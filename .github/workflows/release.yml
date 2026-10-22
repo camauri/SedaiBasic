@@ -129,9 +129,12 @@ jobs:
       - name: Create the draft
         env:
           GH_TOKEN: ${{ github.token }}
+        # A tag with a suffix (v2.0.0-alpha.1, v2.0.0-rc.1) is a pre-release; a bare vX.Y.Z is not.
         run: |
+          pre=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && pre="--prerelease"
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --draft \
+            --draft $pre \
             --title "SedaiBasic $GITHUB_REF_NAME" \
             --generate-notes
