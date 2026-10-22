@@ -177,6 +177,8 @@ var
   WasmBackend: TWasmBackend;
   BytecodeProgram: TBytecodeProgram;
   Serializer: TBytecodeSerializer;
+  MapPC, MapLine: Integer;   // DIVERGENZE 718
+  MapFile: string;
   i, removed: Integer;
   HasLineNums: Boolean;
   QBLangDetected: Boolean;
@@ -622,6 +624,14 @@ begin
           {$ENDIF}
 
           // === SERIALIZATION ===
+          // ⭐ DIVERGENZE 718 - the lines a .basc carries are the PROGRAM's, not those of the text the preprocessor expanded:
+          // sb maps a run-time error's line through the preprocessor's origin map, and a .basc has no map when it runs, so
+          // "BASIC LINE 1563" came out for line 5 of a program that includes crt.bi. Only lines of the program's own file are
+          // rewritten; a program with no #include maps every line onto itself. SB_LINE_MAP=0 is the A/B.
+          if GetEnvironmentVariable('SB_LINE_MAP') <> '0' then
+            for MapPC := 0 to BytecodeProgram.SourceMapRangeCount - 1 do
+              if PPMapOutputLine(BytecodeProgram.SourceMapRangeLine(MapPC), MapFile, MapLine) and (MapFile = '') then
+                BytecodeProgram.SetSourceMapRangeLine(MapPC, MapLine);
           if Verbose then
             WriteLn('Saving bytecode to: ', OutputFile);
 

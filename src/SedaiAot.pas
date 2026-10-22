@@ -543,6 +543,11 @@ function AotAscMidInline: Boolean;
 // Phase 2 of the pointer model: may a raw accessor of this type code be lowered to a move? Exported for the
 // same reason as AotAscMidInline - the loop JIT lowers the same four opcodes and must draw the same line.
 function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
+// ...and the codes the compiled backends TRANSLATE natively: AotRawCodeNative plus RTC_PTR64 / RTC_NPTR on an integer
+// access. The loop JIT admits the same ones since DIVERGENZE 687 (EmitRawJ), so both draw this line in one place.
+function AotRawCodeAot(Code: Int64; IsFloat: Boolean): Boolean;
+// Where the home span lives on the VM instance (AotSetHomeLayout), for the JIT's inline RTC_PTR64 test. 0 = not supplied.
+procedure AotGetHomeLayout(out ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 procedure AotSetHomeLayout(ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);   // phase 3.2
@@ -614,6 +619,12 @@ procedure AotSetHomeLayout(ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);
 begin
   GHomeValidOff := ValidOff; GHomeLoOff := LoOff; GHomeHiOff := HiOff;
   GRawLoOff := RawLoOff; GRawHiOff := RawHiOff;
+end;
+
+procedure AotGetHomeLayout(out ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);
+begin
+  ValidOff := GHomeValidOff; LoOff := GHomeLoOff; HiOff := GHomeHiOff;
+  RawLoOff := GRawLoOff; RawHiOff := GRawHiOff;
 end;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
@@ -698,11 +709,11 @@ function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
 begin
   if IsFloat then Exit(True);            // RTC_SINGLE is four bytes, every other code eight
   case Code of
-    // ⛔ STILL False here: the JIT asks this function too and its raw arm has no translation. The AOT admits RTC_PTR64
-    // separately (AotRawCodeAot), because AotRawAccess translates it through a leaf call (phase 3.2).
+    // ⛔ False here: this function answers "a plain MOVE". RTC_PTR64 is a translation, admitted by AotRawCodeAot - the
+    // AOT's AotRawAccess and, since DIVERGENZE 687, the JIT's EmitRawJ translate it inline plus a leaf call.
     RTC_PTR64: Result := False;          // a pointer read from / written into C's memory is translated (250 · 451)
     RTC_BOOL:  Result := False;          // phase 3 (Boolean): a normalisation, not a width - the helper does it
-    RTC_NPTR:  Result := False;          // phase 3.2: the AOT does it inline (AotRawCodeAot); the JIT keeps the helper
+    RTC_NPTR:  Result := False;          // phase 3.2: translated, not moved - AotRawCodeAot admits it for both backends
     {$IFDEF WINDOWS}
     RTC_I32, RTC_U32: Result := False;   // a cell of a WSTRING block Windows handed back is a UTF-16 unit (239)
     {$ENDIF}
@@ -4432,9 +4443,9 @@ var
           3, 4: begin E.EmitBytes([$66, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], ax
           5, 6: begin E.EmitBytes([$89, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], eax
           // a Boolean (DIVERGENZE 456): the VM's 0/-1 is written as C's 0/1
+          // ...and since DIVERGENZE 642 the low byte of -v, so a byte fbc would keep is kept
           8:    begin
-                  E.EmitBytes([$48, $85, $C0]);                                        // test rax, rax
-                  E.EmitBytes([$0F, $95, $C0]);                                        // setne al
+                  E.EmitBytes([$48, $F7, $D8]);                                        // neg rax
                   E.EmitBytes([$88, $81]); E.Emit32(LongWord(Ofs));                    // mov [rcx+ofs], al
                 end;
         else    begin E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], rax
@@ -4467,10 +4478,9 @@ var
           5: begin E.EmitBytes([$48, $63, $81]); E.Emit32(LongWord(Ofs)); end;      // movsxd rax, dword
           6: begin E.EmitBytes([$8B, $81]); E.Emit32(LongWord(Ofs)); end;           // mov eax, dword (zx)
           // a Boolean (DIVERGENZE 456): any nonzero byte is true, and true is the VM's -1
+          // ...and since DIVERGENZE 642 -(the signed byte), as fbc reads it: 1 is -1, 0 is 0, 200 is 56
           8: begin
-               E.EmitBytes([$80, $B9]); E.Emit32(LongWord(Ofs)); E.EmitBytes([$00]);  // cmp byte [rcx+ofs], 0
-               E.EmitBytes([$0F, $95, $C0]);                                           // setne al
-               E.EmitBytes([$48, $0F, $B6, $C0]);                                      // movzx rax, al
+               E.EmitBytes([$48, $0F, $BE, $81]); E.Emit32(LongWord(Ofs));            // movsx rax, byte [rcx+ofs]
                E.EmitBytes([$48, $F7, $D8]);                                           // neg rax
              end;
         else begin E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Ofs)); end;      // mov rax, qword

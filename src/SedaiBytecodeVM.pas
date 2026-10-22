@@ -1132,6 +1132,7 @@ type
       function correct for the main context and for a THREADCREATE worker alike (see
       jit-thread-unsafe). The JIT already derives these inline for J13; the AOT gets them here. }
     procedure GetRecordLayout(out RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
+    procedure GetHomeLayout(out ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);   // phase 3.2 · DIVERGENZE 687
     // AOT: turn a compiled function's return value into the PC to resume at, handling the
     // C3 helper sentinels. Out of line on purpose - see the implementation comment.
     function AotSettle(C: TExecutionContext; R: PtrInt): Integer;
@@ -5334,6 +5335,26 @@ begin
   Result := PByte(PtrUInt(H and not FGNPTR_TAG) + PtrUInt(Enc shr 4));
 end;
 
+// ⭐ DIVERGENZE 642 (committente, 22 ott 2026: «copiamo fbc per il dialetto MODERN») - the BYTE of a Boolean is what fbc
+// reads, not a normalised truth. fbc keeps a Boolean as one byte (0/1 when it writes it) and every reading of it works on
+// that byte: CInt(b) is -(the byte, signed) - 200 answers 56, 255 answers 1, 2 answers -2 -, "b = True" compares the
+// byte with 1, a copy keeps the byte, and And/Or/Xor work bitwise on the bytes. The VM's value of a Boolean is therefore
+// -(signed byte): 0 and 1 are the VM's false (0) and true (-1) as before, and every other byte keeps its identity. The
+// store is the inverse, the low byte of -v. CLASSIC has no Boolean (Commodore BASIC v7: real, integer, string).
+// SB_BOOL_RAWBYTE=0 is the A/B (any nonzero byte reads as -1, a store writes 0/1).
+var
+  GBoolRawByte: Boolean = True;
+
+function BoolFromByte(B: Byte): Int64; inline;
+begin
+  if GBoolRawByte then Result := -Int64(ShortInt(B)) else Result := -Ord(B <> 0);
+end;
+
+function BoolToByte(V: Int64): Byte; inline;
+begin
+  if GBoolRawByte then Result := Byte(-V) else Result := Ord(V <> 0);
+end;
+
 function FieldIntAt(p: PByte; Code: Int64): Int64; inline;
 begin
   case Code of
@@ -5343,7 +5364,7 @@ begin
     4: Result := PWord(p)^;
     5: Result := PLongInt(p)^;
     6: Result := PLongWord(p)^;
-    8: Result := -Ord(PByte(p)^ <> 0);   // a Boolean: C's 0/1 (any nonzero) -> the VM's 0/-1 (DIVERGENZE 456)
+    8: Result := BoolFromByte(PByte(p)^);   // a Boolean: the byte as fbc reads it (DIVERGENZE 456, 642)
   else Result := PInt64(p)^;
   end;
 end;
@@ -5352,7 +5373,7 @@ procedure SetFieldIntAt(p: PByte; Code, Val: Int64); inline;
 begin
   case Code of
     1, 2: PByte(p)^ := Byte(Val);
-    8:    PByte(p)^ := Ord(Val <> 0);     // a Boolean: the VM's true -> C's 1 (DIVERGENZE 456)
+    8:    PByte(p)^ := BoolToByte(Val);   // a Boolean: the VM's true -> C's 1 (DIVERGENZE 456, 642)
     3, 4: PWord(p)^ := Word(Val);
     5, 6: PLongWord(p)^ := LongWord(Val);
   else PInt64(p)^ := Val;
@@ -5372,7 +5393,7 @@ begin
     4: Result := PWord(p)^;          // u16
     5: Result := PLongInt(p)^;       // s32
     6: Result := PLongWord(p)^;      // u32
-    8: Result := -Ord(PByte(p)^ <> 0);   // Boolean: 0/1 in the bytes, 0/-1 in the VM (DIVERGENZE 456)
+    8: Result := BoolFromByte(PByte(p)^);   // Boolean: 0/1 in the bytes, 0/-1 in the VM (DIVERGENZE 456, 642)
   else Result := PInt64(p)^;
   end;
 end;
@@ -5385,7 +5406,7 @@ begin
   if (Enc and $F) = 0 then begin PInt64(p)^ := Val; Exit; end;
   case Enc and $F of
     1, 2: PByte(p)^ := Byte(Val);
-    8:    PByte(p)^ := Ord(Val <> 0);     // Boolean: the VM's true -> 1, as fbc writes it (DIVERGENZE 456)
+    8:    PByte(p)^ := BoolToByte(Val);   // Boolean: the VM's true -> 1, as fbc writes it (DIVERGENZE 456, 642)
     3, 4: PWord(p)^ := Word(Val);
     5, 6: PLongWord(p)^ := LongWord(Val);
   else PInt64(p)^ := Val;
@@ -5974,7 +5995,21 @@ begin
     Result := FLitSAdd[ConstIdx];
     if Result = 0 then
     begin
-      Result := StrSAdd(S);
+      // ⭐ DIVERGENZE 696 - ...and in the fb memory mode that one address is a MACHINE address, as fbc's literal lives in
+      // read-only data: a raw-heap name in a "ZString Ptr" array reached C with the VM's mark in its bytes when the array
+      // went through a cast or an Any Ptr (IUP's IupPPlotAddStrPoints, glib's g_strjoinv). Never freed, like the data it
+      // stands for. SB_LIT_NATIVE=0 is the A/B.
+      if FNativeMemory and (SysUtils.GetEnvironmentVariable('SB_LIT_NATIVE') <> '0') then
+      begin
+        Result := NativeAlloc(PtrUInt(Length(S)) + 1, True);
+        if Result <> 0 then
+        begin
+          if Length(S) > 0 then Move(S[1], Pointer(PtrUInt(Result and not FGNPTR_TAG))^, Length(S));
+          PByte(PtrUInt(Result and not FGNPTR_TAG) + PtrUInt(Length(S)))^ := 0;
+        end;
+      end
+      else
+        Result := StrSAdd(S);
       FLitSAdd[ConstIdx] := Result;
     end;
   finally
@@ -6418,6 +6453,35 @@ function libc_realloc(p: Pointer; size: PtrUInt): Pointer; cdecl; external 'c' n
 procedure libc_free(p: Pointer); cdecl; external 'c' name 'free';
 {$ENDIF}
 
+type
+  TCLconvHead = record
+    decimal_point: PAnsiChar;   // the first field of C's struct lconv, on every libc this project targets
+  end;
+  PCLconvHead = ^TCLconvHead;
+{$IFDEF WINDOWS}
+function libc_localeconv: PCLconvHead; cdecl; external 'msvcrt' name 'localeconv';
+{$ELSE}
+function libc_localeconv: PCLconvHead; cdecl; external 'c' name 'localeconv';
+{$ENDIF}
+
+var
+  GCLocaleNumKnob: Integer = -1;     // SB_C_LOCALE_NUM=0 turns DIVERGENZE 710 off (read once, lazily)
+
+procedure RefreshCDecimalPoint;
+// DIVERGENZE 710: C's current decimal separator into GCDecimalPoint (one byte; '.' when C answers nothing usable).
+var
+  L: PCLconvHead;
+begin
+  if GCLocaleNumKnob < 0 then
+    GCLocaleNumKnob := Ord(SysUtils.GetEnvironmentVariable('SB_C_LOCALE_NUM') <> '0');
+  if GCLocaleNumKnob = 0 then Exit;
+  L := libc_localeconv;
+  if (L <> nil) and (L^.decimal_point <> nil) and (L^.decimal_point^ <> #0) and (L^.decimal_point[1] = #0) then
+    GCDecimalPoint := L^.decimal_point^
+  else
+    GCDecimalPoint := '.';
+end;
+
 function TBytecodeVM.NativeAlloc(ByteCount: PtrUInt; NoteRegion: Boolean): Int64;
 // Allocate / CAllocate / New <builtin> / crt's malloc and calloc in the fb memory mode (phase 1 of the pointer
 // model). ⭐ The answer is the machine address with FGNPTR_TAG: the mark a pointer C returned has always carried,
@@ -6494,8 +6558,8 @@ end;
 
 function TBytecodeVM.NativeRecCell(Ctx: TExecutionContext; ByteSize: Int64): Int64;
 // A native record local: a pooled cell of this size if one is free (zeroed), else a new libc block with the size in the 8
-// bytes before the image. The image starts 8 bytes in, so its address is still 8-aligned and bit 0 is free for the
-// FrameCells mark.
+// bytes before the image. The image starts 16 bytes in (700), so its address is 16-aligned as fbc's and bit 0 is free for
+// the FrameCells mark.
 var
   k, Lim: Integer;
   Img: PtrUInt;
@@ -6517,10 +6581,13 @@ begin
     end;
     Dec(k);
   end;
-  Mem := libc_calloc(1, PtrUInt(ByteSize) + 8);
+  // ⛔ DIVERGENZE 700 - the image starts SIXTEEN bytes in, with the size still in the 8 bytes right before it: fbc puts a
+  // record variable on a 16-byte boundary and C relies on it - Newton writes the 4x4 matrices of a NewtonJointRecord with
+  // aligned SSE stores, and an image at 8 mod 16 faulted inside NewtonJointGetInfo. calloc answers 16-aligned blocks.
+  Mem := libc_calloc(1, PtrUInt(ByteSize) + 16);
   if Mem = nil then raise EOutOfMemory.Create('Out of memory allocating a record');
-  PInt64(Mem)^ := ByteSize;
-  Img := PtrUInt(Mem) + 8;
+  Img := PtrUInt(Mem) + 16;
+  PInt64(Img - 8)^ := ByteSize;
   if FBoundsCheck then
     ForeignNoteRegion(nil, Img, PtrUInt(ByteSize), True, False);
   Result := Int64(Img) or FGNPTR_TAG;
@@ -7154,7 +7221,7 @@ begin
   case WidthCode of
     RTC_I8:  Result := PShortInt(@A.ByteData[ByteOfs])^;
     RTC_U8:  Result := A.ByteData[ByteOfs];
-    RTC_BOOL: Result := -Ord(A.ByteData[ByteOfs] <> 0);
+    RTC_BOOL: Result := BoolFromByte(A.ByteData[ByteOfs]);   // DIVERGENZE 642
     RTC_I16: Result := PSmallInt(@A.ByteData[ByteOfs])^;
     RTC_U16: Result := PWord(@A.ByteData[ByteOfs])^;
     RTC_I32: Result := PLongInt(@A.ByteData[ByteOfs])^;
@@ -7183,7 +7250,7 @@ var
 begin
   case WidthCode of
     RTC_I8, RTC_U8:   W := 1;
-    RTC_BOOL:         begin W := 1; V := Ord(V <> 0); end;
+    RTC_BOOL:         begin W := 1; V := BoolToByte(V); end;   // DIVERGENZE 642
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
     RTC_I64, RTC_PTR64, RTC_NPTR: W := 8;   // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
@@ -7661,13 +7728,24 @@ begin
   // builds them: a worker may be rebuilding them. Outside every candidate buffer and the raw heap there is nothing to
   // come home to, and the walk over every array is skipped.
   AvU := 0;
-  if FHasWorkers then EnterCriticalSection(FArrDescLock);
-  try
+  // ⚠️ The try/finally only where the lock is taken: its frame set-up was a fifth of a compiled loop that reads an
+  // @-taken pointer cell (DIVERGENZE 687), and with no worker there is nothing to release.
+  if FHasWorkers then
+  begin
+    EnterCriticalSection(FArrDescLock);
+    try
+      if FHomeValid = 0 then RebuildHomeSpan;
+      if HomeMayContain(PtrUInt(V)) then
+        AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(V)));
+    finally
+      LeaveCriticalSection(FArrDescLock);
+    end;
+  end
+  else
+  begin
     if FHomeValid = 0 then RebuildHomeSpan;
     if HomeMayContain(PtrUInt(V)) then
       AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(V)));
-  finally
-    if FHasWorkers then LeaveCriticalSection(FArrDescLock);
   end;
   if AvU <> 0 then Exit(Int64(AvU));
   // ⚠️ The region note is read only by --bounds-check and by the strict mode (RawAddr): in fb it was a lock, a binary
@@ -7766,7 +7844,7 @@ begin
     RTC_I32: Result := PLongInt(RawAddr(RawPtr, 4))^;
     // The unsigned views ZERO-extend: a UByte holding 200 is 200 in the int bank, not -56.
     RTC_U8:  Result := PByte(RawAddr(RawPtr, 1))^;
-    RTC_BOOL: Result := -Ord(PByte(RawAddr(RawPtr, 1))^ <> 0);   // C's 0/1 (any nonzero) -> the VM's 0/-1
+    RTC_BOOL: Result := BoolFromByte(PByte(RawAddr(RawPtr, 1))^);   // C's 0/1 -> the VM's 0/-1, any other byte as fbc reads it (642)
     RTC_U16: Result := PWord(RawAddr(RawPtr, 2))^;
     RTC_U32: Result := PLongWord(RawAddr(RawPtr, 4))^;
     // ⭐ A POINTER read out of raw memory (DIVERGENZE 250). From C's own memory it is C's pointer: it
@@ -8235,7 +8313,7 @@ begin
     RTC_I32: PLongInt(RawAddr(RawPtr, 4, True))^ := LongInt(Value);
     // Unsigned views: same WIDTH, so the bytes written are the same - they exist for the LOAD.
     RTC_U8:  PByte(RawAddr(RawPtr, 1, True))^ := Byte(Value);
-    RTC_BOOL: PByte(RawAddr(RawPtr, 1, True))^ := Ord(Value <> 0);   // the VM's true -> C's 1
+    RTC_BOOL: PByte(RawAddr(RawPtr, 1, True))^ := BoolToByte(Value);   // the VM's true -> C's 1 (642)
     RTC_U16: PWord(RawAddr(RawPtr, 2, True))^ := Word(Value);
     RTC_U32: PLongWord(RawAddr(RawPtr, 4, True))^ := LongWord(Value);
     // ⭐ A POINTER written INTO C's memory - the write twin of the RTC_PTR64 load. Inside the VM a machine
@@ -9831,6 +9909,9 @@ begin
     CallDepth := Ctx.CallStackPtr;
   end;
   TForeignTable(ForeignTable).Invoke(TableIdx, Ctx, Ctx.XferInt, Ctx.XferFloat, NArgs, ResInt, ResFloat);
+  // ⭐ DIVERGENZE 710 (owner: copy fbc) - C may have switched LC_NUMERIC (setlocale, GTK inside IupOpen): read the decimal
+  // separator back, for FormatNumber and VAL in MODERN. One libc call returning a static struct. SB_C_LOCALE_NUM=0 is the A/B.
+  RefreshCDecimalPoint;
   if GLongjmpGuard then
   begin
     Stale := ExceptFrameHead;
@@ -10715,6 +10796,8 @@ begin
   FProgram := Program_;
   SetLength(FLitSAdd, 0);   // DIVERGENZE 593: literal addresses are by POOL INDEX, and a new program has a new pool
   FNativeMemory := Assigned(Program_) and Program_.NativeMemory;   // decided when it was compiled
+  // DIVERGENZE 642: the byte of a Boolean as fbc keeps it - fb memory mode only (strict keeps the VM's image).
+  GBoolRawByte := FNativeMemory and (SysUtils.GetEnvironmentVariable('SB_BOOL_RAWBYTE') <> '0');
   FImgNative := SysUtils.GetEnvironmentVariable('SB_IMG_NATIVE') <> '0';
   RewritePackedArrayOps;   // phase 2.5: before EnsureDenseOps builds the per-PC index and the JIT reads the bytecode
 
@@ -16071,7 +16154,22 @@ begin
   Result := PtrInt(FloatToUIntConv(D, True));
 end;
 
+procedure TBytecodeVM.GetHomeLayout(out ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);
+// Where the home span lives on this instance, for the compiled RTC_PTR64 load's inline test (AotSetHomeLayout).
+// ⛔ DIVERGENZE 687: the front end hands it to the AOT BEFORE AotCompileProgram, as it hands the record layout. Set only
+// here at run time, it arrived after the AOT had compiled: GHomeValidOff was 0, the inline test was never emitted, and
+// every RTC_PTR64 read of compiled code called AotPtrHome - a loop over an @-taken pointer 72 -> 557 ms.
+begin
+  ValidOff := Integer(PtrUInt(@FHomeValid) - PtrUInt(Pointer(Self)));
+  LoOff    := Integer(PtrUInt(@FHomeLo) - PtrUInt(Pointer(Self)));
+  HiOff    := Integer(PtrUInt(@FHomeHi) - PtrUInt(Pointer(Self)));
+  RawLoOff := Integer(PtrUInt(@FRawLo) - PtrUInt(Pointer(Self)));
+  RawHiOff := Integer(PtrUInt(@FRawHi) - PtrUInt(Pointer(Self)));
+end;
+
 procedure TBytecodeVM.SetAotPrimitives(var C: TAotCtx);
+var
+  HV, HL, HH, RL, RH: Integer;
 begin
   // C3: the runtime-helper pair. Compiled code calls back into the interpreter for an op with no
   // native form. Both are stable: the helper is a static function and VMSelf is the instance that
@@ -16091,11 +16189,8 @@ begin
   C.RawAlloc := @AotRawAlloc;
   C.PtrHome := @AotPtrHome;
   C.PtrFromInt := @AotPtrFromInt;   // DIVERGENZE 528
-  AotSetHomeLayout(Integer(PtrUInt(@FHomeValid) - PtrUInt(Pointer(Self))),
-                   Integer(PtrUInt(@FHomeLo) - PtrUInt(Pointer(Self))),
-                   Integer(PtrUInt(@FHomeHi) - PtrUInt(Pointer(Self))),
-                   Integer(PtrUInt(@FRawLo) - PtrUInt(Pointer(Self))),
-                   Integer(PtrUInt(@FRawHi) - PtrUInt(Pointer(Self))));
+  GetHomeLayout(HV, HL, HH, RL, RH);
+  AotSetHomeLayout(HV, HL, HH, RL, RH);
   C.PtrStore := @AotPtrStore;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
@@ -17235,6 +17330,18 @@ begin
     Result := StringOfChar('0', Digits - Length(Result)) + Result;
 end;
 
+function LocaleValText(const S: string): string;
+// DIVERGENZE 710: VAL's text under a C numeric locale whose separator is not '.': the dot ends the number (strtod stops
+// there) and the locale's separator becomes the dot ParseLeadingFloat reads.
+var
+  p: Integer;
+begin
+  Result := S;
+  p := Pos('.', Result);
+  if p > 0 then SetLength(Result, p - 1);
+  Result := StringReplace(Result, GCDecimalPoint, '.', []);
+end;
+
 function ParseLeadingFloat(const S: string): Double;
 var
   I, J, K, Len, DPos: Integer;
@@ -17446,11 +17553,46 @@ begin
   end;
 end;
 
-// Encode a single Unicode codepoint as its UTF-8 byte sequence (FreeBASIC WCHR). Invalid codepoints
-// (negative or > U+10FFFF) yield the replacement char U+FFFD.
-function Utf8EncodeCP(CP: Integer): string;
+// Encode a single Unicode codepoint as its UTF-8 byte sequence (FreeBASIC WCHR).
+// ⭐ DIVERGENZE 225 - a value OUTSIDE the Unicode range is kept as it stands, as fbc keeps it: a Linux wstring has
+// 4-byte elements and fbc writes the 32 bits there ("Asc(WChr(&hFFFFFFFF))" is 4294967295). The string bank holds a
+// wstring as UTF-8, which has no spelling for such a value, so the ORIGINAL UTF-8 long forms carry it - 5 and 6 bytes
+// (lead F8/FC, up to 2^31) and a 7-byte form with lead FE (6 continuations, 36 bits) for the top bit. Every decoder of
+// this storage (Utf8FirstCP, UTF8ToUCS4Cells, the terminal's Utf8ToUtf32Cells) reads them back to the same cell, and
+// the codepoint COUNT needs nothing: a lead byte is still a non-continuation byte. SB_WCHR_RAW=0 is the A/B (U+FFFD).
+var
+  GWChrRawKnob: Integer = -1;
+
+function WChrKeepsRaw: Boolean;
 begin
-  if (CP < 0) or (CP > $10FFFF) then CP := $FFFD;
+  if GWChrRawKnob < 0 then
+    if SysUtils.GetEnvironmentVariable('SB_WCHR_RAW') = '0' then GWChrRawKnob := 0 else GWChrRawKnob := 1;
+  Result := GWChrRawKnob = 1;
+end;
+
+function Utf8EncodeCP(CP64: Int64): string;
+var
+  CP: LongWord;
+begin
+  CP := LongWord(CP64 and $FFFFFFFF);          // fbc takes the low 32 bits: WChr(-1) is cell 4294967295
+  if (CP > $10FFFF) and not WChrKeepsRaw then CP := $FFFD;
+  if CP > $10FFFF then
+  begin
+    if CP < $200000 then
+      Result := Chr($F0 or (CP shr 18)) + Chr($80 or ((CP shr 12) and $3F)) +
+                Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F))
+    else if CP < $4000000 then
+      Result := Chr($F8 or (CP shr 24)) + Chr($80 or ((CP shr 18) and $3F)) + Chr($80 or ((CP shr 12) and $3F)) +
+                Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F))
+    else if CP < $80000000 then
+      Result := Chr($FC or (CP shr 30)) + Chr($80 or ((CP shr 24) and $3F)) + Chr($80 or ((CP shr 18) and $3F)) +
+                Chr($80 or ((CP shr 12) and $3F)) + Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F))
+    else
+      Result := Chr($FE) + Chr($80 or ((CP shr 30) and $3F)) + Chr($80 or ((CP shr 24) and $3F)) +
+                Chr($80 or ((CP shr 18) and $3F)) + Chr($80 or ((CP shr 12) and $3F)) +
+                Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
+    Exit;
+  end;
   if CP < $80 then
     Result := Chr(CP)
   else if CP < $800 then
@@ -17465,7 +17607,7 @@ end;
 // Decode the FIRST codepoint of a UTF-8 string (FreeBASIC ASC on a WSTRING); 0 for an empty string.
 // The mirror of Utf8EncodeCP, and the reason bcStrAsc cannot answer for a wide string: that one takes
 // the first BYTE, which for anything above U+007F is only the lead byte of the sequence.
-function Utf8FirstCP(const S: string): Integer;
+function Utf8FirstCP(const S: string): Int64;
 var
   b, n, i, need: Integer;
 begin
@@ -17475,6 +17617,10 @@ begin
   if (b and $E0) = $C0 then begin Result := b and $1F; need := 1; end
   else if (b and $F0) = $E0 then begin Result := b and $0F; need := 2; end
   else if (b and $F8) = $F0 then begin Result := b and $07; need := 3; end
+  // the long forms of DIVERGENZE 225 (a cell outside the Unicode range)
+  else if (b and $FC) = $F8 then begin Result := b and $03; need := 4; end
+  else if (b and $FE) = $FC then begin Result := b and $01; need := 5; end
+  else if b = $FE then begin Result := 0; need := 6; end
   else Exit(b);                                  // a stray continuation byte: report it as it stands
   n := Length(S);
   for i := 2 to need + 1 do
@@ -17964,7 +18110,12 @@ begin
         Ctx.StringRegs[Instr.Dest] := TrimRight(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1]));
     8: // bcStrVal - VAL(s): leading floating-point number, FreeBASIC style (leading parse + &H/&O/&B).
       begin
-        Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Ctx.StringRegs[Instr.Src1]);
+        // ⭐ DIVERGENZE 710 (owner: copy fbc) - in MODERN, VAL reads through C's numeric locale as fbc's strtod does: with a
+        // comma separator "3.5" is 3 and "3,5" is 3.5. ⛔ CLASSIC (Commodore BASIC v7) keeps the dot whatever C did.
+        if (GCDecimalPoint <> '.') and Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(LocaleValText(Ctx.StringRegs[Instr.Src1]))
+        else
+          Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Ctx.StringRegs[Instr.Src1]);
       end;
     9: // bcStrHex - HEX$(n[, digits]) - full INT64 range. Src2 = digits width (0 = no leading zeros).
       begin
@@ -19372,7 +19523,15 @@ begin
           // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
           // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
         begin
-          if Length(FRedimPendingLBs) > 0 then
+          // ⭐ DIVERGENZE 725 - a PARAMETER (bit 2) whose argument is a FIXED array keeps its bounds, as in fbc: Preserve
+          // changes nothing, a plain ReDim clears the elements. The storage says which, as it does for ERASE.
+          if ((Instr.Immediate and 4) <> 0) and (Ctx.ArrMap[Instr.Src1] >= 0) and
+             (Ctx.ArrMap[Instr.Src1] < Length(FArrays)) and not FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic then
+          begin
+            if (Instr.Immediate and 1) = 0 then EraseArray(Ctx.ArrMap[Instr.Src1], False);
+            SetLength(FRedimPendingLBs, 0);
+          end
+          else if Length(FRedimPendingLBs) > 0 then
           begin
             RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
                        True, FRedimPendingLBs[0]);
@@ -19961,7 +20120,13 @@ begin
         end;
       28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper (and any lower) bounds
         begin
-          RedimArrayN(Ctx.ArrMap[Instr.Src1], FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
+          if ((Instr.Immediate and 4) <> 0) and (Ctx.ArrMap[Instr.Src1] >= 0) and          // DIVERGENZE 725, as above
+             (Ctx.ArrMap[Instr.Src1] < Length(FArrays)) and not FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic then
+          begin
+            if (Instr.Immediate and 1) = 0 then EraseArray(Ctx.ArrMap[Instr.Src1], False);
+          end
+          else
+            RedimArrayN(Ctx.ArrMap[Instr.Src1], FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
           SetLength(FRedimPendingUBs, 0);
           SetLength(FRedimPendingLBs, 0);
         end;
@@ -23576,7 +23741,7 @@ begin
         // width alone could not say so - a Boolean and a Byte are both one - and the VM wrote its own
         // truth, -1, so the file got &hFF where fbc writes 1. The call site spells it out because only it
         // knows the declared type (BinPutGetWidthImm).
-        if BinWidth = 9 then begin BinWidth := 1; BinI := Ord(BinI <> 0); end;
+        if BinWidth = 9 then begin BinWidth := 1; BinI := BoolToByte(BinI); end;   // DIVERGENZE 642: the byte as it is
         if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;   // default: full 64-bit integer
         SetLength(Data, BinWidth); Move(BinI, Data[1], BinWidth);  // little-endian low bytes
         if Assigned(FOnFileData) then
@@ -23624,7 +23789,7 @@ begin
           Data := IntToStr(BinWidth); FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
           BinI := 0;
           if Length(Data) >= BinWidth then Move(Data[1], BinI, BinWidth);   // little-endian, zero-extended
-          if BinIsBool then BinI := -Ord(BinI <> 0);
+          if BinIsBool then BinI := BoolFromByte(Byte(BinI));   // DIVERGENZE 642
           if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := BinI;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');

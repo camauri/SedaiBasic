@@ -154,6 +154,11 @@ type
     // are single-def. Sharing the state-dependent table meant intrec recomputed the same
     // 'index - lbound' four times per iteration, once after each RecordStore.
     FLoopVarTable: TLocalValueMap;
+    { A read through an ADDRESS (ssaRawLoadInt/Float) gets its own block-local table, emptied by EVERY instruction that
+      can write anything (IsMemoryBarrier) - not by the element barrier the array table uses: a RecordStore can change
+      the bytes a raw load reads through a record-field pointer, and a native record IS raw memory. A cell with "@"
+      (a native module or frame cell) is read twice per "s += *p : p += 1", and without this both reads stayed. }
+    FRawTable: TLocalValueMap;
     { Constants get their OWN block-local table, and it is emptied at every CALL. A literal reloaded
       into a second register is the same value anywhere, so dominance would license reuse across the
       whole dominated subtree - but the register that carries it would then have to survive whatever
@@ -481,6 +486,7 @@ begin
   FScopedTable := TScopedGVNTable.Create;
   FBlockTable := TLocalValueMap.Create;
   FBoundTable := TLocalValueMap.Create;
+  FRawTable := TLocalValueMap.Create;
   FLoopVarTable := TLocalValueMap.Create;
   FConstTable := TLocalValueMap.Create;
   FPhiDefinedRegs := TRegKeySet.Create;
@@ -503,6 +509,7 @@ begin
   FPhiDefinedRegs.Free;
   FBlockTable.Free;
   FBoundTable.Free;
+  FRawTable.Free;
   FLoopVarTable.Free;
   FConstTable.Free;
   FScopedTable.Free;
@@ -538,6 +545,16 @@ end;
 function GVNNumbersConstants: Boolean;
 begin
   Result := GVNConstMode <> 0;
+end;
+
+var
+  GGvnRawLoad: Integer = -1;   // raw loads value-numbered in FRawTable: -1 unread, 0 off (GVN_RAWLOAD=0, the A/B), 1 on
+
+function GVNNumbersRawLoads: Boolean;
+begin
+  if GGvnRawLoad < 0 then
+    if GetEnvironmentVariable('GVN_RAWLOAD') = '0' then GGvnRawLoad := 0 else GGvnRawLoad := 1;
+  Result := GGvnRawLoad = 1;
 end;
 
 procedure TGVNPass.CollectPhiDefinedRegisters;
@@ -1021,6 +1038,10 @@ begin
     ssaArrayLoad, ssaArrayLBound, ssaArrayUBound:
       Result := True;
 
+    // A read through an address: same reasoning, its own table (FRawTable), emptied by every possible writer.
+    ssaRawLoadInt, ssaRawLoadFloat:
+      Result := GVNNumbersRawLoads;
+
     // Everything else is unsafe
     else
       Result := False;
@@ -1072,6 +1093,14 @@ begin
   //   * anything built on a LOOP-VARIANT value, because reusing one across blocks only stretches a
   //     live range over the loop latch (cost - see UsesLoopVariantValue).
   // A descriptor read answers from its own table, which survives element and field stores.
+  if Instr.OpCode in [ssaRawLoadInt, ssaRawLoadFloat] then
+  begin
+    if FRawTable.TryGetValue(Hash, ExistingValue) then
+      RewriteAsCopy(Instr, ExistingValue, Hash)
+    else
+      FRawTable.AddOrSetValue(Hash, Instr.Dest);
+    Exit;
+  end;
   if IsDescriptorRead(Instr.OpCode) then
   begin
     if FBoundTable.TryGetValue(Hash, ExistingValue) then
@@ -1229,6 +1258,7 @@ begin
   FBoundTable.Clear;
   FLoopVarTable.Clear;
   FConstTable.Clear;
+  FRawTable.Clear;
 
   // Process each instruction in block
   for i := 0 to Block.Instructions.Count - 1 do
@@ -1238,6 +1268,8 @@ begin
     // it, including - conservatively - its own operands' worth of state.
     if IsElementBarrier(Instr.OpCode) then
       FBlockTable.Clear;
+    if IsMemoryBarrier(Instr.OpCode) then
+      FRawTable.Clear;
     // ...and the descriptor table only for something that can actually reshape an array.
     if IsReshapeBarrier(Instr.OpCode) then
       FBoundTable.Clear;

@@ -277,6 +277,11 @@ function ExactStrToDouble(const S: string): Double;
   this file exists to prevent. }
 function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 
+var
+  // DIVERGENZE 710: C's current decimal separator (LC_NUMERIC), refreshed by the VM after every foreign call. Read by
+  // FormatNumber (PRINT, STR, WRITE) and by VAL's parser; '.' until C changes the locale.
+  GCDecimalPoint: Char = '.';
+
 implementation
 
 uses Math;
@@ -1104,6 +1109,11 @@ begin
   // Negative zero: its magnitude renders as "0" with no sign, but NonNeg is False (from the sign bit under
   // nfFreeBASIC), so restore the minus FreeBASIC prints ("-0"). Any ordinary negative already carries it.
   if (not NonNeg) and (NumStr <> '') and (NumStr[1] <> '-') then NumStr := '-' + NumStr;
+  // ⭐ DIVERGENZE 710 (owner, 22 Oct 2026: copy fbc) - the decimal separator of C's numeric locale: fbc formats through
+  // libc, so once C code switches LC_NUMERIC to a comma locale (GTK inside IupOpen does) "Print 1.5" is "1,5". The VM reads
+  // the separator back from localeconv after every foreign call (GCDecimalPoint); '.' until then.
+  if (GCDecimalPoint <> '.') and (FNumberFormat = nfFreeBASIC) then
+    NumStr := StringReplace(NumStr, '.', GCDecimalPoint, []);
   Result := Prefix + NumStr + Suffix;
 end;
 

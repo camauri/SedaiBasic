@@ -1676,7 +1676,7 @@ function TLexerFSM.ProcessEscapes(const Raw: string): string;
 var
   i, n: Integer;
   c: Char;
-  Val, Cnt, d, Base: Integer;
+  Val, Cnt, d, Base, MaxDigits: Integer;
 
   function HexDigit(ch: Char): Integer;
   begin
@@ -1842,8 +1842,17 @@ begin
             Continue;   // "\&" with no h/o/b prefix: fbc drops both characters (measured: !"\&101" is "101")
           Inc(i);
           Val := 0;
-          while i <= n do
+          // ⛔ AT MOST 2 hex, 3 octal or 8 binary digits, as fbc reads them (DIVERGENZE 689, measured: !"\&h4142" is "A42",
+          // !"\&o1012" is "A2", !"\&b010000011" is "A1"). Reading every following digit made !"\&h04\&h03abc" two bytes
+          // instead of five - the DER bytes the cryptlib deck hands to cryptAddCertExtension.
+          case Base of
+            16: MaxDigits := 2;
+            8:  MaxDigits := 3;
+          else  MaxDigits := 8;
+          end;
+          while (i <= n) and (MaxDigits > 0) do
           begin
+            Dec(MaxDigits);
             if Base = 16 then
             begin
               d := HexDigit(Raw[i]);

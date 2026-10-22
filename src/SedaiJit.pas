@@ -2196,6 +2196,90 @@ var
   end;
   procedure EmitRawJ(apc: Integer; IsFloat, IsStore: Boolean);
   var pCold, pDone, W: Integer;
+
+    // ⭐ DIVERGENZE 687: RTC_PTR64, the AOT's EmitPtrLoad. rax = the bare address. A value outside [64 KiB, 2^47) is kept;
+    // outside the raw heap and the home span it takes C's mark inline; inside either, AotPtrHome decides (a leaf call).
+    // Before this the JIT ran every such read through the interpreter: a loop over an @-taken pointer 74 -> 9135 ms.
+    procedure EmitPtrLoadJ;
+    var pKeep, pLow, pC1, pC2, pC3, pNR, pT1, pTagDone, pCall: Integer;
+        VOff, LOff, HOff, RLOff, RHOff: Integer;
+    begin
+      AotGetHomeLayout(VOff, LOff, HOff, RLOff, RHOff);
+      E.EmitBytes([$48, $8B, $00]);                                          // mov rax, [rax]
+      E.EmitBytes([$48, $89, $C2]);                                          // mov rdx, rax
+      E.EmitBytes([$48, $C1, $EA, 47]);                                      // shr rdx, 47
+      E.EmitBytes([$0F, $85]); pKeep := E.Len; E.Emit32(0);                  // jnz keep
+      E.EmitBytes([$48, $3D]); E.Emit32($10000);                             // cmp rax, 0x10000
+      E.EmitBytes([$0F, $82]); pLow := E.Len; E.Emit32(0);                   // jb keep
+      pCall := -1;
+      if VOff > 0 then
+      begin
+        MovImm64(RDX, PtrInt(VMSelf));                                       // rdx = the VM
+        E.EmitBytes([$48, $83, $BA]); E.Emit32(LongWord(VOff)); E.Emit8(0);  // cmp qword [rdx+valid], 0
+        E.EmitBytes([$0F, $84]); pC1 := E.Len; E.Emit32(0);                  // je call
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(RLOff));             // cmp rax, [rdx+rawlo]
+        E.EmitBytes([$72, $00]); pNR := E.Len - 1;                           // jb notraw
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(RHOff));             // cmp rax, [rdx+rawhi]
+        E.EmitBytes([$0F, $82]); pC2 := E.Len; E.Emit32(0);                  // jb call
+        E.PatchByte(pNR, Byte(E.Len - (pNR + 1)));                           // @notraw
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(LOff));              // cmp rax, [rdx+lo]
+        E.EmitBytes([$72, $00]); pT1 := E.Len - 1;                           // jb tag
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(HOff));              // cmp rax, [rdx+hi]
+        E.EmitBytes([$0F, $86]); pC3 := E.Len; E.Emit32(0);                  // jbe call
+        E.PatchByte(pT1, Byte(E.Len - (pT1 + 1)));                           // @tag
+        E.EmitBytes([$48, $0F, $BA, $E8, 61]);                               // bts rax, 61
+        E.EmitBytes([$E9]); pTagDone := E.Len; E.Emit32(0);                  // jmp keep
+        pCall := E.Len;                                                      // @call
+        E.Patch32(pC1, LongWord(pCall - (pC1 + 4)));
+        E.Patch32(pC2, LongWord(pCall - (pC2 + 4)));
+        E.Patch32(pC3, LongWord(pCall - (pC3 + 4)));
+      end;
+      SpillVol; LeafSaveBases;
+      MovRR(ABI_ARG1, RAX);                                                  // arg1 = the value read (before arg0: Win64)
+      MovImm64(ABI_ARG0, PtrInt(VMSelf));                                    // arg0 = VMSelf
+      LeafCall(Prim(AOTCTX_PTRHOME));
+      LeafRestore;
+      E.Patch32(pKeep, LongWord(E.Len - (pKeep + 4)));                       // @keep
+      E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
+      if pCall >= 0 then E.Patch32(pTagDone, LongWord(E.Len - (pTagDone + 4)));
+      IStore(I^.Dest, RAX);
+    end;
+
+    // ...and EmitPtrStore: a C-marked value loses the mark; a packed VM name (top bits clear, >= 2^32) or a raw offset
+    // (top bits 010, DIVERGENZE 613) goes through AotPtrStore; anything else is written as it is. rax = the bare address,
+    // rcx = the value.
+    procedure EmitPtrStoreJ;
+    var pNotTag, pTop, pLow, pWrite, pRaw: Integer;
+    begin
+      E.EmitBytes([$48, $89, $CA]);                                          // mov rdx, rcx
+      E.EmitBytes([$48, $C1, $EA, 61]);                                      // shr rdx, 61
+      E.EmitBytes([$83, $FA, $01]);                                          // cmp edx, 1
+      E.EmitBytes([$0F, $85]); pNotTag := E.Len; E.Emit32(0);                // jne nottag
+      E.EmitBytes([$48, $0F, $BA, $F1, 61]);                                 // btr rcx, 61
+      E.EmitBytes([$E9]); pWrite := E.Len; E.Emit32(0);                      // jmp write
+      E.Patch32(pNotTag, LongWord(E.Len - (pNotTag + 4)));                   // @nottag
+      E.EmitBytes([$83, $FA, $02]);                                          // cmp edx, 2
+      E.EmitBytes([$0F, $84]); pRaw := E.Len; E.Emit32(0);                   // je call
+      E.EmitBytes([$85, $D2]);                                               // test edx, edx
+      E.EmitBytes([$0F, $85]); pTop := E.Len; E.Emit32(0);                   // jnz write
+      E.EmitBytes([$48, $89, $CA]);                                          // mov rdx, rcx
+      E.EmitBytes([$48, $C1, $EA, 32]);                                      // shr rdx, 32
+      E.EmitBytes([$0F, $84]); pLow := E.Len; E.Emit32(0);                   // jz write
+      E.Patch32(pRaw, LongWord(E.Len - (pRaw + 4)));                         // @call
+      SpillVol; LeafSaveBases;
+      MovRR(ABI_ARG1, RCX);                                                  // arg1 = the value (before arg0: rcx IS arg0 on Win64)
+      MovImm64(ABI_ARG0, PtrInt(VMSelf));                                    // arg0 = VMSelf
+      LeafCall(Prim(AOTCTX_PTRSTORE));
+      LeafRestore;
+      MovRR(RCX, RAX);                                                       // rcx = the value to write
+      ILoad(RAX, I^.Src1);                                                   // rax = the pointer again
+      E.EmitBytes([$48, $0F, $BA, $F0, 61]);                                 // btr rax, 61
+      E.Patch32(pWrite, LongWord(E.Len - (pWrite + 4)));                     // @write
+      E.Patch32(pTop, LongWord(E.Len - (pTop + 4)));
+      E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
+      E.EmitBytes([$48, $89, $08]);                                          // mov [rax], rcx
+    end;
+
   begin
     W := Integer(I^.Immediate and $FFFFFFFF);
     if IsStore then
@@ -2220,6 +2304,18 @@ var
         else
           E.EmitBytes([$F2, $0F, $11, $00]);                                 // movsd [rax], xmm0
       end
+      else if W = RTC_PTR64 then
+        EmitPtrStoreJ
+      else if W = RTC_NPTR then
+      begin
+        // the mark comes off a C-marked value; anything else is written as it is (the AOT's arm)
+        E.EmitBytes([$48, $89, $CA]);                                        // mov rdx, rcx
+        E.EmitBytes([$48, $C1, $EA, 61]);                                    // shr rdx, 61
+        E.EmitBytes([$83, $FA, $01]);                                        // cmp edx, 1
+        E.EmitBytes([$75, $05]);                                             // jne +5
+        E.EmitBytes([$48, $0F, $BA, $F1, 61]);                               // btr rcx, 61
+        E.EmitBytes([$48, $89, $08]);                                        // mov [rax], rcx
+      end
       else
         case W of
           RTC_I8,  RTC_U8:  E.EmitBytes([$88, $08]);                         // mov [rax], cl
@@ -2235,6 +2331,20 @@ var
         if W = RTC_SINGLE then E.EmitBytes([$F3, $0F, $5A, $00])             // cvtss2sd xmm0, [rax]
         else E.EmitBytes([$F2, $0F, $10, $00]);                              // movsd xmm0, [rax]
         FStore(I^.Dest, XMM0);
+      end
+      else if W = RTC_PTR64 then
+        EmitPtrLoadJ
+      else if W = RTC_NPTR then
+      begin
+        // a user-space address gets C's mark (the AOT's arm)
+        E.EmitBytes([$48, $8B, $00]);                                        // mov rax, [rax]
+        E.EmitBytes([$48, $89, $C2]);                                        // mov rdx, rax
+        E.EmitBytes([$48, $C1, $EA, 47]);                                    // shr rdx, 47
+        E.EmitBytes([$75, $0D]);                                             // jnz +13
+        E.EmitBytes([$48, $3D]); E.Emit32($10000);                           // cmp rax, 0x10000   (6 bytes)
+        E.EmitBytes([$72, $05]);                                             // jb +5              (2 bytes)
+        E.EmitBytes([$48, $0F, $BA, $E8, 61]);                               // bts rax, 61        (5 bytes)
+        IStore(I^.Dest, RAX);
       end
       else
       begin
@@ -3201,7 +3311,7 @@ var
         // which is how phase 2.3 turned every native raw STORE into a LOAD and every Float access into an Int one
         // (m984 died under --jit with "address 1"). Explicit comparisons, as before.
         if UseHelper and NativeMem and not (InCallee or InGosub) and
-           AotRawCodeNative(I^.Immediate and $FFFFFFFF,
+           AotRawCodeAot(I^.Immediate and $FFFFFFFF,
                             (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat) or
                             (I^.OpCode = bcRefLoadFloat) or (I^.OpCode = bcRefStoreFloat)) then
           EmitRawJ(apc, (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat) or

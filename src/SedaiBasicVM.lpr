@@ -775,6 +775,8 @@ var
   PassPrevCount: Integer;
   i, removed: Integer;
   ErrorSourceLine: Integer;
+  MapFile: string;          // DIVERGENZE 718
+  MapLine: Integer;
   ProgIsModern: Boolean;      // dialect of THIS program: drives fbc's abort message on an uncaught error
   AbortDesc, AbortModule: string;
   QBLangDetected: Boolean;
@@ -782,6 +784,7 @@ var
   AotFuncList: TAotFuncs;
   AotI: Integer;
   AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff: Integer;
+  AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff: Integer;   // DIVERGENZE 687
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
   ProfMode: TProfilerMode;
@@ -971,7 +974,18 @@ begin
         begin
           WriteLn('ERROR: Parsing failed!');
           if ParserResult.Errors.Count > 0 then
+          begin
+            // ⭐ DIVERGENZE 718 - the line of the program (or of the header) the error stands on, not of the EXPANDED source:
+            // with "#include" in front, "print (" on line 3 was reported at 1561. SB_LINE_MAP=0 is the A/B.
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and
+               PPMapOutputLine(ParserResult.Errors[0].Line, MapFile, MapLine) then
+            begin
+              ParserResult.Errors[0].Line := MapLine;
+              if MapFile <> '' then
+                ParserResult.Errors[0].Message := ParserResult.Errors[0].Message + ' [in ' + ExtractFileName(MapFile) + ']';
+            end;
             WriteLn('  ', ParserResult.Errors[0].ToString);
+          end;
           ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
@@ -2146,6 +2160,10 @@ begin
         // Offsets only - the compiled code reads the live base from the context it is given.
         VM.GetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
         AotSetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        // ...and where the home span lives, so a compiled RTC_PTR64 load tests it inline (DIVERGENZE 687): set only at run
+        // time it arrived after this compile, and every such load called AotPtrHome.
+        VM.GetHomeLayout(AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff);
+        AotSetHomeLayout(AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff);
         AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
                                          BytecodeProgram.ModernMode and not OptBoundsCheck,
                                          GetEnvironmentVariable('AOT_DIAG') = '1',
@@ -2206,6 +2224,8 @@ begin
             ErrorSourceLine := 0;
             if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
               ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
             // "#line n "file"" renames the position a diagnostic reports, which is exactly this one.
             AbortModule := BytecodeProgram.ModuleName;
             PPMapLine(ErrorSourceLine, ErrorSourceLine, AbortModule);
@@ -2232,6 +2252,8 @@ begin
           if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
           begin
             ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
             with BytecodeProgram.GetInstruction(VM.PC) do
             begin
               if ErrorSourceLine > 0 then
@@ -2387,6 +2409,8 @@ var
   LoadTime, ExecuteTime: Double;
   i: Integer;
   ErrorSourceLine: Integer;
+  MapFile: string;          // DIVERGENZE 718
+  MapLine: Integer;
   ShowBanners: Boolean;
   {$IFDEF ENABLE_PROFILER}
   Profiler: TProfiler;
@@ -2559,6 +2583,8 @@ begin
             if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
             begin
               ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
               with BytecodeProgram.GetInstruction(VM.PC) do
               begin
                 if ErrorSourceLine > 0 then

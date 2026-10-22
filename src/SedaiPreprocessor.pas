@@ -47,6 +47,11 @@ var
   // the file. Widening it costs a MISSING refusal (never a wrong answer), and the positional form
   // would need the directive's line to survive macro expansion, which it does not.
   GPPUndefNames: TStringList = nil;
+  // ⭐ DIVERGENZE 718 - where every line of the EXPANDED source came from: the file ('' = the program's own source) and its
+  // line there. Filled by Expand as it emits; read by PPMapOutputLine wherever a position is REPORTED, so a syntax error
+  // in a program that includes headers names the program's line (fbc: "le.bas(3) error 9") and not the expanded one.
+  GPPOriginFile: TStringList = nil;
+  GPPOriginLine: array of Integer;
 
 
   // ⭐ THE LIBRARIES THE PROGRAM NAMED with "#inclib". Until the FFI existed this directive was
@@ -176,6 +181,8 @@ var
   physical line and the unchanged module when no #line covers it. }
 procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string);
 
+{ DIVERGENZE 718: the file ('' = the program) and line an EXPANDED line (1-based) came from; False when unknown. }
+function PPMapOutputLine(ExpandedLine: Integer; out FileName: string; out SrcLine: Integer): Boolean;
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
 // ⭐ Did the source ask for a dialect that is NOT -lang fb? fbc honours '#lang "qb"' / '#lang "fblite"'
@@ -1058,6 +1065,7 @@ var
 function PPResolveTypeName(const Operand: string): string; forward;
 function PPIsBuiltinTypeWord(const U: string): Boolean; forward;
 procedure PPNoteDeclarations(const Line: string); forward;
+procedure PPCheckParamsAgainstFnMacros(const Line: string; FnDefs: TStringList); forward;
 
 function TokenPos(const Hay, Needle: string): Integer;
 // Position of Needle in Hay as a WHOLE TOKEN (delimited by non-identifier characters), or 0. A plain
@@ -4486,6 +4494,68 @@ begin
     PPAddDeclLine(L);
 end;
 
+var
+  GPPParamFnMacroKnob: Integer = -1;   // SB_PARAM_FNMACRO=0 turns DIVERGENZE 713 off (read once)
+
+procedure PPCheckParamsAgainstFnMacros(const Line: string; FnDefs: TStringList);
+// ⛔ DIVERGENZE 713 - a PARAMETER may not take the name of a function-like macro in force: fbc's "error 4: Duplicated
+// definition, at parameter n (name)" ("#define key(i) ..." from allegro.bi, then "Function f(ByVal key As Long)"). The
+// macro never expands there (no parentheses follow), so nothing else would notice. Only SUB / FUNCTION definitions are read.
+var
+  U, Params, P, NameU: string;
+  i, Depth, Start, ParamNo, k: Integer;
+  Parts: TStringList;
+begin
+  if (FnDefs = nil) or (FnDefs.Count = 0) then Exit;
+  if GPPParamFnMacroKnob < 0 then GPPParamFnMacroKnob := Ord(SysUtils.GetEnvironmentVariable('SB_PARAM_FNMACRO') <> '0');
+  if GPPParamFnMacroKnob = 0 then Exit;
+  U := UpperFast(Trim(Line));
+  // ⚠️ A DEFINITION only (measured): in a DECLARE the parameter names create no symbol, and fbc takes "Declare Function
+  // f(ByVal max As Long)" under glib's "#define MAX(a, b)" - gtk.bi, allegro.bi and glib.bi are written that way.
+  if Copy(U, 1, 8) = 'DECLARE ' then Exit;
+  for k := 1 to 3 do
+    if (Copy(U, 1, 8) = 'PRIVATE ') or (Copy(U, 1, 7) = 'PUBLIC ') or (Copy(U, 1, 7) = 'STATIC ') then
+      U := TrimLeft(Copy(U, Pos(' ', U) + 1, MaxInt));
+  if not ((Copy(U, 1, 4) = 'SUB ') or (Copy(U, 1, 9) = 'FUNCTION ')) then Exit;
+  i := Pos('(', U);
+  if i = 0 then Exit;
+  Depth := 0; Start := i + 1; Params := '';
+  while i <= Length(U) do
+  begin
+    if U[i] = '(' then Inc(Depth)
+    else if U[i] = ')' then
+    begin
+      Dec(Depth);
+      if Depth = 0 then begin Params := Copy(U, Start, i - Start); Break; end;
+    end;
+    Inc(i);
+  end;
+  if Trim(Params) = '' then Exit;
+  Parts := TStringList.Create;
+  try
+    Depth := 0; Start := 1;
+    for i := 1 to Length(Params) do
+      if Params[i] = '(' then Inc(Depth)
+      else if Params[i] = ')' then Dec(Depth)
+      else if (Params[i] = ',') and (Depth = 0) then begin Parts.Add(Copy(Params, Start, i - Start)); Start := i + 1; end;
+    Parts.Add(Copy(Params, Start, MaxInt));
+    for ParamNo := 0 to Parts.Count - 1 do
+    begin
+      P := Trim(Parts[ParamNo]);
+      while (Copy(P, 1, 6) = 'BYVAL ') or (Copy(P, 1, 6) = 'BYREF ') do P := TrimLeft(Copy(P, 7, MaxInt));
+      i := 1;
+      while (i <= Length(P)) and (P[i] in ['A'..'Z', '0'..'9', '_']) do Inc(i);
+      NameU := Copy(P, 1, i - 1);
+      if (NameU = '') or (NameU = 'AS') then Continue;
+      if FnDefs.IndexOfName(NameU) >= 0 then
+        raise EPreprocessorError.CreateFmt('Duplicated definition, at parameter %d (%s): %s is a function-like macro ' +
+          'in force here', [ParamNo + 1, LowerCase(NameU), NameU]);
+    end;
+  finally
+    Parts.Free;
+  end;
+end;
+
 procedure PPNoteDeclarations(const Line: string);
 // Collect, from a line the preprocessor is about to EMIT, the names it declares and the type each was
 // declared as (DIVERGENZE 23). This is the preprocessor's half of what fbc's single pass has for free:
@@ -4666,6 +4736,16 @@ begin
   end;
 end;
 
+function PPMapOutputLine(ExpandedLine: Integer; out FileName: string; out SrcLine: Integer): Boolean;
+begin
+  FileName := ''; SrcLine := ExpandedLine;
+  Result := (GPPOriginFile <> nil) and (ExpandedLine >= 1) and (ExpandedLine <= Length(GPPOriginLine)) and
+            (ExpandedLine <= GPPOriginFile.Count) and (GPPOriginLine[ExpandedLine - 1] > 0);
+  if not Result then Exit;
+  FileName := GPPOriginFile[ExpandedLine - 1];
+  SrcLine := GPPOriginLine[ExpandedLine - 1];
+end;
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 var
   Defs: TStringList;     // Names = UPPER object-like macro names, Values = macro bodies
@@ -4814,6 +4894,8 @@ var
   // macro expansion fed back through here). It exists for one reason: "#pragma once" is a statement a
   // file makes ABOUT ITSELF, so the directive has to know which file it is standing in.
   var
+    OwnOrigin: Boolean;      // DIVERGENZE 718
+    OriginLine: Integer;
     Lines: TStringList;
     li, p, q: Integer;
     Canon: string;   // the include path, canonicalised - the identity every "once" question asks about
@@ -5075,9 +5157,23 @@ var
       // re-expansion are re-entered here with their own text, whose line numbers say nothing about
       // where the question stands, so they leave the outer position alone. See GPPDefinedLimit.
       IsModuleText := (Text = GPPSourceForDefined);
+      // DIVERGENZE 718: a FILE's own text records the origin of what it emits; a macro fed back through here (no path,
+      // not the module) leaves its lines to the caller, which gives them the line the macro was used on.
+      OwnOrigin := IsModuleText or (SrcPath <> '');
+      OriginLine := 0;
       li := 0;
       while li < Lines.Count do
       begin
+        if OwnOrigin and (GPPOriginFile <> nil) then
+        begin
+          while GPPOriginFile.Count < Output.Count do
+          begin
+            GPPOriginFile.Add(SrcPath);
+            SetLength(GPPOriginLine, GPPOriginFile.Count);
+            GPPOriginLine[GPPOriginFile.Count - 1] := OriginLine;
+          end;
+          OriginLine := li + 1;
+        end;
         if IsModuleText then GPPDefinedLimit := li;
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
@@ -5932,11 +6028,13 @@ var
           begin
             ExpandedLine := ReprocessExpansion(ExpandedLine, Dir);
             PPNoteDeclarations(ExpandedLine);
+            PPCheckParamsAgainstFnMacros(ExpandedLine, FnDefs);
             Output.Add(ExpandedLine);
           end
           else
           begin
             PPNoteDeclarations(ExpandedLine);
+            PPCheckParamsAgainstFnMacros(ExpandedLine, FnDefs);
             Output.Add(ExpandedLine);
           end;
           CountDefBlocks(ExpandedLine);
@@ -5951,6 +6049,13 @@ var
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
         Inc(li);
       end;
+      if OwnOrigin and (GPPOriginFile <> nil) then   // DIVERGENZE 718: the last line's output
+        while GPPOriginFile.Count < Output.Count do
+        begin
+          GPPOriginFile.Add(SrcPath);
+          SetLength(GPPOriginLine, GPPOriginFile.Count);
+          GPPOriginLine[GPPOriginFile.Count - 1] := OriginLine;
+        end;
       // Drop any conditionals left open by this (included) text, so it can't affect the caller.
       while High(Active) > SavedStackTop do
       begin
@@ -6029,6 +6134,9 @@ begin
     SetLength(Taken, 0);
     EscapeOn := False;
     GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
+    if GPPOriginFile = nil then GPPOriginFile := TStringList.Create;   // DIVERGENZE 718: a new program, a new map
+    GPPOriginFile.Clear;
+    SetLength(GPPOriginLine, 0);
     GPPOutput := Output;          // ...positionally: the expansion so far IS the symbol table so far
     if GPPDefWords <> nil then FreeAndNil(GPPDefWords);   // a new program, a new expansion
     GPPDefWordsCovered := 0;

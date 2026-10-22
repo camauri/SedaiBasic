@@ -144,6 +144,7 @@ type
     function BlockDominatesAllLatches(Block: TSSABasicBlock; Loop: TLoopInfo): Boolean;
     function OperandInvariantModern(const Val: TSSAValue; Loop: TLoopInfo; ToHoist: TFPList): Boolean;
     function IsCandidateModern(const Instr: TSSAInstruction; Block: TSSABasicBlock; Loop: TLoopInfo; ToHoist: TFPList): Boolean;
+    function IsRawAddrHolder(ArrId: Integer): Boolean;   // "<name>$RA": the address of a native module cell
     procedure CollectInvariantsModern(Loop: TLoopInfo; ToHoist, OriginalBlocks: TFPList);
 
     { Check if an array is modified anywhere in the loop }
@@ -177,6 +178,16 @@ var
   GLicmMapInstrs: Int64 = 0;      // instructions visited by BuildLoopMaps, summed over all calls
   GLicmMultiEntry: Integer = 0;   // loops declined because something outside enters them past the header
   GLicmTFind, GLicmTSort, GLicmTMaps, GLicmTHoist: QWord;
+
+var
+  GLicmRa: Integer = -1;   // the "$RA" holder rule: -1 unread, 0 off (LICM_RA=0), 1 on
+
+function LicmRaOn: Boolean;
+begin
+  if GLicmRa < 0 then
+    if GetEnvironmentVariable('LICM_RA') = '0' then GLicmRa := 0 else GLicmRa := 1;
+  Result := GLicmRa = 1;
+end;
 
 function LicmDiagOn: Boolean;
 begin
@@ -1321,6 +1332,18 @@ begin
   Result := True;
 end;
 
+function TLoopInvariantCodeMotion.IsRawAddrHolder(ArrId: Integer): Boolean;
+// The one-element array SedaiSSA's RawModuleAddrArrayId declares for an "@"-taken module scalar: its name ends in "$RA",
+// a character no BASIC name can hold, so a program array can never answer yes.
+var
+  N: string;
+begin
+  Result := False;
+  if (ArrId < 0) or (ArrId >= FProgram.GetArrayCount) then Exit;
+  N := FProgram.GetArray(ArrId).Name;
+  Result := (Length(N) > 3) and (Copy(N, Length(N) - 2, 3) = '$RA');
+end;
+
 function TLoopInvariantCodeMotion.IsCandidateModern(const Instr: TSSAInstruction; Block: TSSABasicBlock;
   Loop: TLoopInfo; ToHoist: TFPList): Boolean;
 var
@@ -1350,6 +1373,22 @@ begin
   if not UniquelyDefinedInLoop(Instr, Loop) then Exit;
   // ...that is dead outside the loop (zero-trip safety).
   if not AllUsesInsideLoop(Instr.Dest, Loop) then Exit;
+
+  // ⭐ The "<name>$RA" holder of a native module cell: element 0 is the CELL'S ADDRESS, written once when the cell is
+  // allocated (hoisted to the program's entry, SedaiSSA HoistToEntry) and by nothing else. Every read of an "@"-taken
+  // module scalar loads it first, so a hot loop re-read it on every turn. None of the reasons the general rule below
+  // refuses applies to it: no thread writes it (the entry did, before any thread), no callee does (only the module body
+  // allocates), and a write through an address cannot land in it (its buffer is never handed to the program or to C).
+  // What remains is a store that NAMES it - a "ZString * n" Dim inside the loop, which is not hoisted - and that is in
+  // the loop's store set. ⚠️ A body reached by a JUMP would hide that store from the loop's blocks, and GOSUB is the one
+  // such body; it is refused in MODERN, and this path and the "$RA" cells are MODERN-only. LICM_RA=0 is the A/B.
+  if (Instr.OpCode = ssaArrayLoad) and (Instr.Src1.Kind = svkArrayRef) and LicmRaOn and
+     IsRawAddrHolder(Instr.Src1.ArrayIndex) then
+  begin
+    if FLoopModArrays.ContainsKey(Int64(Instr.Src1.ArrayIndex)) then Exit;
+    Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);
+    Exit;
+  end;
 
   if Instr.OpCode = ssaArrayLoad then
   begin

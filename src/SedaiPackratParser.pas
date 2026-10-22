@@ -414,6 +414,7 @@ type
     function AtEndSelect: Boolean;
     procedure ConsumeEndSelect;
     // SUB / FUNCTION declaration (FreeBASIC/QB). Body up to END SUB / END FUNCTION.
+    function ProcNameIsReserved(const NameU: string): Boolean;   // DIVERGENZE 717
     function ParseProcedureDecl: TASTNode;
     procedure ParseProcedureBody(Parent: TASTNode);
     function AtEndProcedure: Boolean;
@@ -598,6 +599,8 @@ implementation
 
 uses
   Math, StrUtils, TypInfo,
+  SedaiFbReserved,     // DIVERGENZE 717: a module procedure may not take a name fbc keeps for itself
+
   SedaiLexerFSM,       // SynthesizeHeaderThunks lexes the thunks it appends (508)
   SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
 
@@ -2269,6 +2272,15 @@ begin
    // under the Using, so the import won. "Declare Function bar : Using ns1 : ... : Function bar = 2"
    // answered ns1's 1 where fbc answers 2. The shape is "DECLARE SUB|FUNCTION|PROPERTY <name>";
    // a DOTTED name is a method of a type, not a module-level name. DIVERGENZE 98.
+   // ⛔ DIVERGENZE 717 - a MODULE-level procedure may not take a name fbc keeps for itself ("Declare Function run(...)",
+   // print, len, open...): its "error 4: Duplicated definition". A method or a namespace member may (measured). The
+   // name token can be a keyword token, so its text is asked, not its type. SB_PROC_RESERVED=0 is the A/B.
+   if FModernMode and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
+      (not SameText(VarToStr(Context.PeekNext.Value), 'OPERATOR')) and   // "Declare Operator Abs" overloads the builtin
+      Assigned(Context.PeekToken(2)) and (FNsPrefix = '') and (not FInNamespaceBody) and
+      ProcNameIsReserved(UpperFast(VarToStr(Context.PeekToken(2).Value))) then
+     HandleError(Format('Duplicated definition: "%s" is a FreeBASIC keyword and cannot name a procedure',
+       [UpperFast(VarToStr(Context.PeekToken(2).Value))]), Context.PeekToken(2));
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
       (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
@@ -4906,6 +4918,14 @@ begin
       // the surplus arguments at every call site were then dropped in silence.
       else if Context.Check(ttOpDot) then
       begin
+        // ⛔ DIVERGENZE 720 - ...but never as the FIRST parameter: fbc's "error 313: the first parameter in a procedure
+        // may not be vararg" (C needs a named argument before the tail). The implicit THIS of a method is not one the
+        // program wrote. SB_VARARG_FIRST=0 is the A/B.
+        if FModernMode and (GetEnvironmentVariable('SB_VARARG_FIRST') <> '0') and
+           ((ParamList.ChildCount = 0) or
+            ((ParamList.ChildCount = 1) and (ParamList.GetChild(0).ValueUpper = 'THIS'))) then
+          HandleError('The first parameter in a procedure may not be vararg ("..."): name at least one parameter before it',
+                      Context.CurrentToken);
         while Context.Check(ttOpDot) do Context.Advance;        // "..."
         Owner.Attributes.Values['VARIADIC'] := '1';
       end
@@ -4919,6 +4939,21 @@ begin
   end;
 end;
 
+function TPackratParser.ProcNameIsReserved(const NameU: string): Boolean;
+// DIVERGENZE 717: is NameU (upper case, unqualified) a name fbc refuses for a module procedure? The measured reserved table,
+// minus what the program #undef'd. SB_PROC_RESERVED=0 is the A/B.
+const
+  // MEASURED (22 Oct 2026, fbc 1.10.1, "Declare Function NAME(ByVal x As Long) As Long" for each of the 420 names): the
+  // reserved names fbc nevertheless takes for a procedure - library functions, not words of the language.
+  FB_PROC_NAME_FREE = ' BIN BSAVE CVA_LIST DYLIBSYMBOL __FUNCTION_NQ__ GETMOUSE HEX IMAGEINFO LEFT OCT RIGHT SCREENCONTROL ' +
+                      'SCREENGLPROC SCREENINFO VAL VALINT VALLNG VALUINT VALULNG WBIN WHEX WOCT ';
+begin
+  if Pos(' ' + NameU + ' ', FB_PROC_NAME_FREE) > 0 then Exit(False);
+  Result := (NameU <> '') and (Pos('.', NameU) = 0) and IsFbReservedVarName(NameU) and
+            ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(NameU) < 0)) and
+            (GetEnvironmentVariable('SB_PROC_RESERVED') <> '0');
+end;
+
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
@@ -4929,6 +4964,8 @@ var
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
   SaidOverload: Boolean;   // the decorators named OVERLOAD (DIVERGENZE 472)
   DefRet: string;
+  ConstParamSaved, ConstParamT, ConstParamN: string;   // DIVERGENZE 715
+  ConstParamI: Integer;
 begin
   SaidOverload := False;
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -5113,6 +5150,11 @@ begin
       end;
     end;
     CheckMemberDefinitionIsDeclared(MethodType, QualName, Kind, NameTok);
+    // ⛔ DIVERGENZE 717 - ...and a module-level DEFINITION the same ("Function run(...)": fbc's error 4).
+    if FModernMode and (MethodType = '') and (FNsPrefix = '') and (not FInNamespaceBody) and
+       ProcNameIsReserved(QualName) then
+      HandleError(Format('Duplicated definition: "%s" is a FreeBASIC keyword and cannot name a procedure', [QualName]),
+                  NameTok);
     NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
     Result.AddChild(NameNode);
   end;
@@ -5427,7 +5469,27 @@ begin
     Context.Advance;
   end;
 
+  // ⛔ DIVERGENZE 715 - a parameter "As Const T Ptr" points to a constant, as a Dim of that type does: "p[0] = 7" through it
+  // is fbc's "error 119: Cannot modify a constant". Registered for the body only - the set is keyed by bare name, so a
+  // module pointer of the same name gets its own state back at END SUB. SB_CONST_PARAM_PTEE=0 is the A/B.
+  ConstParamSaved := FConstPointeeNames.Text;
+  if GetEnvironmentVariable('SB_CONST_PARAM_PTEE') <> '0' then
+    for ConstParamI := 0 to ParamList.ChildCount - 1 do
+      if (ParamList.GetChild(ConstParamI).NodeType = antIdentifier) and (ParamList.GetChild(ConstParamI).ChildCount >= 1) then
+      begin
+        ConstParamT := UpperFast(VarToStr(ParamList.GetChild(ConstParamI).GetChild(0).Value));
+        ConstParamN := ParamList.GetChild(ConstParamI).ValueUpper;
+        if (ParamList.GetChild(ConstParamI).Attributes.Values['CONSTP'] = '1') and
+           (Length(ConstParamT) > 4) and (Copy(ConstParamT, Length(ConstParamT) - 3, 4) = ' PTR') and
+           (Pos(' PTR', Copy(ConstParamT, 1, Length(ConstParamT) - 4)) = 0) then
+        begin
+          if FConstPointeeNames.IndexOf(ConstParamN) < 0 then FConstPointeeNames.Add(ConstParamN);
+        end
+        else if FConstPointeeNames.IndexOf(ConstParamN) >= 0 then
+          FConstPointeeNames.Delete(FConstPointeeNames.IndexOf(ConstParamN));
+      end;
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
+  FConstPointeeNames.Text := ConstParamSaved;
   CheckByRefReturn(Result);                       // ...and what a BYREF one is allowed to hand back
   ConsumeEndProcedure;
   DoNodeCreated(Result);
@@ -5443,6 +5505,12 @@ begin
   // Also accepts unparenthesised args ("CALL name a, b"). The arguments are kept in
   // an antArgumentList child; SSA lowering wires them through the transfer registers.
   Token := Context.CurrentToken;
+  // ⭐ DIVERGENZE 722 - CALL does not exist in -lang fb: fbc "error 146: Only valid in -lang deprecated or fblite or
+  // qb". A procedure is called by its name. CLASSIC keeps the statement as it was, and so does a source that asked
+  // for another dialect (the escape hatch the OPTION refusal uses). SB_CALL_STMT=1 is the A/B.
+  if FModernMode and (not SourceDeclaresNonFbDialect) and (GetEnvironmentVariable('SB_CALL_STMT') <> '1') then
+    HandleError('CALL is not part of the FreeBASIC dialect: it is only valid in -lang deprecated, fblite or qb ' +
+      '(fbc: error 146) - call the procedure by its name, or add ''#lang "fblite"''', Token);
   Context.Advance;                                // consume CALL
   Result := nil;
   if not Context.Check(ttIdentifier) then
@@ -6115,6 +6183,10 @@ begin
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                                 // (
+    // ⛔ DIVERGENZE 720 - the procedure TYPE too: "Function Cdecl(...) As Long" is fbc's error 313 as the declaration is.
+    if FModernMode and Context.Check(ttOpDot) and (GetEnvironmentVariable('SB_VARARG_FIRST') <> '0') then
+      HandleError('The first parameter in a procedure may not be vararg ("..."): name at least one parameter before it',
+                  Context.CurrentToken);
     while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]) do
     begin
       // ⛔⛔ A PARSER LOOP NEEDS A PROGRESS GUARANTEE, and this one had none: it consumed only what it
@@ -15569,6 +15641,18 @@ begin
         DArrBounds := DArrBounds + IntToStr(DaLb) + ':' + IntToStr(DaUb);
       end;
     end;
+    // ⭐ DIVERGENZE 703 - ...and the ALIAS AFTER the bounds, which is where fbc puts it for an array: "extern tz(0 to 1)
+    // alias "tzname" as zstring ptr". Read only before them, the array was never bound and "tz(1)" was "Array not
+    // declared" (cgui deck). SB_EXTERN_ALIAS_AFTER=0 is the A/B.
+    if (AliasSym = '') and HasParens and Context.Check(ttIdentifier) and
+       SameText(VarToStr(Context.CurrentToken.Value), 'ALIAS') and
+       Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral) and
+       (GetEnvironmentVariable('SB_EXTERN_ALIAS_AFTER') <> '0') then
+    begin
+      Context.Advance;                                    // ALIAS
+      AliasSym := VarToStr(Context.CurrentToken.Value);
+      Context.Advance;                                    // "symbol"
+    end;
     if Context.Check(ttAsType) then
     begin
       Context.Advance;                                    // AS
@@ -16217,6 +16301,10 @@ begin
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
   if IsShared then Context.Advance;   // consume SHARED
+  // ⭐ DIVERGENZE 714 - the SHARED the program WROTE, kept apart from the attribute the compiler also sets on its own: fbc
+  // refuses it inside a procedure (error 61) and inside a compound statement or scoped block (error 96), and the SSA,
+  // which knows the scopes, asks this mark.
+  if IsShared then Result.Attributes.Values['WRITTENSHARED'] := '1';
   // FreeBASIC COMMON [SHARED] var: a module-shared variable. In our single-module model this is
   // exactly DIM SHARED, so force the SHARED flag (an explicit SHARED, if present, was consumed above).
   if UpperFast(VarToStr(Token.Value)) = kCOMMON then IsShared := True;
@@ -17876,6 +17964,7 @@ var
   MemberName, PrevMember: string;
   ValueNode, AsnNode: TASTNode;
   IsFirst: Boolean;
+  EnumVal: Int64;              // a member's folded value (703)
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnum, Token);
@@ -17951,6 +18040,11 @@ begin
         CreateLiteralNode(1, Token),
         TLexerToken.CreateSimple(ttOpAdd, '+'));
     if not Assigned(ValueNode) then ValueNode := CreateLiteralNode(0, Token);
+    // ⭐ DIVERGENZE 703 - ...and the member's VALUE is a constant the parser knows, as a Const's is: the bounds of a C
+    // library's data array ("extern cgui_colors(0 to NR_OF_CGUI_COLORS - 1) as long") are folded here, and a bound
+    // naming an enum member did not fold - the array was never bound to its C symbol, read 0, and "@a(0)" was refused.
+    if (Result.Attributes.Values['EXPLICIT'] <> '1') and TryConstIntExpr(ValueNode, EnumVal) and (FConstIntValues.IndexOfName(MemberName) < 0) then
+      FConstIntValues.Values[MemberName] := IntToStr(EnumVal);
     AsnNode := TASTNode.Create(antAssignment, Token);
     AsnNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MemberName, Token));
     AsnNode.AddChild(ValueNode);

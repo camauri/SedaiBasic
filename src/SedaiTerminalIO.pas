@@ -540,7 +540,8 @@ end;
 // valid sequence is a cell of its own value, as Utf8FirstCP reads it in the VM.
 function Utf8ToUtf32Cells(const S: string; out Count: Integer): string;
 var
-  i, k, n, b, cp, need: Integer;
+  i, k, n, b, need: Integer;
+  cp: Int64;
   P: PByte;
 begin
   n := Length(S);
@@ -554,6 +555,9 @@ begin
     else if (b and $E0) = $C0 then begin cp := b and $1F; need := 1; end
     else if (b and $F0) = $E0 then begin cp := b and $0F; need := 2; end
     else if (b and $F8) = $F0 then begin cp := b and $07; need := 3; end
+    else if (b and $FC) = $F8 then begin cp := b and $03; need := 4; end   // DIVERGENZE 225: a cell outside
+    else if (b and $FE) = $FC then begin cp := b and $01; need := 5; end   // the Unicode range, as WChr keeps it
+    else if b = $FE then begin cp := 0; need := 6; end
     else begin cp := b; need := 0; end;
     if need > 0 then
     begin

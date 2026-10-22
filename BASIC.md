@@ -186,7 +186,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `FN` | ✓ | Function call (FNname(value)) |
 | `SUB` | ✓ | Structured SUB procedure (FreeBASIC/QB): params (ByVal), locals, recursion. `END SUB` |
 | `FUNCTION` | ✓ | Structured FUNCTION: params, return via `fname=expr` or `RETURN expr`, recursion. `END FUNCTION` |
-| `CALL` | ✓ | Invoke a SUB: `CALL name(args)` (or `CALL name args`); `EXIT SUB`/`EXIT FUNCTION` for early return |
+| `CALL` | ✓ | Invoke a SUB: `CALL name(args)` (or `CALL name args`); `EXIT SUB`/`EXIT FUNCTION` for early return. ⚠️ Not part of the FreeBASIC dialect: in MODERN it is refused as fbc refuses it in `-lang fb` (error 146) unless the source declares `#lang "fblite"`/`"qb"`; call the procedure by its name. And a procedure exists from its `DECLARE` or its definition on: a call, `@name` or `ProcPtr(name)` above both is refused, as fbc reads the file once |
 
 ## FreeBASIC (MODERN) additions
 
@@ -490,6 +490,9 @@ raw bytes.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
   names an interface must provide every method of it, and it *is-a* that interface for dispatch and
   for `Is`. An fbc source is unaffected, since fbc has no interfaces to name.
+- **No `-lang qb`, `-lang deprecated` or `-lang fblite` dialects (owner's decision, 22 Oct 2026).** MODERN is fbc's
+  base dialect (`-lang fb`) and CLASSIC is Commodore BASIC v7; a source that asks for another fbc dialect with `#lang` is
+  not compiled as that dialect. Ledger entry 178.
 - **Error handling in MODERN is FreeBASIC's, never QB's.** fbc is QB-compatible only where a program
   asks for it (`-lang qb` / `fblite`), so MODERN's reference is fbc's own base dialect:
   - `Err` carries **FreeBASIC** error numbers, and `Err$` their **FreeBASIC** messages. ⛔ That is a
@@ -2202,7 +2205,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BOOLEAN` | ✓ | Holds -1 (true) or 0 (false) in the VM; a `BOOLEAN` variable **prints as `true`/`false`** (B1.5). A `Boolean` field of a record is **one byte**, and in the default (fb) memory mode it holds C's `0`/`1` exactly as `fbc` lays it out — so is the byte written or read through a `Boolean Ptr` or a `ByRef` Boolean parameter (any nonzero byte reads as true). An **array** of `Boolean` (standalone or a member of a record) is one byte per element with the same 0/1 image, and its elements print as `true`/`false`. ⚠️ In the `strict` memory mode a record keeps the VM's own image, where a true Boolean field or member element is the byte 255. |
+| `BOOLEAN` | ✓ | Holds -1 (true) or 0 (false) in the VM; a `BOOLEAN` variable **prints as `true`/`false`** (B1.5). A `Boolean` field of a record is **one byte**, and in the default (fb) memory mode it holds C's `0`/`1` exactly as `fbc` lays it out — so is the byte written or read through a `Boolean Ptr` or a `ByRef` Boolean parameter (any nonzero byte reads as true, and its value is what fbc reads from the byte: `CInt` of a Boolean holding the byte 200 is 56, `b = True` compares the bytes, And/Or/Xor work on the bytes, a copy keeps the byte). A number assigned to a Boolean becomes true or false (`x = 0.5` is true). An **array** of `Boolean` (standalone or a member of a record) is one byte per element with the same 0/1 image, and its elements print as `true`/`false`. ⚠️ In the `strict` memory mode a record keeps the VM's own image, where a true Boolean field or member element is the byte 255. |
 
 ##### Procedure Types
 

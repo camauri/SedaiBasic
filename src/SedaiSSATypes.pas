@@ -1294,10 +1294,47 @@ begin
     Result[3] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
     Result[4] := AnsiChar(Byte($80 or (Cell and $3F)));
   end
+  // ⭐ DIVERGENZE 225 - out of the Unicode range the cell is KEPT, in the original UTF-8 long forms (the spelling
+  // Utf8EncodeCP gives WChr of such a value), so a cell written into a WString * n buffer reads back as itself.
+  // UCS4CellToUnicode still answers U+FFFD: that is a conversion to UTF-16, where no such value exists.
+  else if Cell < $200000 then
+  begin
+    SetLength(Result, 4);
+    Result[1] := AnsiChar(Byte($F0 or (Cell shr 18)));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 12) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[4] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
+  else if Cell < $4000000 then
+  begin
+    SetLength(Result, 5);
+    Result[1] := AnsiChar(Byte($F8 or (Cell shr 24)));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 18) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or ((Cell shr 12) and $3F)));
+    Result[4] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[5] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
+  else if Cell < $80000000 then
+  begin
+    SetLength(Result, 6);
+    Result[1] := AnsiChar(Byte($FC or (Cell shr 30)));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 24) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or ((Cell shr 18) and $3F)));
+    Result[4] := AnsiChar(Byte($80 or ((Cell shr 12) and $3F)));
+    Result[5] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[6] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
   else
-    // Out of Unicode range: U+FFFD, the same answer UCS4CellToUnicode gives it, so the two funnels
-    // cannot disagree about what an impossible cell means.
-    Result := #$EF#$BF#$BD;
+  begin
+    SetLength(Result, 7);
+    Result[1] := AnsiChar(Byte($FE));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 30) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or ((Cell shr 24) and $3F)));
+    Result[4] := AnsiChar(Byte($80 or ((Cell shr 18) and $3F)));
+    Result[5] := AnsiChar(Byte($80 or ((Cell shr 12) and $3F)));
+    Result[6] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[7] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end;
 end;
 
 function UTF8ToUCS4Cells(const S: AnsiString): TUCS4Cells;
@@ -1318,6 +1355,9 @@ begin
     else if (C and $E0) = $C0 then begin need := 1; C := C and $1F; end
     else if (C and $F0) = $E0 then begin need := 2; C := C and $0F; end
     else if (C and $F8) = $F0 then begin need := 3; C := C and $07; end
+    else if (C and $FC) = $F8 then begin need := 4; C := C and $03; end   // DIVERGENZE 225: the long forms
+    else if (C and $FE) = $FC then begin need := 5; C := C and $01; end
+    else if C = $FE then begin need := 6; C := 0; end
     else begin need := 0; end;      // a stray continuation byte stands for itself
     if i + need > Length(S) then need := 0;
     for k := 1 to need do

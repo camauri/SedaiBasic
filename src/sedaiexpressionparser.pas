@@ -88,7 +88,11 @@ type
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
-    function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
+    function ParseTypeConstructor(Token: TLexerToken): TASTNode;
+    function ParenGroupIsTuple: Boolean;                          // DIVERGENZE 694
+    function TypeCtorHasTupleArg: Boolean;
+    function ParseTypeCtorTupleArgs(Token: TLexerToken): TASTNode;
+    function ParseTypeCtorTupleElem(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseConstQualifier(Token: TLexerToken): TASTNode; // CONST written where a TYPE is expected: step over it
     function ParseBraceInitializer(Token: TLexerToken): TASTNode; // { a, b, ... } aggregate initialiser in expression position
     function ParseArgPassMode(Token: TLexerToken): TASTNode;   // BYVAL/BYREF written on an ARGUMENT at a call site
@@ -2852,6 +2856,83 @@ begin
   Result := ParseExpression(precCall);
 end;
 
+function TExpressionParser.ParenGroupIsTuple: Boolean;
+// At a '(': does the group hold a comma at its OWN level? "(1, 2)" is a list of field values, "(a + b)" is an expression.
+// Looks ahead and puts the stream back.
+var
+  Saved, Depth: Integer;
+begin
+  Result := False;
+  if not Context.Check(ttDelimParOpen) then Exit;
+  Context.SavePosition(Saved);
+  Context.Advance;
+  Depth := 1;
+  while (Depth > 0) and not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    if Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) then Inc(Depth)
+    else if Context.Check(ttDelimParClose) or Context.Check(ttDelimBrackClose) then Dec(Depth)
+    else if (Depth = 1) and Context.Check(ttSeparParam) then begin Result := True; Break; end;
+    if Depth > 0 then Context.Advance;
+  end;
+  Context.RestorePosition(Saved);
+end;
+
+function TExpressionParser.TypeCtorHasTupleArg: Boolean;
+// Inside "type<T>(" : is any top-level argument a parenthesised LIST? Only then the tuple reader runs, so every other
+// constructor keeps the expression list it always had.
+var
+  Saved, Depth: Integer;
+begin
+  Result := False;
+  Context.SavePosition(Saved);
+  Depth := 0;
+  while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+  begin
+    if (Depth = 0) and Context.Check(ttDelimParClose) then Break;
+    if (Depth = 0) and Context.Check(ttDelimParOpen) and ParenGroupIsTuple then begin Result := True; Break; end;
+    if Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) then Inc(Depth)
+    else if Context.Check(ttDelimParClose) or Context.Check(ttDelimBrackClose) then Dec(Depth);
+    Context.Advance;
+  end;
+  Context.RestorePosition(Saved);
+end;
+
+function TExpressionParser.ParseTypeCtorTupleElem(Token: TLexerToken): TASTNode;
+// One field value of "type<T>( ... )": a parenthesised LIST becomes an antArgumentList marked TUPLEINIT (nested as deep as
+// the source nests it), anything else an expression (DIVERGENZE 694).
+var
+  L: TASTNode;
+begin
+  if Context.Check(ttDelimParOpen) and ParenGroupIsTuple then
+  begin
+    Context.Advance;                                     // (
+    L := TASTNode.Create(antArgumentList, Context.CurrentToken);
+    L.Attributes.Values['TUPLEINIT'] := '1';
+    repeat
+      L.AddChild(ParseTypeCtorTupleElem(Token));
+    until not Context.Match(ttSeparParam);
+    if not Context.Match(ttDelimParClose) then
+      HandleError('Expected ")" to close a list of field values', Context.CurrentToken);
+    Result := L;
+  end
+  else
+  begin
+    Result := ParseExpression(precNone);
+    if not Assigned(Result) then Result := TASTNode.Create(antLiteral, Token);
+  end;
+end;
+
+function TExpressionParser.ParseTypeCtorTupleArgs(Token: TLexerToken): TASTNode;
+// ⭐ DIVERGENZE 694 - the arguments of "type<T>( ... )" where a field value is itself a parenthesised list: a record of
+// records written inline, "type<BoundingBox>((-1, -1, -1), (1, 1, 1))" (raylib). The same list a DIM initialiser accepts,
+// built the same way.
+begin
+  Result := TASTNode.Create(antExpressionList, Token);
+  repeat
+    Result.AddChild(ParseTypeCtorTupleElem(Token));
+  until not Context.Match(ttSeparParam);
+end;
+
 function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
 // FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
 // or field-by-field when T has none). The TYPE token is already consumed. Lowers to the same shape the
@@ -3014,6 +3095,8 @@ begin
   begin
     if Context.Check(ttDelimParClose) then
       Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+    else if TypeCtorHasTupleArg and (GetEnvironmentVariable('SB_TYPECTOR_TUPLE') <> '0') then
+      Args := ParseTypeCtorTupleArgs(Token)               // DIVERGENZE 694: "type<B>((1, 2), (3, 4))"
     else
       Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
     if not Context.Match(ttDelimParClose) then

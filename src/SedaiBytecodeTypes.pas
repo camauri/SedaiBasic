@@ -1280,6 +1280,11 @@ type
     // Source map API - transparent replacement for SourceLine field
     procedure SetSourceLine(PC: Integer; Line: Integer);
     function GetSourceLine(PC: Integer): Integer;
+    // DIVERGENZE 718: the source map's RANGES, so a front end can rewrite their lines in place (sbc maps them onto the
+    // program's own lines before it writes a .basc).
+    function SourceMapRangeCount: Integer;
+    function SourceMapRangeLine(Index: Integer): Integer;
+    procedure SetSourceMapRangeLine(Index, Line: Integer);
     // Procedure map API (ERFN): record where each procedure's code starts, then ask which procedure
     // owns a PC. Returns '' for module-level code.
     procedure AddProcRange(StartPC: Integer; const Name: string);
@@ -1594,6 +1599,21 @@ begin
     Inc(FSourceMapCount);
     FLastSourceLine := Line;
   end;
+end;
+
+function TBytecodeProgram.SourceMapRangeCount: Integer;
+begin
+  Result := FSourceMapCount;
+end;
+
+function TBytecodeProgram.SourceMapRangeLine(Index: Integer): Integer;
+begin
+  Result := FSourceMap[Index].SourceLine;
+end;
+
+procedure TBytecodeProgram.SetSourceMapRangeLine(Index, Line: Integer);
+begin
+  FSourceMap[Index].SourceLine := Line;
 end;
 
 function TBytecodeProgram.GetSourceLine(PC: Integer): Integer;
