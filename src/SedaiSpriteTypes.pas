@@ -1,7 +1,7 @@
 {
   SedaiSpriteTypes.pas
   ====================
-  Sprite management type definitions for SedaiBasic2.
+  Sprite management type definitions for SedaiBasic.
 
   Based on Commodore 128 BASIC 7.0 sprite system with modern extensions:
   - Up to 256 sprites (configurable via MAX_SPRITES)

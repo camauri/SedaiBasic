@@ -1,4 +1,4 @@
-# SedaiBasic2 Interpreter with VM
+# SedaiBasic Interpreter with VM
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Maurizio%20Cammalleri-0077B5?logo=linkedin)](https://www.linkedin.com/in/maurizio-cammalleri-80a89a11/)
@@ -58,9 +58,9 @@ Also in [`bas/demo/`](bas/demo/): `bubble_universe.bas`, `voxel_landscape.bas`, 
 > - [WEB_BASIC.md](WEB_BASIC.md) - Web BASIC (`sbw`), the stand-alone HTTP server
 > - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
 
-## What is SedaiBasic2?
+## What is SedaiBasic?
 
-SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
+SedaiBasic began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
 
 - **CLASSIC**: line-numbered, from Commodore BASIC v7 (**202 / 210** core commands, 96%). It keeps
   v7's *language*, not v7's machine: this does not run on a C64/C128 and has none of its peripherals,
@@ -154,7 +154,7 @@ puts the engine level with CPython driving PCRE2.
 
 ### Numeric output follows the standard, not the reference
 
-Where FreeBASIC compatibility and **IEEE 754-2019** disagree, SedaiBasic2 follows the standard. This
+Where FreeBASIC compatibility and **IEEE 754-2019** disagree, SedaiBasic follows the standard. This
 is a deliberate, measured departure and the only one of its kind.
 
 Printing a `Double` at 16 significant digits, FreeBASIC rounds **twice**: the exact value to 17
@@ -165,7 +165,7 @@ patterns). The textbook case is `1e-283`, whose nearest double is exactly
 `9.999999999999999e-284`, while rounding to 17 first turns `…946` into `…95` and carries it through
 sixteen nines to print `1e-283`.
 
-SedaiBasic2 prints `9.999999999999999e-284`. Its digits come from the **exact** binary value,
+SedaiBasic prints `9.999999999999999e-284`. Its digits come from the **exact** binary value,
 a double is `M × 2^E`, so the decimal expansion is an integer built by repeated multiplication, with
 no floating point and no approximation anywhere, and are rounded once, half-to-even.
 
@@ -229,7 +229,7 @@ After this one-time setup, all local scripts will run without restrictions.
 #### Running the Setup
 
 ```powershell
-# Full setup: download FPC and compile SedaiBasic2
+# Full setup: download FPC and compile SedaiBasic
 .\setup.ps1
 
 # Show help
@@ -242,7 +242,7 @@ This will:
 3. Download the SDL2 Pascal bindings into `deps\sdl2`
 4. Install MinGW-w64 GCC into `deps\gcc` for the C hot loop, worth 27-45%
 5. Download SedaiAudioFoundation, without which there is no sound
-6. Compile SedaiBasic2 (`sb.exe`)
+6. Compile SedaiBasic (`sb.exe`)
 
 Every download is pinned by SHA-256. Steps 4 and 5 are never fatal: without them you get a slower
 interpreter and no audio, not a failed build.
@@ -253,7 +253,7 @@ interpreter and no audio, not a failed build.
 # Only download and install FPC (do not compile)
 .\setup.ps1 -FpcOnly
 
-# Only compile SedaiBasic2 (FPC must already be installed)
+# Only compile SedaiBasic (FPC must already be installed)
 .\setup.ps1 -BuildOnly
 
 # Force FPC reinstallation
@@ -294,7 +294,7 @@ Only `sdl2` and `sdl2_ttf` bindings are actually used, so there is no need for `
 
 ### Build System
 
-SedaiBasic2 includes cross-platform build scripts for compiling all targets.
+SedaiBasic includes cross-platform build scripts for compiling all targets.
 
 #### Build Targets
 
@@ -389,7 +389,7 @@ fpc -o"sb.exe" -Px86_64 -Twin64 -MObjFPC -O1 \
 
 ## Applications
 
-SedaiBasic2 provides four applications for different use cases:
+SedaiBasic provides four applications for different use cases:
 
 ### SedaiBasic VM (Command Line Interpreter)
 

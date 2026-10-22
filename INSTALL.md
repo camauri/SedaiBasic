@@ -1,4 +1,4 @@
-# Building SedaiBasic2
+# Building SedaiBasic
 
 There are no binary releases yet, so building is the only way in. This assumes you have already
 cloned the repository; everything below happens inside it.
@@ -231,7 +231,7 @@ Quietly building with a compiler other than the one you named is worse than not 
 ## macOS
 
 ⛔ **Never built, never tested.** `build.sh` recognises `--os darwin` and the dependency table knows
-the Homebrew package names, but nobody has compiled SedaiBasic2 on a Mac and no macOS binary has ever
+the Homebrew package names, but nobody has compiled SedaiBasic on a Mac and no macOS binary has ever
 been produced. Treat it as unexplored, not as supported.
 
 ---

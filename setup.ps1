@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    SedaiBasic2 Setup Script for Windows
+    SedaiBasic Setup Script for Windows
 
 .DESCRIPTION
     Interactive setup script that guides users through dependency configuration.
@@ -14,10 +14,10 @@
     Show help message
 
 .PARAMETER FpcOnly
-    Download and install FPC only, do not compile SedaiBasic2
+    Download and install FPC only, do not compile SedaiBasic
 
 .PARAMETER BuildOnly
-    Compile SedaiBasic2 only, skip FPC installation (requires FPC already installed)
+    Compile SedaiBasic only, skip FPC installation (requires FPC already installed)
 
 .PARAMETER ForceGcc
     Force reinstallation of the GCC used for the C hot loop
@@ -257,7 +257,7 @@ function Run-InteractiveSetup {
     # 1. FPC Configuration
     $fpcResult = Prompt-ForPath `
         -ComponentName "1. FREE PASCAL COMPILER (FPC 3.2.2)" `
-        -Description "Compiler required to build SedaiBasic2" `
+        -Description "Compiler required to build SedaiBasic" `
         -ValidationFile "bin\x86_64-win64\fpc.exe" `
         -DefaultDownloadPath $FpcDir `
         -CurrentValue $UserConfig.FpcPath
@@ -397,7 +397,7 @@ function Run-InteractiveSetup {
 
 function Show-Help {
     Write-Host ""
-    Write-Host "SedaiBasic2 Setup Script" -ForegroundColor Cyan
+    Write-Host "SedaiBasic Setup Script" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "USAGE:" -ForegroundColor Yellow
     Write-Host "    .\setup.ps1 [options]"
@@ -405,7 +405,7 @@ function Show-Help {
     Write-Host "OPTIONS:" -ForegroundColor Yellow
     Write-Host "    -Help           Show this help message"
     Write-Host "    -FpcOnly        Download and install FPC only, do not compile"
-    Write-Host "    -BuildOnly      Compile SedaiBasic2 only, skip FPC installation"
+    Write-Host "    -BuildOnly      Compile SedaiBasic only, skip FPC installation"
     Write-Host "    -ForceFpc       Force reinstallation of FPC even if present"
     Write-Host "    -ForceGcc       Force reinstallation of GCC (the C hot loop)"
     Write-Host "    -Clean          Clean build directories before compilation"
@@ -513,13 +513,13 @@ function Show-Summary {
                 Write-Host "  Location: " -NoNewline -ForegroundColor Gray
                 Write-Host $FpcExe -ForegroundColor Yellow
                 Write-Host ""
-                Write-Host "  To compile SedaiBasic2, run:" -ForegroundColor Gray
+                Write-Host "  To compile SedaiBasic, run:" -ForegroundColor Gray
                 Write-Host "    .\setup.ps1 -BuildOnly" -ForegroundColor White
             }
             "build" {
                 Write-Host "  BUILD COMPLETED!" -ForegroundColor Green
                 Write-Host ""
-                Write-Host "  SedaiBasic2 has been compiled successfully." -ForegroundColor White
+                Write-Host "  SedaiBasic has been compiled successfully." -ForegroundColor White
                 Write-Host ""
                 Write-Host "  Output: " -NoNewline -ForegroundColor Gray
                 Write-Host "$BinDir\" -ForegroundColor Yellow
@@ -529,7 +529,7 @@ function Show-Summary {
             default {
                 Write-Host "  SETUP COMPLETED SUCCESSFULLY!" -ForegroundColor Green
                 Write-Host ""
-                Write-Host "  SedaiBasic2 has been built successfully." -ForegroundColor White
+                Write-Host "  SedaiBasic has been built successfully." -ForegroundColor White
                 Write-Host ""
                 Write-Host "  Output: " -NoNewline -ForegroundColor Gray
                 Write-Host "$BinDir\" -ForegroundColor Yellow
@@ -866,7 +866,7 @@ function Build-SedaiBasic {
         return $false
     }
 
-    Show-Status "Building SedaiBasic2 using build.ps1 -Clean..."
+    Show-Status "Building SedaiBasic using build.ps1 -Clean..."
     # build.ps1's default target is 'all', and 'all' is FIVE: sbw was missing from this line.
     Show-Status "Targets: sb, sbc, sbd, sbv, sbw"
     Show-Status "Output: $BinDir\"
@@ -1151,7 +1151,7 @@ function Invoke-Setup {
         }
     }
 
-    # Step: Build SedaiBasic2
+    # Step: Build SedaiBasic
     if ($doBuild) {
         # If BuildOnly, verify FPC first
         if ($BuildOnly) {
@@ -1165,7 +1165,7 @@ function Invoke-Setup {
         }
 
         $currentStep++
-        Show-Step -Number $currentStep -Total $totalSteps -Title "Building SedaiBasic2"
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Building SedaiBasic"
 
         if (!(Initialize-BuildDirs)) {
             Show-Summary -Success $false

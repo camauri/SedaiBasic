@@ -1,9 +1,9 @@
 ﻿<#
 .SYNOPSIS
-    Downloads and installs SedaiBasic2 runtime dependencies for Windows
+    Downloads and installs SedaiBasic runtime dependencies for Windows
 
 .DESCRIPTION
-    This script downloads the SedaiBasic2 runtime package (SDL2 DLLs, fonts, etc.)
+    This script downloads the SedaiBasic runtime package (SDL2 DLLs, fonts, etc.)
     from the SedaiBasic2-Deps repository and extracts it to the bin/x86_64-win64 folder.
 
     Exit codes:
@@ -93,7 +93,7 @@ function Write-Error {
 # Main installation logic
 function Install-Runtime {
     Write-Status "============================================" -Color Cyan
-    Write-Status "  SedaiBasic2 Runtime Installer" -Color Cyan
+    Write-Status "  SedaiBasic Runtime Installer" -Color Cyan
     Write-Status "  Target: bin/x86_64-win64" -Color Cyan
     Write-Status "============================================" -Color Cyan
 
@@ -145,7 +145,7 @@ function Install-Runtime {
     }
 
     # Step 5: Download
-    Write-Step "Downloading SedaiBasic2 Runtime..."
+    Write-Step "Downloading SedaiBasic Runtime..."
     Write-Status "URL: $DOWNLOAD_URL" -Color Gray
 
     $downloadResult = Get-FileWithProgress -Url $DOWNLOAD_URL -OutFile $ZipFile -Quiet:$Quiet
@@ -217,7 +217,7 @@ function Install-Runtime {
 
     # Done
     Write-Status "`n============================================" -Color Green
-    Write-Success "  SedaiBasic2 Runtime installed successfully!"
+    Write-Success "  SedaiBasic Runtime installed successfully!"
     Write-Status "  Location: $RuntimeDir" -Color Green
     Write-Status "============================================" -Color Green
 

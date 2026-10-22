@@ -1,4 +1,4 @@
-﻿# SedaiBasic2 Benchmark Results
+﻿# SedaiBasic Benchmark Results
 
 ```
    ____           _       _ ____            _      ____
@@ -24,7 +24,7 @@
 | **CPU Threads** | 8 |
 | **CPU Max Clock** | 2,40 GHz |
 | **RAM** | 15,9 GB |
-| **Interpreter** | SedaiBasic2 (register-based bytecode VM) |
+| **Interpreter** | SedaiBasic (register-based bytecode VM) |
 
 ## Benchmark Results
 
@@ -36,7 +36,7 @@
 
 ## Python Comparison
 
-| Benchmark | SedaiBasic2 | Python (1T) | Speedup (1T) | Python (MT) | Speedup (MT) |
+| Benchmark | SedaiBasic | Python (1T) | Speedup (1T) | Python (MT) | Speedup (MT) |
 |-----------|------------:|------------:|-------------:|------------:|-------------:|
 | fannkuch-redux | 494425,244 ms | 1523821,101 ms | 3,08x | 555082,457 ms | 1,12x |
 | n-body | 88409,743 ms | 523862,617 ms | 5,93x | - | - |
@@ -44,7 +44,7 @@
 
 ## Lua Comparison
 
-| Benchmark | SedaiBasic2 | Lua 5.4 | Speedup |
+| Benchmark | SedaiBasic | Lua 5.4 | Speedup |
 |-----------|------------:|--------:|--------:|
 | fannkuch-redux | 494425,244 ms | 518408,784 ms | 1,05x |
 | n-body | 88409,743 ms | 223514,099 ms | 2,53x |
@@ -61,7 +61,7 @@
 ## Notes
 
 - Benchmarks from [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/)
-- Times measured using SedaiBasic2's built-in `--stats` option
+- Times measured using SedaiBasic's built-in `--stats` option
 - MIPS = Million Instructions Per Second (VM bytecode instructions)
 - Results may vary based on system load and thermal throttling
 - **Statistical measures** (when using -Runs > 1):

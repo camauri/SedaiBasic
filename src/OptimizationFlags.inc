@@ -22,7 +22,7 @@
 { ============================================================================
   OptimizationFlags.inc
 
-  Shared optimization flags for the entire SedaiBasic2 compiler.
+  Shared optimization flags for the entire SedaiBasic compiler.
   Include this file in any unit that needs to respect optimization settings.
 
   Usage:

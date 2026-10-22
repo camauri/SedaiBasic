@@ -25,7 +25,7 @@ unit SedaiProfiler;
 {$interfaces CORBA}
 {$codepage UTF8}
 
-{ VM Profiler for SedaiBasic2
+{ VM Profiler for SedaiBasic
 
   Provides two profiling modes:
   1. Sampling Profiler - Low overhead (~1-5%), interrupts VM at fixed intervals

@@ -22,7 +22,7 @@
 { ============================================================================
   Unit: SedaiDebug
 
-  Runtime debug flag management for SedaiBasic2 compiler.
+  Runtime debug flag management for SedaiBasic compiler.
 
   This unit provides:
     - Runtime debug flag variables (set via command-line)

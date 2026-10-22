@@ -1,4 +1,4 @@
-# Download utilities for SedaiBasic2 scripts
+# Download utilities for SedaiBasic scripts
 # Common functions for downloading files with progress
 
 function Get-FileWithProgress {
@@ -54,7 +54,7 @@ function Get-FileWithProgress {
         $webRequest = [System.Net.HttpWebRequest]::Create($Url)
         $webRequest.Method = "GET"
         $webRequest.AllowAutoRedirect = $true
-        $webRequest.UserAgent = "SedaiBasic2-Installer/1.0"
+        $webRequest.UserAgent = "SedaiBasic-Installer/1.0"
 
         $response = $webRequest.GetResponse()
         $totalBytes = $response.ContentLength

@@ -1,7 +1,7 @@
 {
   SedaiSpriteEngine.pas
   =====================
-  Hardware-like sprite engine for SedaiBasic2.
+  Hardware-like sprite engine for SedaiBasic.
 
   Implements ISpriteManager using SDL2 textures for rendering.
   Sprites are rendered as a layer on top of the text/graphics screen,

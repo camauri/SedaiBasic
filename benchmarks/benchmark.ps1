@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SedaiBasic2 benchmark suite - The Computer Language Benchmarks Game.
+    SedaiBasic benchmark suite - The Computer Language Benchmarks Game.
 
 .DESCRIPTION
     Runs the ten CLBG programs across every runtime available on this machine and reports wall-clock
@@ -28,7 +28,7 @@
       time is not credited. "No reference available on this machine" is reported as NO REF - which is
       a different thing from a failed comparison, and must never be read as a pass.
 
-    SedaiBasic2 runs under all four execution profiles: interpreter, AOT, JIT and AOT+JIT.
+    SedaiBasic runs under all four execution profiles: interpreter, AOT, JIT and AOT+JIT.
 
     Copyright (c) 2025 Maurizio Cammalleri
     Released under GNU GPL v3
@@ -44,7 +44,7 @@
 
     Why it is separate: the yardsticks are not what is under test, and at the standard CLBG sizes
     they dominate the battery - measured on this machine, Python and Lua together are 3.6 hours of
-    a 8-hour run, against 1.7 hours for all four SedaiBasic2 profiles. Fewer runs there buys back
+    a 8-hour run, against 1.7 hours for all four SedaiBasic profiles. Fewer runs there buys back
     most of the day, and it errs in the honest direction: a yardstick measured fewer times tends to
     read SLOWER, which flatters us, so the ratios it produces are a floor, not a boast.
 
@@ -67,7 +67,7 @@
     Run only the named runtimes: sedai, python, lua.
 
 .PARAMETER Profile
-    Run only the named SedaiBasic2 profiles: interp, aot, jit, aotjit.
+    Run only the named SedaiBasic profiles: interp, aot, jit, aotjit.
 
 .PARAMETER NoThermometer
     Skip the thermometer readings.
@@ -180,7 +180,7 @@ $Script:Suite = @(
        Desc='Eigenvalue using the power method' }
 )
 
-# The four SedaiBasic2 execution profiles.
+# The four SedaiBasic execution profiles.
 $Script:Profiles = @(
     @{ Key='interp'; Label='sb interp';  Flags=@() }
     @{ Key='aot';    Label='sb AOT';     Flags=@('--aot') }
@@ -514,7 +514,7 @@ function Invoke-Arm {
 
     # A COMPARISON runtime that cannot run the program here is not a benchmark failure: several CLBG
     # programs bind native libraries (GMP, PCRE2, lrexlib) that a stock Windows box does not have.
-    # That is reported as unavailable, and does not count against the benchmark. Only SedaiBasic2 -
+    # That is reported as unavailable, and does not count against the benchmark. Only SedaiBasic -
     # the thing under test - turns a failure into FAIL.
     if ($fail) { return @{ Ms = 0.0; Signature = $null; Error = $fail; IsReference = [bool]$IsReference } }
     return @{ Ms = $best; Signature = $sig; Error = $null; IsReference = [bool]$IsReference }
@@ -616,7 +616,7 @@ function Invoke-Benchmark {
     }
     $result.Expected = $expected
 
-    # --- SedaiBasic2, four profiles ----------------------------------------
+    # --- SedaiBasic, four profiles ----------------------------------------
     if ($Script:RunSedai) {
         $src = Join-Path $BasDir $Bench.Bas
         foreach ($p in $Script:Profiles) {
@@ -683,7 +683,7 @@ function Get-ArmLabel {
 }
 
 function Get-BadArms {
-    # The arms under test are the SedaiBasic2 ones; Python and Lua are yardsticks. A yardstick that
+    # The arms under test are the SedaiBasic ones; Python and Lua are yardsticks. A yardstick that
     # cannot run here, or that disagrees with the designated reference, is a fact about that runtime
     # on this machine. It is reported, but it does not fail the benchmark, which verifies sb.
     #
@@ -770,7 +770,7 @@ function Write-Report {
     $order = Get-ArmOrder
     $md = [Text.StringBuilder]::new()
 
-    [void]$md.AppendLine("# SedaiBasic2 - Benchmark Results")
+    [void]$md.AppendLine("# SedaiBasic - Benchmark Results")
     [void]$md.AppendLine()
     [void]$md.AppendLine("Generated: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))")
     [void]$md.AppendLine()

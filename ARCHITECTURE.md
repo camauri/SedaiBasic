@@ -1,8 +1,8 @@
-# SedaiBasic2 - Compilation Pipeline Architecture
+# SedaiBasic - Compilation Pipeline Architecture
 
 ## Overview
 
-SedaiBasic2 is a BASIC language compiler/interpreter implementing a complete compilation pipeline with:
+SedaiBasic is a BASIC language compiler/interpreter implementing a complete compilation pipeline with:
 - Finite State Machine (FSM) based Lexer with FastPath optimizations
 - Packrat Parser with Pratt expression parsing
 - Semi-Pruned Static Single Assignment (SSA) intermediate representation

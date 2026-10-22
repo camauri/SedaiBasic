@@ -1,4 +1,4 @@
-# CLBG - SedaiBasic2 vs Python 3 vs Lua 5.4 - 20 agosto 2026
+# CLBG - SedaiBasic vs Python 3 vs Lua 5.4 - 20 agosto 2026
 
 Intel Core Ultra 9 185H (16c/22t), Debian 13. Dimensione STANDARD (i valori veri della CLBG),
 migliore di 3 esecuzioni, raffreddamento 20 s fra le corse.

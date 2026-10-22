@@ -582,7 +582,7 @@ function Find-SedaiAudio {
         return @{ Enabled = $true; Path = $depsPath; Reason = 'Found in deps/' }
     }
 
-    # Auto-detect: check sibling folder (same level as SedaiBasic2)
+    # Auto-detect: check sibling folder (same level as SedaiBasic)
     $defaultPath = Join-Path (Split-Path -Parent $ProjectRoot) 'SedaiAudioFoundation'
     if (Test-Path (Join-Path $defaultPath 'src\sedaiaudiofoundation.pas')) {
         return @{ Enabled = $true; Path = $defaultPath; Reason = "Found at default: $defaultPath" }

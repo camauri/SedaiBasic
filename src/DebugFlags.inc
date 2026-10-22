@@ -22,7 +22,7 @@
 { ============================================================================
   DebugFlags.inc
 
-  Compile-time debug flags for the SedaiBasic2 compiler.
+  Compile-time debug flags for the SedaiBasic compiler.
 
   USAGE:
     1. Define flags here to ENABLE debug code compilation

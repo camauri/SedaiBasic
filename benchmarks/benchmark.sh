@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# SedaiBasic2 benchmark suite - The Computer Language Benchmarks Game.
+# SedaiBasic benchmark suite - The Computer Language Benchmarks Game.
 #
 # Port of benchmark.ps1 (which stays, and stays the reference for Windows). Same measurement
 # rules, same report, same verdicts - what changes is only what the platform forces:
@@ -506,7 +506,7 @@ invoke_benchmark() {
     [[ -z "$expected" ]] && line "no runnable reference on this machine - output CANNOT be verified" "$YELLOW"
     BENCH_EXPECTED["$name"]="$expected"
 
-    # --- SedaiBasic2, four profiles ----------------------------------------
+    # --- SedaiBasic, four profiles ----------------------------------------
     if [[ "$RUN_SEDAI" == "true" ]]; then
         local src="$BAS_DIR/$bas" p
         for p in "${PROFILE_KEYS[@]}"; do
@@ -622,7 +622,7 @@ write_report() {
     local name k
 
     {
-        echo "# SedaiBasic2 - Benchmark Results"
+        echo "# SedaiBasic - Benchmark Results"
         echo ""
         echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""

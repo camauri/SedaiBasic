@@ -22,7 +22,7 @@
 { ============================================================================
   ConfigFlags.inc
 
-  Compile-time configuration flags for the SedaiBasic2 compiler.
+  Compile-time configuration flags for the SedaiBasic compiler.
 
   These flags enable/disable optional features and external library support.
   ============================================================================ }

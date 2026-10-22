@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# SedaiBasic2 Setup Script for Linux
+# SedaiBasic Setup Script for Linux
 #
 # Copyright (c) 2025 Maurizio Cammalleri
 # Released under GNU GPL v3
@@ -404,7 +404,7 @@ BUILD_ARGS=("$BUILD_TARGET")
 [[ -n "$FPC_OVERRIDE" ]] && BUILD_ARGS+=(--fpc "$FPC_OVERRIDE")
 if "$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]}"; then
     echo ""
-    show_status "SedaiBasic2 built: $SCRIPT_DIR/bin/" "Success"
+    show_status "SedaiBasic built: $SCRIPT_DIR/bin/" "Success"
     exit 0
 else
     echo ""
