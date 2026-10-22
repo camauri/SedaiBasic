@@ -556,6 +556,9 @@ type
     // rather than reconstructed later. FDataCount is that walk's running pool length.
     FDataMarks: TStringList;
     FDataCount: Integer;
+    // DIVERGENZE 662: the ADDRESS items of the DATA statements - name = pool index, object = the expression node.
+    FDataAddrItems: TStringList;
+    FDataAddrNames: TStringList;   // ...and the arrays they name, upper case
     FUnsigned64Arrays: TStringList;      // array names (UPPER) whose element type is UInteger/ULongInt (unsigned-64)
     FSwapTempSeq: Integer;               // SWAP: unique counter for synthesized snapshot temp names
     FDefTypeBank: array['A'..'Z'] of Integer;  // DEFINT/DEFSTR...: initial letter -> bank (0/1/2), -1=unset
@@ -1793,6 +1796,8 @@ type
     procedure ProcessFilter(Node: TASTNode);
     // DATA/READ/RESTORE
     procedure ProcessData(Node: TASTNode);
+    procedure EmitDataAddressItems;   // DIVERGENZE 662
+    procedure NoteDataAddrNames(N: TASTNode);
     procedure EmitReadBoolean(const DestReg: TSSAValue);
     procedure ProcessRead(Node: TASTNode);
     procedure ProcessRestore(Node: TASTNode);
@@ -1859,6 +1864,7 @@ type
     // File management commands (executed directly in VM)
     procedure ProcessCopyFile(Node: TASTNode);
     function ProcessFsFunction(Node: TASTNode): TSSAValue;
+    function EmitGfxBFile(Node: TASTNode; IsLoad: Boolean): TSSAValue;   // DIVERGENZE 663
     function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
@@ -2379,6 +2385,8 @@ begin
   FAddrTakenProcs.Duplicates := dupIgnore;
   FArrayElemWidth.CaseSensitive := False;
   FDataMarks := TIndexedStringList.Create;
+  FDataAddrItems := TStringList.Create;   // DIVERGENZE 662
+  FDataAddrNames := TStringList.Create;
   FDataMarks.CaseSensitive := False;
   FDataCount := 0;
   FUnsigned64Arrays := TIndexedStringList.Create;
@@ -2548,6 +2556,8 @@ begin
   FArrayElemWidth.Free;
   FAddrTakenProcs.Free;
   FDataMarks.Free;
+  FDataAddrItems.Free;
+  FDataAddrNames.Free;
   FUnsigned64Arrays.Free;
   FBlockHandledVars.Free;
   FCurrentTopLevelLabels.Free;
@@ -8850,18 +8860,27 @@ begin
           begin
             ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);  // w
             ProcessExpression(ArgListNode.GetChild(1), RVal);     RReg := EnsureIntRegister(RVal);          // h
-            if ArgListNode.ChildCount >= 3 then
+            // an omitted argument ("ImageCreate(w, h, , 8)") is a valueless literal: the colour was not given
+            if (ArgListNode.ChildCount >= 3) and not ((ArgListNode.GetChild(2).NodeType = antLiteral) and
+               (VarIsEmpty(ArgListNode.GetChild(2).Value) or VarIsNull(ArgListNode.GetChild(2).Value))) then
             begin
               ProcessExpression(ArgListNode.GetChild(2), GVal); GReg := EnsureIntRegister(GVal);
             end
             else
             begin
               GReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaLoadConstInt, GReg, MakeSSAConstInt(Int64($FFFF00FF)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitInstruction(ssaLoadConstInt, GReg, MakeSSAConstInt(IMGCREATE_NOFILL), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             end;
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
             EmitInstruction(ssaGfxImageCreate, Result, ArgReg, RReg, GReg);   // Src3=color -> Immediate
+            // ✅ DIVERGENZE 677: the DEPTH, fourth argument - PhiSources[0], as ScreenRes carries its own
+            if (ArgListNode.ChildCount >= 4) and not ((ArgListNode.GetChild(3).NodeType = antLiteral) and
+               (VarIsEmpty(ArgListNode.GetChild(3).Value) or VarIsNull(ArgListNode.GetChild(3).Value))) then
+            begin
+              ProcessExpression(ArgListNode.GetChild(3), BVal);
+              FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1].AddPhiSource(EnsureIntRegister(BVal), nil);
+            end;
           end
           else
             raise Exception.Create('IMAGECREATE requires at least 2 arguments: IMAGECREATE(w, h [, color])');
@@ -8960,9 +8979,14 @@ begin
           // the visibility bit: $10000 while the cursor is shown - LOCATE's third argument hides it on a terminal
           ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaGfxForeColor, ShiftAmt, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(4));
+          RVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaBitwiseOr, RVal, ArgReg, ShiftAmt, MakeSSAValue(svkNone));
+          // DIVERGENZE 668: libfb answers 0 when its console is not initialised (output redirected) - the mask is 0 then
+          ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGfxForeColor, ShiftAmt, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(5));
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaBitwiseOr, Result, ArgReg, ShiftAmt, MakeSSAValue(svkNone));
+          EmitInstruction(ssaBitwiseAnd, Result, RVal, ShiftAmt, MakeSSAValue(svkNone));
         end
         else if FuncName = 'PMAP' then
         begin
@@ -25739,7 +25763,17 @@ begin
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
-    if Child.NodeType = antLiteral then
+    // DIVERGENZE 662: an ADDRESS item ("Data @mydbl") - a placeholder here, in pool order, and the address written into
+    // it by EmitDataAddressItems once the entry code has made the cells it names.
+    if Child.Attributes.Values['DATAADDR'] = '1' then
+    begin
+      FDataAddrItems.AddObject(IntToStr(FDataCount), Child);
+      NoteDataAddrNames(Child);
+      Inc(FDataCount);
+      EmitInstruction(ssaDataAdd, MakeSSAValue(svkNone), MakeSSAConstInt(0),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else if Child.NodeType = antLiteral then
     begin
       Inc(FDataCount);   // running pool length: what a RESTORE mark seen later must point PAST
       // Determine type of data and emit appropriate ssaDataAdd
@@ -25763,6 +25797,46 @@ begin
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
+  end;
+end;
+
+procedure TSSAGenerator.NoteDataAddrNames(N: TASTNode);
+// DIVERGENZE 662: the arrays an address item of a DATA statement names ("@arr(2)") - EmitSharedArrayAllocs hoists them.
+var
+  i: Integer;
+begin
+  if N = nil then Exit;
+  if (N.NodeType = antArrayAccess) and (N.ChildCount > 0) and (N.GetChild(0).NodeType = antIdentifier) and
+     (FDataAddrNames.IndexOf(N.GetChild(0).ValueUpper) < 0) then
+    FDataAddrNames.Add(N.GetChild(0).ValueUpper);
+  for i := 0 to N.ChildCount - 1 do NoteDataAddrNames(N.GetChild(i));
+end;
+
+procedure TSSAGenerator.EmitDataAddressItems;
+// ✅ DIVERGENZE 662 - the address items of the DATA statements ("Data @"fOObAR", @mydbl, @proc"). fbc knows them at link
+// time; here they exist once the entry code has allocated the module's cells and arrays, so they are evaluated right
+// after that and written into the placeholders ProcessData left in the pool (bcDataSetInt), before any module
+// constructor or module code can READ them.
+var
+  i: Integer;
+  V, R: TSSAValue;
+begin
+  for i := 0 to FDataAddrItems.Count - 1 do
+  begin
+    ProcessExpression(TASTNode(FDataAddrItems.Objects[i]), V);
+    if (V.Kind <> svkRegister) or (V.RegType <> srtInt) then
+    begin
+      R := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      if V.Kind = svkConstInt then
+        EmitInstruction(ssaLoadConstInt, R, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+        EmitInstruction(ssaFloatToInt, R, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else
+        Continue;
+      V := R;
+    end;
+    EmitInstruction(ssaDataSetInt, MakeSSAValue(svkNone), V,
+                   MakeSSAConstInt(StrToInt(FDataAddrItems[i])), MakeSSAValue(svkNone));
   end;
 end;
 
@@ -26435,6 +26509,9 @@ var
   FilenameVal, FilenameReg: TSSAValue;
 begin
   if FCurrentBlock = nil then Exit;
+  // ✅ DIVERGENZE 663: in MODERN BLOAD is fbgfx's (a BMP or a raw block into an image, memory or the screen); the C128's
+  // bytecode BLOAD below stays CLASSIC's
+  if FModernMode then begin EmitGfxBFile(Node, True); Exit; end;
 
   // BLOAD "filename"
   if Node.ChildCount > 0 then
@@ -26458,6 +26535,7 @@ var
   FilenameVal, FilenameReg: TSSAValue;
 begin
   if FCurrentBlock = nil then Exit;
+  if FModernMode then begin EmitGfxBFile(Node, False); Exit; end;   // DIVERGENZE 663, as BLOAD above
 
   // BSAVE "filename"
   if Node.ChildCount > 0 then
@@ -31110,6 +31188,50 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitGfxBFile(Node: TASTNode; IsLoad: Boolean): TSSAValue;
+// ✅ DIVERGENZE 663 - fbgfx's BSAVE filename, source [, size [, pal]] and BLOAD filename [, dest [, pal]], as a statement or
+// a function (0, or fbc's error code). The arguments are POSITIONAL, an omitted one a valueless literal; every operand
+// the VM reads is a register, an omitted one 0 (the screen / no size / no palette).
+var
+  i: Integer;
+  V: TSSAValue;
+  Ops: array[0..3] of TSSAValue;
+  Instr: TSSAInstruction;
+
+  function Omitted(k: Integer): Boolean;
+  begin
+    Result := (k >= Node.ChildCount) or (Node.GetChild(k) = nil) or
+              ((Node.GetChild(k).NodeType = antLiteral) and
+               (VarIsEmpty(Node.GetChild(k).Value) or VarIsNull(Node.GetChild(k).Value)));
+  end;
+
+begin
+  if Omitted(0) then raise Exception.CreateFmt('%s requires a file name', [IfThen(IsLoad, 'BLOAD', 'BSAVE')]);
+  ProcessStringExpression(Node.GetChild(0), V);
+  Ops[0] := EnsureStringRegister(V);
+  // BSAVE: source, size, palette; BLOAD: destination, -, palette
+  for i := 1 to 3 do
+  begin
+    if (not IsLoad or (i <> 2)) and not Omitted(IfThen(IsLoad and (i = 3), 2, i)) then
+    begin
+      ProcessExpression(Node.GetChild(IfThen(IsLoad and (i = 3), 2, i)), V);
+      Ops[i] := EnsureIntRegister(V);
+    end
+    else
+      Ops[i] := EnsureIntRegister(MakeSSAConstInt(0));
+  end;
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  Instr := TSSAInstruction.Create(ssaGfxBFile);
+  Instr.Dest := Result;
+  Instr.Src1 := Ops[0];
+  Instr.Src2 := Ops[1];
+  Instr.Src3 := MakeSSAConstInt(Ord(IsLoad));
+  Instr.SourceLine := Node.SourceLine;
+  Instr.AddPhiSource(Ops[2], nil);
+  Instr.AddPhiSource(Ops[3], nil);
+  FCurrentBlock.AddInstruction(Instr);
+end;
+
 function TSSAGenerator.ProcessFsFunction(Node: TASTNode): TSSAValue;
 // FreeBASIC function form of a filesystem command (parser guarantees MODERN and the name set):
 // ChDir/MkDir/RmDir/Kill/FileCopy(...) -> error code, Shell(cmd) -> exit code. Emits the SAME SSA
@@ -31124,6 +31246,7 @@ begin
   if FCurrentBlock = nil then
     raise Exception.CreateFmt('%s() outside a block', [FuncName]);
   if FuncName = kDIR then Exit(EmitDir(Node));
+  if (FuncName = 'BSAVE') or (FuncName = 'BLOAD') then Exit(EmitGfxBFile(Node, FuncName = 'BLOAD'));   // 663
   if FuncName = '__CVABASE' then
   begin
     // Internal, emitted by TryEmitCvaMacro alone: CVA_START's answer.
@@ -48299,7 +48422,9 @@ var
   i, k: Integer;
   Decl: TASTNode;
 begin
-  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  // ⭐ DIVERGENZE 662: a module array named by an ADDRESS item of a DATA statement ("Data @arr(2)") is static storage in
+  // fbc too, and EmitDataAddressItems takes its address right after this - so it is hoisted the same way, shared or not.
+  if (Node = nil) or (((FModuleCtors = nil) or (FModuleCtors.Count = 0)) and (FDataAddrNames.Count = 0)) then Exit;
   for i := 0 to Node.ChildCount - 1 do
   begin
     if Node.GetChild(i).NodeType <> antDim then Continue;
@@ -48307,7 +48432,9 @@ begin
     begin
       Decl := Node.GetChild(i).GetChild(k);
       if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
-      if Decl.Attributes.Values['SHARED'] <> '1' then Continue;
+      if not (((Decl.Attributes.Values['SHARED'] = '1') and Assigned(FModuleCtors) and (FModuleCtors.Count > 0)) or
+              ((Decl.GetChild(0).NodeType = antIdentifier) and
+               (FDataAddrNames.IndexOf(Decl.GetChild(0).ValueUpper) >= 0))) then Continue;
       if Decl.GetChild(1).NodeType <> antDimensions then Continue;      // a scalar: the allocs above have it
       if not DimBoundsAreConstant(Decl.GetChild(1)) then Continue;
       Decl.Attributes.Values['HOISTEDDIM'] := '1';
@@ -66261,6 +66388,8 @@ begin
   // documents a few hundred lines below.
   FDataMarks.Clear;
   FDataCount := 0;
+  FDataAddrItems.Clear;
+  FDataAddrNames.Clear;
   PreProcessData(AST);
 
   // (PreCollectProcedures already ran, above the raw-pointer fixpoint - see the note there. It is
@@ -66303,6 +66432,7 @@ begin
   EmitStaticMemberRecords;
   EmitSharedScalarConstInits(AST);
   EmitSharedArrayAllocs(AST);
+  EmitDataAddressItems;   // DIVERGENZE 662: after the cells and arrays exist, before anything can READ
   EmitModuleConstructors;
 
   // Process AST (DATA statements will be skipped since they're already processed).

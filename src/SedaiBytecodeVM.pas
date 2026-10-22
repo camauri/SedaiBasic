@@ -247,6 +247,10 @@ type
       SB_IMG_NATIVE=0 is the A/B: the image-surface region of before. }
     FImgBlocks: array of PByte;
     FImgBlockCap: array of PtrUInt;
+    // ✅ DIVERGENZE 677: bytes per pixel of each IMAGECREATE image (0 = 4), and how many are at 1 or 2 - while that is
+    // zero ExecuteGraphicsOp reconciles nothing.
+    FImgBpp: array of Byte;
+    FImgLowCount: Integer;
     FImgNative: Boolean;
     FImgLastAddr: PtrUInt;
     FImgLastHandle: Integer;
@@ -930,6 +934,10 @@ type
     function ArrDescField(const A: TArrayStorage; Field: Integer): Int64;  // ...and the two element bases
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     procedure ImgShape(Handle: Integer);        // pitch, block and header of an IMAGECREATE surface (phase 5.5)
+    function ImgBppOf(Handle: Integer): Integer;   // 1, 2 or 4 bytes per pixel (DIVERGENZE 677)
+    procedure ImgFill(Handle: Integer; Fill: UInt32);
+    function GfxBFile(Ctx: TExecutionContext; IsLoad: Boolean; const AName: string; P, Size, Pal: Int64): Int64;   // 663
+    procedure ExecuteGraphicsOpBody(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function ImgBlockOf(Handle: Integer): PByte;
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
     // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
@@ -945,6 +953,7 @@ type
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function ClosureEntryPC(A: PtrUInt): Int64;                     // ...e la strada inversa (DIVERGENZE 425 · 561)
     function ValueForC(Ctx: TExecutionContext; V: Int64; SigIdx: Int64): Int64;   // bcValueForC (561 · 576)
+    function FbConsoleBare: Boolean;   // DIVERGENZE 668: fbc's console NOT initialised (output redirected)
     function PtrValueForC(V: Int64; RawHeapToo: Boolean): Int64;    // ...its pointer half (576)
     function PtrFromIntValue(Ctx: TExecutionContext; V: Int64): Int64;   // bcPtrFromInt (DIVERGENZE 528)
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
@@ -6932,7 +6941,7 @@ procedure TBytecodeVM.ImgShape(Handle: Integer);
 // GET re-shapes it (DIVERGENZE 646: fbc rewrites the header in the SAME buffer). ⚠️ A GET larger than the block would
 // write past it under fbc; here the surface keeps its own pixels and the header still tells the new size.
 var
-  W, H, Pitch: Integer;
+  W, H, Pitch, Bpp: Integer;
   Need: PtrUInt;
   Blk: PByte;
   Addr: Int64;
@@ -6941,10 +6950,11 @@ begin
   W := FGraphics.SurfaceWidth(Handle);
   H := FGraphics.SurfaceHeight(Handle);
   if (W <= 0) or (H <= 0) then Exit;
-  Pitch := (W * 4 + 15) and not 15;
+  Bpp := ImgBppOf(Handle);                  // DIVERGENZE 677: 1, 2 or 4 bytes per pixel, as fbc gives the image
+  Pitch := (W * Bpp + 15) and not 15;
   if not (FNativeMemory and FImgNative) then
   begin
-    FGraphics.SetSurfaceImageBuffer(Handle, nil, Pitch div 4);
+    FGraphics.SetSurfaceImageFormat(Handle, Bpp, nil, Pitch);
     Exit;
   end;
   Need := PtrUInt(RAWPTR_IMG_HDR_SIZE) + PtrUInt(Pitch) * PtrUInt(H);
@@ -6965,14 +6975,493 @@ begin
   // fbgfx.bi's IMAGE: type(u32) bpp(s32) width(u32) height(u32) pitch(u32), then 12 reserved bytes. bpp is BYTES.
   FillChar(Blk^, RAWPTR_IMG_HDR_SIZE, 0);
   PLongWord(Blk)^ := 7;                              // fbc's PUT_HEADER_NEW
-  PLongInt(Blk + 4)^ := 4;
+  PLongInt(Blk + 4)^ := Bpp;
   PLongWord(Blk + 8)^ := LongWord(W);
   PLongWord(Blk + 12)^ := LongWord(H);
   PLongWord(Blk + 16)^ := LongWord(Pitch);
   if Need <= FImgBlockCap[Handle] then
-    FGraphics.SetSurfaceImageBuffer(Handle, Blk + RAWPTR_IMG_HDR_SIZE, Pitch div 4)
+    FGraphics.SetSurfaceImageFormat(Handle, Bpp, Blk + RAWPTR_IMG_HDR_SIZE, Pitch)
   else
-    FGraphics.SetSurfaceImageBuffer(Handle, nil, Pitch div 4);
+    FGraphics.SetSurfaceImageFormat(Handle, Bpp, nil, Pitch);
+end;
+
+procedure TBytecodeVM.ImgFill(Handle: Integer; Fill: UInt32);
+// DIVERGENZE 677: IMAGECREATE fills EVERY byte of the pixel area, the row padding too - measured on fbc at 8, 16 and 32
+// bits ("ImageCreate(5, 2, 7)" at 8 bits: sixteen 7s per row). CreateSurface filled the picture; this fills the bytes.
+var
+  Data: PByte;
+  Size, i: Integer;
+  W16: Word;
+begin
+  if not Assigned(FGraphics) or not FGraphics.SurfaceData(Handle, Data, Size) or (Data = nil) or (Size <= 0) then Exit;
+  case ImgBppOf(Handle) of
+    1: FillChar(Data^, Size, Byte(Fill));
+    2: begin
+         W16 := Word((((Fill shr 16) and $FF) shr 3) shl 11) or Word((((Fill shr 8) and $FF) shr 2) shl 5) or
+                Word((Fill and $FF) shr 3);
+         for i := 0 to Size div 2 - 1 do PWord(Data + i * 2)^ := W16;
+       end;
+  else
+    for i := 0 to Size div 4 - 1 do PUInt32(Data + i * 4)^ := Fill;
+  end;
+end;
+
+function TBytecodeVM.GfxBFile(Ctx: TExecutionContext; IsLoad: Boolean; const AName: string; P, Size, Pal: Int64): Int64;
+// ✅ DIVERGENZE 663 - fbgfx's BSAVE and BLOAD, transcribed from fbc 1.10.1's gfx_bsave.c / gfx_bload.c rule by rule:
+//   BSAVE name, src [, size [, pal]]: a name ending in ".bmp" writes a BMP of the image src (or of the screen, src = 0) -
+//     an 8-bit image as an 8-bit BMP with 256 palette entries (the device palette, or pal's 6-bit one), a 16-bit image as
+//     24 bits, a 32-bit one as 32 with its alpha; rows bottom-up, each a whole number of words. Any other name writes
+//     &hFE, the size as 32 bits and `size` bytes from src (the screen's bytes and its palette when src = 0).
+//   BLOAD name [, dest [, pal]]: &hFD (QB) / &hFE blocks are copied into dest (or the screen); a BMP (1/4/8/16/24/32
+//     bits, BI_RGB or BI_BITFIELDS, either row order) goes into the image dest - clipped to it, the image's header kept -
+//     or the screen, converted to its depth; a palette goes to pal (6 bits) or becomes the device palette.
+//   The answer is fbc's error code: 0, 1 illegal function call, 2 file not found, 3 file I/O error.
+// ⚠️ A palette pointer is asked for its 256 Longs as ONE block from its base: in strict a pointer is a VM name whose
+//   arithmetic is not in bytes, so "Pal + i * 4" named the wrong element (and ran past the array).
+// ⚠️ An image is named by its pointer; any other non-zero pointer is MEMORY, which only the raw form uses.
+const
+  E_OK = 0; E_ILLEGAL = 1; E_NOTFOUND = 2; E_FILEIO = 3;
+var
+  FS: TFileStream;
+  Surf, W, H, Bpp, Pitch, x, y, i, OutBpp, OutPitch, n: Integer;
+  Data: PByte;
+  DataSize: Integer;
+  Row: array of Byte;
+  Pix: UInt32;
+  c, v16: Word;
+  PalTab: array[0..255] of UInt32;
+  Hdr: array[0..53] of Byte;
+  Mem: PByte;
+  Id: Byte;
+  B4: array[0..3] of Byte;
+  bfOff, biSize, biComp, bfType, biPlanes, biBits: LongWord;
+  biW, biH: LongInt;
+  Flipped, IsImg: Boolean;
+  Masks, Shifts, Bits: array[0..3] of LongWord;
+  RowSize, Expand, Padding, Entries, DW, DH, DBpp, k: Integer;
+  Src: array of Byte;
+  Raw: UInt32;
+  r, g, b, a: LongWord;
+
+  procedure Put32(Ofs: Integer; V: LongWord);
+  begin
+    Hdr[Ofs] := V and $FF; Hdr[Ofs + 1] := (V shr 8) and $FF; Hdr[Ofs + 2] := (V shr 16) and $FF; Hdr[Ofs + 3] := V shr 24;
+  end;
+
+  function Get16(Ofs: Integer): LongWord;
+  begin
+    Result := Hdr[Ofs] or (LongWord(Hdr[Ofs + 1]) shl 8);
+  end;
+
+  function Get32(Ofs: Integer): LongWord;
+  begin
+    Result := Hdr[Ofs] or (LongWord(Hdr[Ofs + 1]) shl 8) or (LongWord(Hdr[Ofs + 2]) shl 16) or (LongWord(Hdr[Ofs + 3]) shl 24);
+  end;
+
+  // fbc's CONVERT_DEPTH: a channel of `from` bits to `to` bits
+  function ConvDepth(cv: LongWord; From, ToB: Integer): LongWord;
+  begin
+    if From <= 0 then Exit(0);
+    if From <= ToB then Result := (cv shl (ToB - From)) or (cv shr (From - (ToB - From)))
+    else Result := cv shr (From - ToB);
+  end;
+
+  // the pixel (x, y) of a surface as fbc holds it: an index at 1 byte, RGB565 at 2, ARGB at 4
+  function SurfPixel(SX, SY: Integer): UInt32;
+  begin
+    Result := FGraphics.GetPixel(Surf, SX, SY);
+    if Bpp = 1 then Result := Result and $FF
+    else if Bpp = 2 then
+      Result := ((((Result shr 16) and $FF) shr 3) shl 11) or ((((Result shr 8) and $FF) shr 2) shl 5) or ((Result and $FF) shr 3);
+  end;
+
+  // writes a pixel given in the DESTINATION's format (index / RGB565 / ARGB)
+  procedure SetSurf(SX, SY: Integer; V: UInt32);
+  begin
+    if DBpp = 2 then   // RGB565 -> ARGB by repeating the high bits, as ImagePull and fbc do
+      V := $FF000000 or (UInt32((((V shr 11) and $1F) shl 3) or (((V shr 11) and $1F) shr 2)) shl 16) or
+           (UInt32((((V shr 5) and $3F) shl 2) or (((V shr 5) and $3F) shr 4)) shl 8) or
+           UInt32(((V and $1F) shl 3) or ((V and $1F) shr 2));
+    FGraphics.SetPixel(Surf, SX, SY, V);
+  end;
+
+begin
+  Result := E_ILLEGAL;
+  if not Assigned(FGraphics) then Exit;
+  // the image, the screen (0) or neither (memory)
+  Surf := -1;
+  IsImg := False;
+  if P = 0 then Surf := FGfxWorkSurface
+  else
+  begin
+    i := ImgHandleOf(P);
+    if (i > 0) and (((P and RAWPTR_TAG) = 0) or ((P and RAWPTR_REGION_IMG) <> 0)) and
+       (FGraphics.SurfaceWidth(i) > 0) then
+    begin
+      Surf := i;
+      IsImg := True;
+    end;
+  end;
+  if Surf >= 0 then
+  begin
+    W := FGraphics.SurfaceWidth(Surf);
+    H := FGraphics.SurfaceHeight(Surf);
+    if IsImg then Bpp := ImgBppOf(Surf) else Bpp := FGraphics.SurfaceBytesPerPixel(Surf);
+    if (Bpp <> 1) and (Bpp <> 2) then Bpp := 4;
+  end;
+
+  if not IsLoad then
+  begin
+    try
+      FS := TFileStream.Create(AName, fmCreate);
+    except
+      Exit(E_NOTFOUND);
+    end;
+    try
+      try
+        if SameText(ExtractFileExt(AName), '.bmp') then
+        begin
+          if (Surf < 0) or (W <= 0) or (H <= 0) then Exit(E_ILLEGAL);
+          case Bpp of
+            1: OutBpp := 1;
+            2: OutBpp := 3;
+          else OutBpp := 4;
+          end;
+          case OutBpp of
+            1: begin OutPitch := (W + 3) and not 3; bfOff := 54 + 1024; n := 256; end;
+            3: begin OutPitch := (W * 3 + 3) and not 3; bfOff := 54; n := 0; end;
+          else begin OutPitch := W * 4; bfOff := 54; n := 0; end;
+          end;
+          FillChar(Hdr, SizeOf(Hdr), 0);
+          Hdr[0] := Ord('B'); Hdr[1] := Ord('M');
+          Put32(2, bfOff + LongWord(OutPitch * H));
+          Put32(10, bfOff); Put32(14, 40); Put32(18, LongWord(W)); Put32(22, LongWord(H));
+          Hdr[26] := 1; Hdr[28] := OutBpp * 8;
+          Put32(34, LongWord(OutPitch * H)); Put32(38, $B12); Put32(42, $B12); Put32(46, n); Put32(50, n);
+          FS.WriteBuffer(Hdr, 54);
+          if OutBpp = 1 then
+          begin
+            // the device palette is $00BBGGRR, and fbc writes its bytes high to low - B, G, R, 0. A pal argument is
+            // 6 bits a channel, and fbc's conversion of it swaps the two outer channels: copied as it is.
+            for i := 0 to 255 do
+            begin
+              if Pal <> 0 then
+              begin
+                Raw := PLongWord(BlockAddr(Ctx, Pal, 1024))[i];
+                Pix := ((Raw and $3F0000) shr 14) or ((Raw and $3F00) shl 2) or ((Raw and $3F) shl 18);
+              end
+              else Pix := FGraphics.GetPaletteColor(TPaletteIndex(i)) and $FFFFFF;
+              B4[0] := (Pix shr 16) and $FF; B4[1] := (Pix shr 8) and $FF; B4[2] := Pix and $FF; B4[3] := 0;
+              FS.WriteBuffer(B4, 4);
+            end;
+          end;
+          SetLength(Row, OutPitch + 16);
+          // an image's own bytes go out as they are, its row padding included (fbc copies the whole pitch)
+          Data := nil; DataSize := 0;
+          if IsImg and (Bpp = 1) then FGraphics.SurfaceData(Surf, Data, DataSize);
+          Pitch := (W * Bpp + 15) and not 15;
+          for y := H - 1 downto 0 do
+          begin
+            FillChar(Row[0], Length(Row), 0);
+            for x := 0 to W - 1 do
+            begin
+              Pix := SurfPixel(x, y);
+              case OutBpp of
+                1: Row[x] := Byte(Pix);
+                3: begin
+                     c := Word(Pix);
+                     Row[x * 3] := ((c and $001F) shl 3) or ((c and $001F) shr 2);
+                     Row[x * 3 + 1] := ((c and $07E0) shr 3) or ((c and $07E0) shr 9);
+                     Row[x * 3 + 2] := ((c and $F800) shr 8) or ((c and $F800) shr 13);
+                   end;
+              else PLongWord(@Row[x * 4])^ := Pix;
+              end;
+            end;
+            if (OutBpp = 1) and Assigned(Data) and ((y + 1) * Pitch <= DataSize) then
+              for x := W to OutPitch - 1 do
+                if x < Pitch then Row[x] := Data[y * Pitch + x];
+            FS.WriteBuffer(Row[0], OutPitch);
+          end;
+          Exit(E_OK);
+        end;
+        // the raw block
+        if (Size = 0) and (P <> 0) then
+        begin
+          FreeAndNil(FS);
+          SysUtils.DeleteFile(AName);
+          Exit(E_ILLEGAL);
+        end;
+        B4[0] := $FE; FS.WriteBuffer(B4, 1);
+        Put32(0, LongWord(Size)); FS.WriteBuffer(Hdr, 4);
+        if P = 0 then
+        begin
+          if Surf < 0 then Exit(E_ILLEGAL);
+          Pitch := W * Bpp;
+          if Size > Int64(Pitch) * H then Size := Int64(Pitch) * H;
+          SetLength(Row, Size);
+          for i := 0 to Integer(Size) - 1 do
+          begin
+            Pix := SurfPixel((i mod Pitch) div Bpp, i div Pitch);
+            Row[i] := (Pix shr (8 * ((i mod Pitch) mod Bpp))) and $FF;
+          end;
+          if Size > 0 then FS.WriteBuffer(Row[0], Size);
+          if Bpp = 1 then
+            for i := 0 to 255 do
+            begin
+              if Pal <> 0 then Pix := PLongWord(BlockAddr(Ctx, Pal, 1024))[i]
+              else Pix := (FGraphics.GetPaletteColor(TPaletteIndex(i)) shr 2) and $3F3F3F;
+              B4[0] := Pix and $FF; B4[1] := (Pix shr 8) and $FF; B4[2] := (Pix shr 16) and $FF;
+              FS.WriteBuffer(B4, 3);
+            end;
+        end
+        else if Size > 0 then
+          FS.WriteBuffer(BlockAddr(Ctx, P, PtrUInt(Size))^, Size);
+        Result := E_OK;
+      except
+        Result := E_FILEIO;
+      end;
+    finally
+      FS.Free;
+    end;
+    Exit;
+  end;
+
+  // ---- BLOAD ----
+  if not FileExists(ResolveReadPath(AName)) then Exit(E_NOTFOUND);
+  try
+    FS := TFileStream.Create(ResolveReadPath(AName), fmOpenRead or fmShareDenyNone);
+  except
+    Exit(E_NOTFOUND);
+  end;
+  try
+    try
+      if FS.Read(Id, 1) <> 1 then Exit(E_FILEIO);
+      if (Id = $FD) or (Id = $FE) then
+      begin
+        if Id = $FD then
+        begin
+          FS.ReadBuffer(B4, 4);
+          FS.ReadBuffer(B4, 2);
+          Raw := B4[0] or (LongWord(B4[1]) shl 8);
+        end
+        else
+        begin
+          FS.ReadBuffer(B4, 4);
+          Raw := B4[0] or (LongWord(B4[1]) shl 8) or (LongWord(B4[2]) shl 16) or (LongWord(B4[3]) shl 24);
+        end;
+        if P = 0 then
+        begin
+          if Surf < 0 then Exit(E_ILLEGAL);
+          Pitch := W * Bpp;
+          if Raw > LongWord(Pitch * H) then Raw := Pitch * H;
+          SetLength(Row, Raw);
+          n := FS.Read(Row[0], Raw);
+          DBpp := Bpp;
+          for i := 0 to (n div Bpp) - 1 do
+          begin
+            Pix := 0;
+            for k := 0 to Bpp - 1 do Pix := Pix or (UInt32(Row[i * Bpp + k]) shl (8 * k));
+            SetSurf(i mod W, i div W, Pix);
+          end;
+          if FS.Position < FS.Size then
+            for i := 0 to 255 do
+            begin
+              if FS.Read(B4, 3) <> 3 then Break;
+              Pix := B4[0] or (UInt32(B4[1]) shl 8) or (UInt32(B4[2]) shl 16);
+              if Pal <> 0 then PLongWord(BlockAddr(Ctx, Pal, 1024, True))[i] := Pix
+              else FGraphics.SetPaletteColor(TPaletteIndex(i), $FF000000 or ((Pix shl 2) and $FCFCFC));
+            end;
+        end
+        else
+        begin
+          n := FS.Size - FS.Position;
+          if Int64(Raw) < n then n := Raw;
+          if n > 0 then FS.ReadBuffer(BlockAddr(Ctx, P, PtrUInt(n), True)^, n);
+        end;
+        Exit(E_OK);
+      end;
+      if Id <> Ord('B') then Exit(E_FILEIO);
+      // ---- a BMP ----
+      FS.Position := 0;
+      FillChar(Hdr, SizeOf(Hdr), 0);
+      if FS.Read(Hdr, 18) <> 18 then Exit(E_FILEIO);
+      bfType := Get16(0); bfOff := Get32(10); biSize := Get32(14);
+      if not ((biSize = 12) or (biSize = 40) or (biSize = 56) or (biSize = 108) or (biSize = 124)) then Exit(E_FILEIO);
+      biComp := 0;
+      Masks[0] := 0; Masks[1] := 0; Masks[2] := 0; Masks[3] := 0;
+      if biSize = 12 then
+      begin
+        if FS.Read(Hdr[18], 8) <> 8 then Exit(E_FILEIO);
+        biW := Get16(18); biH := SmallInt(Get16(20)); biPlanes := Get16(22); biBits := Get16(24);
+      end
+      else
+      begin
+        if FS.Read(Hdr[18], 12) <> 12 then Exit(E_FILEIO);
+        biW := LongInt(Get32(18)); biH := LongInt(Get32(22)); biPlanes := Get16(26); biBits := Get16(28);
+        if biSize >= 20 then begin FS.ReadBuffer(Hdr[30], 4); biComp := Get32(30); end;
+        if biSize >= 24 then FS.ReadBuffer(Hdr[34], 4);
+        if biSize >= 56 then
+        begin
+          FS.Seek(16, soCurrent);
+          for i := 0 to 3 do begin FS.ReadBuffer(B4, 4); Masks[i] := B4[0] or (LongWord(B4[1]) shl 8) or (LongWord(B4[2]) shl 16) or (LongWord(B4[3]) shl 24); end;
+        end;
+      end;
+      if (bfType <> 19778) or (biPlanes > 1) or (biW <= 0) or (biH = 0) or (biComp > 3) then Exit(E_FILEIO);
+      Flipped := False;
+      if biH < 0 then
+      begin
+        if (biComp <> 0) and (biComp <> 3) then Exit(E_FILEIO);
+        Flipped := True;
+        biH := -biH;
+      end;
+      if bfOff = 0 then
+      begin
+        bfOff := biSize + 14;
+        if biBits <= 8 then Inc(bfOff, 1 shl biBits);
+      end;
+      FS.Position := biSize + 14;
+      Entries := 0;
+      if biBits <= 8 then
+      begin
+        Entries := 1 shl biBits;
+        for i := 0 to Entries - 1 do
+        begin
+          // fbc reads the three bytes into $00BBGGRR (B first, high), the device palette's own layout
+          if biSize = 12 then FS.ReadBuffer(B4, 3) else FS.ReadBuffer(B4, 4);
+          PalTab[i] := (UInt32(B4[0]) shl 16) or (UInt32(B4[1]) shl 8) or B4[2];
+          if Pal <> 0 then PalTab[i] := (PalTab[i] shr 2) and $3F3F3F;
+        end;
+      end;
+      // the destination: an image keeps its header and clips the picture; else the screen
+      if IsImg then begin DW := W; DH := H; DBpp := Bpp; end
+      else if P = 0 then
+      begin
+        if Surf < 0 then Exit(E_ILLEGAL);
+        DW := W; DH := H; DBpp := Bpp;
+      end
+      else Exit(E_ILLEGAL);
+      if DW > biW then DW := biW;
+      if DH > biH then DH := biH;
+      Expand := 0;
+      if biBits < 8 then Expand := biBits;
+      if biComp = 3 then
+      begin
+        if biSize < 56 then
+          for i := 0 to 2 do begin FS.ReadBuffer(B4, 4); Masks[i] := B4[0] or (LongWord(B4[1]) shl 8) or (LongWord(B4[2]) shl 16) or (LongWord(B4[3]) shl 24); end;
+      end
+      else if biBits <= 16 then
+      begin
+        Masks[0] := $7C00; Masks[1] := $3E0; Masks[2] := $1F;
+      end
+      else
+      begin
+        Masks[0] := $FF0000; Masks[1] := $FF00; Masks[2] := $FF; Masks[3] := $FF000000;
+      end;
+      if (biBits > 8) and (DBpp = 1) then Exit(E_ILLEGAL);
+      if biBits > 32 then Exit(E_FILEIO);
+      for i := 0 to 3 do
+      begin
+        Shifts[i] := 0; Bits[i] := 0;
+        if Masks[i] <> 0 then
+        begin
+          Raw := Masks[i];
+          while (not Raw) and 1 <> 0 do begin Inc(Shifts[i]); Raw := Raw shr 1; end;
+          while Raw <> 0 do begin Inc(Bits[i]); Raw := Raw shr 1; end;
+          Masks[i] := Masks[i] shr Shifts[i];
+        end;
+      end;
+      // the palette: into pal (6 bits) or the device's
+      for i := 0 to Entries - 1 do
+        if Pal <> 0 then PLongWord(BlockAddr(Ctx, Pal, 1024, True))[i] := PalTab[i]
+        else FGraphics.SetPaletteColor(TPaletteIndex(i), $FF000000 or PalTab[i]);
+      k := (biBits + 7) div 8;
+      RowSize := (biW * k + 3) and not 3;
+      case Expand of
+        1: Padding := 4 - (((biW + 7) shr 3) and 3);
+        4: Padding := 4 - (((biW + 1) shr 1) and 3);
+      else Padding := 4 - ((biW * k) and 3);
+      end;
+      Padding := Padding and 3;
+      SetLength(Src, RowSize + 8);
+      FS.Position := bfOff;
+      if IsImg and (FImgLowCount > 0) and (Bpp < 4) then FGraphics.SyncImage(Surf, False);
+      for i := 0 to biH - 1 do
+      begin
+        if Flipped then y := i else y := biH - 1 - i;
+        if Expand <> 0 then
+        begin
+          Raw := 0;
+          for x := 0 to biW - 1 do
+          begin
+            if x mod (8 div Expand) = 0 then
+            begin
+              if FS.Read(B4, 1) <> 1 then Exit(E_FILEIO);
+              Raw := B4[0];
+            end;
+            Src[x] := Raw shr (8 - Expand);
+            Raw := (Raw shl Expand) and $FF;
+          end;
+          FS.Seek(Padding, soCurrent);
+        end
+        else if FS.Read(Src[0], RowSize) <> RowSize then
+          Break;   // fbc: a short row ends the load with the code it had
+        if y >= DH then Continue;
+        for x := 0 to DW - 1 do
+        begin
+          if biBits <= 8 then
+          begin
+            // an index: kept at 1 byte, through the device palette at 2 and 4 (fbc's fb_image_convert_8to*)
+            Raw := Src[x];
+            if DBpp = 1 then Pix := Raw
+            else
+            begin
+              Pix := FGraphics.GetPaletteColor(TPaletteIndex(Raw));
+              r := Pix and $FF; g := (Pix shr 8) and $FF; b := (Pix shr 16) and $FF;
+              if DBpp = 2 then Pix := ((r shr 3) shl 11) or ((g shr 2) shl 5) or (b shr 3)
+              else Pix := $FF000000 or (r shl 16) or (g shl 8) or b;
+            end;
+          end
+          else
+          begin
+            case k of
+              2: Raw := Src[x * 2] or (LongWord(Src[x * 2 + 1]) shl 8);
+              3: Raw := Src[x * 3] or (LongWord(Src[x * 3 + 1]) shl 8) or (LongWord(Src[x * 3 + 2]) shl 16);
+            else Raw := PLongWord(@Src[x * 4])^;
+            end;
+            r := (Raw shr Shifts[0]) and Masks[0];
+            g := (Raw shr Shifts[1]) and Masks[1];
+            b := (Raw shr Shifts[2]) and Masks[2];
+            if DBpp = 2 then
+              Pix := (ConvDepth(r, Bits[0], 5) shl 11) or (ConvDepth(g, Bits[1], 6) shl 5) or ConvDepth(b, Bits[2], 5)
+            else
+            begin
+              r := ConvDepth(r, Bits[0], 8); g := ConvDepth(g, Bits[1], 8); b := ConvDepth(b, Bits[2], 8);
+              if biBits <= 24 then a := 255
+              else
+              begin
+                a := (Raw shr Shifts[3]) and Masks[3];
+                if Masks[3] <> 0 then a := ConvDepth(a, Bits[3], 8);
+              end;
+              Pix := (a shl 24) or (r shl 16) or (g shl 8) or b;
+            end;
+          end;
+          SetSurf(x, y, Pix);
+        end;
+      end;
+      if IsImg and (FImgLowCount > 0) and (Bpp < 4) then FGraphics.SyncImage(Surf, True);
+      Result := E_OK;
+    except
+      Result := E_FILEIO;
+    end;
+  finally
+    FS.Free;
+  end;
+end;
+
+function TBytecodeVM.ImgBppOf(Handle: Integer): Integer;
+begin
+  Result := 4;
+  if (Handle >= 1) and (Handle <= High(FImgBpp)) and (FImgBpp[Handle] in [1, 2]) then Result := FImgBpp[Handle];
 end;
 
 procedure TBytecodeVM.BuildArrayDescriptor(Slot, LogicalId: Integer);
@@ -7156,10 +7645,10 @@ begin
         raise ERangeError.Create('image pointer dereference: a read may not straddle the header and the pixels');
       FillChar(FImgHeaderBuf, SizeOf(FImgHeaderBuf), 0);
       PLongWord(@FImgHeaderBuf[0])^  := 7;                                       // fbc's PUT_HEADER_NEW
-      PLongInt(@FImgHeaderBuf[4])^   := 4;                                       // bytes per pixel
+      PLongInt(@FImgHeaderBuf[4])^   := ImgBppOf(ImgHandle);                     // bytes per pixel (677)
       PLongWord(@FImgHeaderBuf[8])^  := LongWord(FGraphics.SurfaceWidth(ImgHandle));
       PLongWord(@FImgHeaderBuf[12])^ := LongWord(FGraphics.SurfaceHeight(ImgHandle));
-      PLongWord(@FImgHeaderBuf[16])^ := LongWord((FGraphics.SurfaceWidth(ImgHandle) * 4 + 15) and not 15);
+      PLongWord(@FImgHeaderBuf[16])^ := LongWord((FGraphics.SurfaceWidth(ImgHandle) * ImgBppOf(ImgHandle) + 15) and not 15);
       Result := Pointer(@FImgHeaderBuf[ofs]);
       Exit;
     end;
@@ -9175,6 +9664,15 @@ begin
   for k := 0 to FClosures.Count - 1 do
     if PtrUInt(TAbiClosure(PSbClosureCtx(FClosures.Objects[k])^.Closure).Code) = A then
       Exit(PSbClosureCtx(FClosures.Objects[k])^.EntryPC);
+end;
+
+function TBytecodeVM.FbConsoleBare: Boolean;
+// ✅ DIVERGENZE 668 - a MODERN program whose console fbc's runtime would NOT initialise (output redirected, a background
+// job, no terminfo: TcFbConsole and not TcActive), outside a graphics screen. libfb then answers fixed values, measured:
+// Locate() 0, Color() 0, Screen(r, c) 0, CsrLin 1, Pos 1 - whatever was printed or LOCATEd before. False in sbv (it never
+// asks for fbc's console) and on Windows (no terminal console there yet).
+begin
+  Result := TcFbConsole and not TcActive and not FGfxFBScreen and Assigned(FProgram) and FProgram.ModernMode;
 end;
 
 function TBytecodeVM.ValueForC(Ctx: TExecutionContext; V: Int64; SigIdx: Int64): Int64;
@@ -11646,13 +12144,26 @@ begin
         // bcGfxForeColor: Dest=result (current foreground)
         bcGfxForeColor:
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
+        // bcGfxBFile (DIVERGENZE 663): Dest = code, Src1 = name (string), Src2 = pointer, Immediate[0-15] = size,
+        // [16-31] = palette pointer (int registers)
+        bcGfxBFile:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
+          if ((Instr.Immediate shr 16) and $FFFF) > MaxIntReg then MaxIntReg := (Instr.Immediate shr 16) and $FFFF;
+        end;
         // bcGfxImageCreate: Dest=handle, Src1=w, Src2=h, Immediate=fill colour reg
         bcGfxImageCreate:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // handle
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // w
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // h
-          if Instr.Immediate > MaxIntReg then MaxIntReg := Instr.Immediate;  // fill colour reg
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;  // fill colour reg
+          // DIVERGENZE 677: the depth's register rides in Immediate[16..31] ($FFFF = not given)
+          if (((Instr.Immediate shr 16) and $FFFF) <> $FFFF) and (((Instr.Immediate shr 16) and $FFFF) > MaxIntReg) then
+            MaxIntReg := (Instr.Immediate shr 16) and $FFFF;
         end;
         // bcGfxImageDestroy: Src1=handle
         bcGfxImageDestroy:
@@ -12442,6 +12953,7 @@ var
   I64: Int64;
   FS: TFormatSettings;
 begin
+  if VarType(V) = varQWord then Exit(Int64(QWord(V)));   // an ADDRESS item (DIVERGENZE 662): the bits, unchanged
   if VarIsOrdinal(V) then Exit(VarAsType(V, varInt64));
   if VarIsFloat(V) then Exit(Trunc(Double(V)));
   S := Trim(VarToStr(V));
@@ -13279,6 +13791,12 @@ begin
             FDataPool[High(FDataPool)] := FProgram.StringConstants[Instr.Immediate];
         end;
       end;
+    bcDataSetInt:
+      // DIVERGENZE 662: an ADDRESS item of a DATA statement, written by the entry code into the placeholder the pool
+      // got where the DATA sits (bcDataAdd ran first, at the top of the entry block).
+      // Kept as a QWORD variant: that is what tells an address from a number when READ asks for a STRING (fbc answers "").
+      if (Instr.Immediate >= 0) and (Instr.Immediate < Length(FDataPool)) then
+        FDataPool[Instr.Immediate] := QWord(Ctx.IntRegs[Instr.Src1]);
     bcDataReadInt:
       begin
         // Read next DATA value into int register
@@ -13315,7 +13833,9 @@ begin
         // Read next DATA value into string register
         if Ctx.DataIndex < Length(FDataPool) then
         begin
-          Ctx.StringRegs[Instr.Dest] := string(FDataPool[Ctx.DataIndex]);
+          // An ADDRESS item (DIVERGENZE 662) read into a STRING is "" in fbc: the pool entry is a pointer, not text.
+          if VarType(FDataPool[Ctx.DataIndex]) = varQWord then Ctx.StringRegs[Instr.Dest] := ''
+          else Ctx.StringRegs[Instr.Dest] := string(FDataPool[Ctx.DataIndex]);
           Inc(Ctx.DataIndex);
         end
         else if Assigned(FProgram) and FProgram.ModernMode then   // see bcDataReadInt
@@ -20887,7 +21407,9 @@ begin
       Ctx.StringRegs[Instr.Dest] :=
         ReadChars(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], False);
     20: // bcConScreen - SCREEN(row, col [, colorflag]): read a console cell
-      if Assigned(FOutputDevice) then
+      if FbConsoleBare then
+        Ctx.IntRegs[Instr.Dest] := 0   // DIVERGENZE 668: libfb's console not initialised answers 0
+      else if Assigned(FOutputDevice) then
       begin
         // FB counts rows and columns from 1; the console addresses cells from 0.
         ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]) - 1;
@@ -20923,6 +21445,10 @@ begin
       begin
         ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]);
         ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]);
+        // DIVERGENZE 668: with libfb's console not initialised nothing moves on the screen, but a column moves the
+        // position PRINT counts from - the comma's next zone is measured from it ("Locate 5, 20 : Print "x", "y"" pads
+        // "x" to column 29), measured against fbc.
+        if FbConsoleBare and (ScreenCol > 0) then Ctx.CursorCol := ScreenCol - 1;
         if ScreenRow <= 0 then ScreenRow := FOutputDevice.GetCursorY + 1;
         if ScreenCol <= 0 then ScreenCol := FOutputDevice.GetCursorX + 1;
         FOutputDevice.SetCursor(ScreenCol - 1, ScreenRow - 1);
@@ -21049,6 +21575,8 @@ begin
         TcGetXY(TermCol, TermRow);
         Ctx.IntRegs[Instr.Dest] := TermRow;
       end
+      else if FbConsoleBare then
+        Ctx.IntRegs[Instr.Dest] := 1   // DIVERGENZE 668: libfb's console not initialised
       else if Assigned(FProgram) and FProgram.ModernMode then
         Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow + 1
       else
@@ -21256,6 +21784,29 @@ begin
 end;
 
 procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+// ✅ DIVERGENZE 677 - around a graphics statement whose target is a 1/2-byte image, the image's own bytes (which the
+// program may have written through its pointer) become the picture the primitives draw into, and after it the picture
+// goes back into the bytes. One test when no such image exists.
+var
+  T: Integer;
+begin
+  if FImgLowCount = 0 then
+  begin
+    ExecuteGraphicsOpBody(Ctx, Instr);
+    Exit;
+  end;
+  T := DrawSurface;
+  if (T > 0) and (ImgBppOf(T) < 4) and Assigned(FGraphics) then
+  begin
+    FGraphics.SyncImage(T, False);
+    ExecuteGraphicsOpBody(Ctx, Instr);
+    FGraphics.SyncImage(T, True);
+  end
+  else
+    ExecuteGraphicsOpBody(Ctx, Instr);
+end;
+
+procedure TBytecodeVM.ExecuteGraphicsOpBody(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
   TermCol, TermRow: Integer;   // POS asked of the terminal (DIVERGENZE 415)
@@ -21302,7 +21853,8 @@ begin
   begin
     case Instr.OpCode of
       bcGraphicRGBA, bcGfxPoint, bcGfxPalGet, bcGfxImageInfo, bcGfxScreenInfo,
-      bcGfxPMap, bcGfxPointCoord, bcGfxScreenPtr, bcGfxScreenList: ;   // answered in place, below
+      bcGfxPMap, bcGfxPointCoord, bcGfxScreenPtr, bcGfxScreenList,
+      bcGfxBFile: ;   // answered in place, below (BSAVE/BLOAD answer an error code: DIVERGENZE 663)
     else
       begin
         EnqueueDeferredOp(Ctx, dckGraphics, Instr);
@@ -21472,6 +22024,8 @@ begin
           TcGetXY(TermCol, TermRow);   // DIVERGENZE 415: asked of the terminal
           Ctx.IntRegs[Instr.Dest] := TermCol;
         end
+        else if FbConsoleBare then
+          Ctx.IntRegs[Instr.Dest] := 1   // DIVERGENZE 668: libfb's console not initialised
         else if Assigned(FProgram) and FProgram.ModernMode then
           Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol + 1
         else
@@ -21594,6 +22148,9 @@ begin
         GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
         if PointOutsideView(GetX1, GetY1) then
           Ctx.IntRegs[Instr.Dest] := $FFFFFFFF
+        else if (FImgLowCount > 0) and (DrawSurface > 0) and (ImgBppOf(DrawSurface) = 2) then
+          // DIVERGENZE 677: a 16bpp image answers the colour with no alpha byte, as fbc's (RGB565 has none)
+          Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GetX1, GetY1)) and $FFFFFF
         else
           Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GetX1, GetY1));
       end
@@ -21750,20 +22307,44 @@ begin
         //   background, which is what FreeBASIC's "Color()" packs into its result.
       case Instr.Immediate of
         1: Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor);
-        2: Ctx.IntRegs[Instr.Dest] := FConColorFg;
-        3: Ctx.IntRegs[Instr.Dest] := FConColorBg;
+        // DIVERGENZE 668: with libfb's console not initialised Color() answers 0, whatever COLOR set
+        2: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0 else Ctx.IntRegs[Instr.Dest] := FConColorFg;
+        3: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0 else Ctx.IntRegs[Instr.Dest] := FConColorBg;
         // 4: LOCATE()'s visibility bit - the cursor is shown unless LOCATE hid it on a terminal (DIVERGENZE 415)
         4: if TcActive and not TcCursorVisible then Ctx.IntRegs[Instr.Dest] := 0
            else Ctx.IntRegs[Instr.Dest] := $10000;
+        // 5: LOCATE()'s mask - 0 when libfb's console is not initialised (it answers 0 then), -1 otherwise (DIVERGENZE 668)
+        5: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0 else Ctx.IntRegs[Instr.Dest] := -1;
       else
         Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
       end;
     36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
       if Assigned(FGraphics) then
       begin
-        ImgHandle := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-                                             UInt32(Ctx.IntRegs[Instr.Immediate]));
-        if ImgHandle > 0 then ImgShape(ImgHandle);
+        // ✅ DIVERGENZE 677: the image's DEPTH - the fourth argument (Immediate[16..31], $FFFF = not given), else the
+        // screen's, else 32 - and with it fbc's bytes per pixel: 1 up to 8 bits, 2 at 15/16 (RGB565), 4 above. The fill
+        // colour left out (the SSA passes IMGCREATE_NOFILL) is that depth's transparent colour: 0, &hF81F, &hFFFF00FF.
+        if ((Instr.Immediate shr 16) and $FFFF) <> $FFFF then GfxColour := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]
+        else if FGfxScreenDepth > 0 then GfxColour := FGfxScreenDepth
+        else GfxColour := 32;
+        case GfxColour of
+          1..8:   DrawMode := 1;
+          15, 16: DrawMode := 2;
+        else      DrawMode := 4;
+        end;
+        GfxColour := Ctx.IntRegs[Instr.Immediate and $FFFF];
+        if GfxColour = IMGCREATE_NOFILL then
+          if DrawMode = 1 then GfxColour := 0 else GfxColour := Int64($FFFF00FF);
+        ImgHandle := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], UInt32(GfxColour));
+        if ImgHandle > 0 then
+        begin
+          if ImgHandle > High(FImgBpp) then SetLength(FImgBpp, ImgHandle + 1);
+          if FImgBpp[ImgHandle] in [1, 2] then Dec(FImgLowCount);
+          FImgBpp[ImgHandle] := 0;
+          if DrawMode < 4 then begin FImgBpp[ImgHandle] := DrawMode; Inc(FImgLowCount); end;
+          ImgShape(ImgHandle);
+          ImgFill(ImgHandle, UInt32(GfxColour));
+        end;
         // ⭐ A POINTER, not the bare index: FreeBASIC's IMAGECREATE answers an FB.IMAGE PTR and code
         // reads the header and the pixels through it. Offset 0 is the start of the header, so
         // "img->width" and "img + SizeOf(FB.IMAGE)" both land where they should. A failed creation
@@ -21783,6 +22364,11 @@ begin
       if Assigned(FGraphics) then
       begin
         ImgHandle := ImgHandleOf(Ctx.IntRegs[Instr.Src1]);
+        if (ImgHandle >= 1) and (ImgHandle <= High(FImgBpp)) and (FImgBpp[ImgHandle] in [1, 2]) then
+        begin
+          FImgBpp[ImgHandle] := 0;
+          Dec(FImgLowCount);
+        end;
         FGraphics.DestroySurface(ImgHandle);
         // the block goes back to libc AFTER the surface that drew into it is gone
         if ImgBlockOf(ImgHandle) <> nil then
@@ -21806,9 +22392,10 @@ begin
         case Instr.Immediate of
           0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
           1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
-          2: Ctx.IntRegs[Instr.Dest] := 4;      // bytes per pixel, always 32bpp here
+          2: Ctx.IntRegs[Instr.Dest] := ImgBppOf(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));   // bytes per pixel (677)
           // the padded pitch fbc gives an image row (phase 5.5): bytes rounded up to 16
-          3: Ctx.IntRegs[Instr.Dest] := (FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) * 4 + 15) and not 15;
+          3: Ctx.IntRegs[Instr.Dest] := (FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) *
+                                         ImgBppOf(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) + 15) and not 15;
           // ⭐ 4: the POINTER TO THE PIXELS, which is what an image is FOR - walking its rows. It names
           // the image-surface region (RAWPTR_REGION_IMG) at the offset where the pixels begin, i.e.
           // just past the 32-byte FB.IMAGE header, so "p32[i]" steps through the picture and
@@ -21855,6 +22442,8 @@ begin
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
               FGraphics.GetPixel(DrawSurface, GetX1 + GetSx, GetY1 + GetSy));
+        // DIVERGENZE 677: ...into a 1/2-byte image's own bytes
+        if (FImgLowCount > 0) and (DrawMode > 0) and (ImgBppOf(DrawMode) < 4) then FGraphics.SyncImage(DrawMode, True);
       end;
     40: // bcGfxPut - PUT [img,] (x,y),src[,mode] : blit image src onto the DRAW SURFACE (Immediate[0-15]=
         //  src handle register, Immediate[16-31]=mode ordinal constant)
@@ -21864,6 +22453,9 @@ begin
       if Assigned(FGraphics) then
       begin
         // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
+        // DIVERGENZE 677: a 1/2-byte image is read from its own bytes, which the program may have written
+        if (FImgLowCount > 0) and (ImgBppOf(ImgHandleOf(Ctx.IntRegs[Instr.Immediate and $FFFF])) < 4) then
+          FGraphics.SyncImage(ImgHandleOf(Ctx.IntRegs[Instr.Immediate and $FFFF]), False);
         FGraphics.Blit(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        ImgHandleOf(Ctx.IntRegs[Instr.Immediate and $FFFF]),
                        TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
@@ -22166,6 +22758,10 @@ begin
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
       else
         Ctx.IntRegs[Instr.Dest] := FDrawPenX;
+    71: // bcGfxBFile - BSAVE / BLOAD of fbgfx (DIVERGENZE 663): see GfxBFile
+      Ctx.IntRegs[Instr.Dest] := GfxBFile(Ctx, ((Instr.Immediate shr 32) and 1) <> 0, Ctx.StringRegs[Instr.Src1],
+                                          Ctx.IntRegs[Instr.Src2], Ctx.IntRegs[Instr.Immediate and $FFFF],
+                                          Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]);
     70: // bcGfxScreenList - SCREENLIST([depth]): the next fullscreen resolution at that colour depth,
         // as (width shl 16) or height, and 0 when the list is exhausted. Immediate bit0 = a depth was
         // given, which RESTARTS the enumeration; a bare "ScreenList()" continues it.

@@ -91,6 +91,16 @@ type
       SwitchToMode and never touches this. }
     FDepth: Integer;
     FNativeBuffer: PByte;       // 1 or 2 bytes per pixel when FDepth < 32; nil at 32
+    { ✅ DIVERGENZE 677 - an IMAGECREATE image at the depth fbc gives it: 1 byte per pixel (depth 1..8), 2 (15/16,
+      RGB565) or 4. At 1 and 2 the image's own bytes live in FImgPix, row pitch FImgPitch bytes, and that is what a
+      program walks through the image pointer; the primitives keep drawing into the 32bpp buffer, and ImagePull /
+      ImagePush reconcile the two around every graphics statement that touches the image (the VM calls them).
+      A pixel of a 1-byte image is its raw value (what PSET stored, an index); a 2-byte pixel is RGB565 and reads back
+      as $FF000000 or RGB, so the transparent key &hF81F is magenta in both buffers. FImgBpp 0 = not such an image. }
+    FImgBpp: Integer;
+    FImgPix: PByte;
+    FImgPitch: Integer;
+    FImgPixOwned: Boolean;
     FNativeBufferSize: Integer;
     // FreeBASIC VIEW clip rectangle (inclusive, physical pixels). When active, pixel writes outside it
     // are discarded. Reads (GetPixel) are unaffected.
@@ -160,6 +170,14 @@ type
     // otherwise Buf (StridePixels * Height * 4 bytes, owned by the caller) becomes the RGBA buffer. The picture is kept.
     procedure UseImageBuffer(Buf: PByte; StridePixels: Integer);
     function RowPixels: Integer; inline;
+    // DIVERGENZE 677: an image's pixel format. Bpp 4 = UseImageBuffer(Pix, PitchBytes div 4); Bpp 1 or 2 = the 32bpp
+    // buffer becomes this surface's own and Pix (nil: allocated here) holds the image's bytes at PitchBytes per row.
+    procedure UseImageFormat(Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+    procedure ImagePull;   // the image's bytes -> the 32bpp buffer the primitives draw into (Bpp 1/2 only)
+    procedure ImagePush;   // ...and back
+    property ImgBpp: Integer read FImgBpp;
+    property ImgPixels: PByte read FImgPix;
+    property ImgPitch: Integer read FImgPitch;
 
     procedure SetCurrentMode(Mode: TGraphicMode);
     procedure SetSplitLine(Line: Integer);
@@ -218,6 +236,7 @@ var
   Mode: TGraphicMode;
 begin
   if Assigned(FNativeBuffer) then begin FreeMem(FNativeBuffer); FNativeBuffer := nil; end;
+  if FImgPixOwned and Assigned(FImgPix) then begin FreeMem(FImgPix); FImgPix := nil; end;
   // Free text buffer (always separate)
   if Assigned(FTextBuffer) then FreeMem(FTextBuffer);
 
@@ -1202,6 +1221,96 @@ begin
   FGraphicsBufferSize := NewSize;
   FStride := StridePixels;
   FExternalRGB := Buf <> nil;
+end;
+
+procedure TGraphicsMemory.UseImageFormat(Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+var
+  Need: Integer;
+begin
+  if FImgPixOwned and Assigned(FImgPix) and (FImgPix <> Pix) then FreeMem(FImgPix);
+  FImgPix := nil; FImgPixOwned := False; FImgPitch := 0; FImgBpp := 0;
+  if (Bpp <> 1) and (Bpp <> 2) then
+  begin
+    UseImageBuffer(Pix, PitchBytes div 4);
+    Exit;
+  end;
+  if FExternalRGB or (RowPixels <> FState.Width) then UseImageBuffer(nil, FState.Width);
+  // UseImageBuffer(nil, ...) keeps an EXTERNAL buffer's pixels by copying, and owns the new one: after it the 32bpp
+  // buffer is this surface's own at the width, which is the one shape the C hot loop's PSET could ever write - and
+  // PixelStoreTarget refuses a 1/2-byte image all the same.
+  FImgBpp := Bpp;
+  FImgPitch := PitchBytes;
+  Need := PitchBytes * FState.Height;
+  if Pix <> nil then FImgPix := Pix
+  else if Need > 0 then
+  begin
+    GetMem(FImgPix, Need);
+    FillChar(FImgPix^, Need, 0);
+    FImgPixOwned := True;
+  end;
+end;
+
+procedure TGraphicsMemory.ImagePull;
+var
+  x, y: Integer;
+  Row: PByte;
+  Dst: PUInt32;
+  c: Word;
+begin
+  if (FImgBpp = 0) or not Assigned(FImgPix) or not Assigned(FGraphicsBuffer) then Exit;
+  for y := 0 to FState.Height - 1 do
+  begin
+    Row := FImgPix + y * FImgPitch;
+    Dst := PUInt32(FGraphicsBuffer + y * RowPixels * 4);
+    if FImgBpp = 1 then
+      for x := 0 to FState.Width - 1 do
+      begin
+        Dst^ := Row[x];
+        Inc(Dst);
+      end
+    else
+      for x := 0 to FState.Width - 1 do
+      begin
+        c := PWord(Row + x * 2)^;
+        // RGB565 -> 8 bits per channel by REPEATING THE HIGH BITS, as fbc does ((r shl 3) or (r shr 2)): measured, an
+        // index loaded into a 16-bit image reads back $212042 there, and "* 255 div 31" gave $202041
+        Dst^ := $FF000000 or
+                (UInt32((((c shr 11) and $1F) shl 3) or (((c shr 11) and $1F) shr 2)) shl 16) or
+                (UInt32((((c shr 5) and $3F) shl 2) or (((c shr 5) and $3F) shr 4)) shl 8) or
+                 UInt32(((c and $1F) shl 3) or ((c and $1F) shr 2));
+        Inc(Dst);
+      end;
+  end;
+end;
+
+procedure TGraphicsMemory.ImagePush;
+var
+  x, y: Integer;
+  Row: PByte;
+  Src: PUInt32;
+  v: UInt32;
+begin
+  if (FImgBpp = 0) or not Assigned(FImgPix) or not Assigned(FGraphicsBuffer) then Exit;
+  for y := 0 to FState.Height - 1 do
+  begin
+    Row := FImgPix + y * FImgPitch;
+    Src := PUInt32(FGraphicsBuffer + y * RowPixels * 4);
+    if FImgBpp = 1 then
+      for x := 0 to FState.Width - 1 do
+      begin
+        Row[x] := Byte(Src^);
+        Inc(Src);
+      end
+    else
+      for x := 0 to FState.Width - 1 do
+      begin
+        v := Src^;
+        PWord(Row + x * 2)^ := Word((((v shr 16) and $FF) shr 3) shl 11) or
+                               Word((((v shr 8) and $FF) shr 2) shl 5) or
+                               Word((v and $FF) shr 3);
+        Inc(Src);
+      end;
+  end;
 end;
 
 procedure TGraphicsMemory.SetPixelRGBA(X, Y: Integer; RGBA: UInt32);

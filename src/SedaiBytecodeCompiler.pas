@@ -821,6 +821,49 @@ begin
     Exit;
   end;
 
+  // ✅ DIVERGENZE 663: ssaGfxBFile - Dest = code, Src1 = name, Src2 = pointer, Src3 = 1 for BLOAD, PhiSources[0..1] =
+  // size and palette pointer -> Immediate[0..15], [16..31], bit 32.
+  if Instr.OpCode = ssaGfxBFile then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxBFile, 0, 0, 0, 0);
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate :=
+      (Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType, Instr.PhiSources[0].Value.RegIndex,
+                                      Instr.PhiSources[0].Value.Version)) and $FFFF) or
+      ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType, Instr.PhiSources[1].Value.RegIndex,
+                                       Instr.PhiSources[1].Value.Version)) and $FFFF) shl 16);
+    if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt <> 0) then
+      BCInstr.Immediate := BCInstr.Immediate or (Int64(1) shl 32);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // ✅ DIVERGENZE 677: ssaGfxImageCreate - Dest = handle, Src1 = w, Src2 = h, Src3 = the fill colour's register ->
+  // Immediate[0..15], PhiSources[0] - when present - the DEPTH's register -> Immediate[16..31] ($FFFF = not given).
+  if Instr.OpCode = ssaGfxImageCreate then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxImageCreate, 0, 0, 0, 0);
+    if Instr.Dest.Kind = svkRegister then
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    if Instr.Src3.Kind = svkRegister then
+      BCInstr.Immediate := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version) and $FFFF;
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType, Instr.PhiSources[0].Value.RegIndex,
+                                         Instr.PhiSources[0].Value.Version)) and $FFFF) shl 16)
+    else
+      BCInstr.Immediate := BCInstr.Immediate or (Int64($FFFF) shl 16);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
   // Special handling for BOX - pack 8 parameters into bytecode format
   // BOX color, x1, y1, x2, y2, angle, filled, fill_color
   // ⭐ ssaGfxScreenRes: Src1=w, Src2=h, Src3 const = pages|flags, and PhiSources[0] - when present - is
@@ -1850,6 +1893,15 @@ begin
       BCInstr.Src1 := Ord(srtString);  // Type indicator
       BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src1.ConstString);
     end;
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // DIVERGENZE 662: the address item of a DATA statement - Src1 = the address (int register), Src2 = the pool index.
+  if Instr.OpCode = ssaDataSetInt then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcDataSetInt, 0, 0, 0, Instr.Src2.ConstInt);
+    BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

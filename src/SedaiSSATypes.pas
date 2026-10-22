@@ -40,6 +40,9 @@ const
   // FOREIGN call that returns a struct by value uses the same slot (DIVERGENZE 329) and the marshaller
   // must read the number the SSA wrote - one fact, one definition.
   XFER_RESULT_HANDLE_SLOT = 254;
+  // DIVERGENZE 677: the fill colour IMAGECREATE passes when the program gave none - the VM answers that depth's
+  // transparent colour (0 at 8 bits, &hF81F at 16, &hFFFF00FF at 32). Bit 32 is what no colour value carries.
+  IMGCREATE_NOFILL = Int64($1FFFF00FF);
 
   { Register allocation limits }
   MIN_REGISTER_SLOTS = 256;      // Initial allocation size (backward compatible)
@@ -879,6 +882,11 @@ type
     // compiling ("range check error in set constructor"). A new SSA opcode goes here, at the bottom.
     ssaValueForC,
     ssaPtrFromInt,
+    // DIVERGENZE 662: Src1 = int reg (an address), Src2 = svkConstInt (the DATA pool index) -> bcDataSetInt.
+    ssaDataSetInt,
+    // DIVERGENZE 663: BSAVE/BLOAD of fbgfx. Dest = code (int), Src1 = name (string), Src2 = pointer (int), Src3 =
+    // svkConstInt 1 for BLOAD, PhiSources[0] = size (int), PhiSources[1] = palette pointer (int) -> bcGfxBFile.
+    ssaGfxBFile,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

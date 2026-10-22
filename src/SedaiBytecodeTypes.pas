@@ -219,6 +219,9 @@ const
   // ⛔ Not covered by the C hot loop, the AOT or the JIT: it builds an executable page. All three are whitelists,
   // so leaving it out of them is the refusal - the same shape as bcForeignCall above.
   bcValueForC     = bcGroupCore + 173;
+  // ⭐ DIVERGENZE 662: "Data @name" - FDataPool[Immediate] := IntRegs[Src1]. The item is an ADDRESS, known only once the
+  // program runs (fbc knows it at link time): the pool gets a placeholder where the DATA sits and the entry code writes it.
+  bcDataSetInt    = bcGroupCore + 174;
   bcRecordBlockLen  = bcGroupCore + 170; // Dest = how many CONSECUTIVE records the block starting at IntRegs[Src1] holds
                                         //   (1 when the handle is a lone record). What "Delete[] p" needs to run one
                                         //   destructor per element: fbc keeps the same number in a UInteger in front
@@ -919,6 +922,10 @@ const
   //   that sizes its canvas from ScreenInfo's DESKTOP resolution - so a wrong 0 here became a 0x0
   //   canvas, a null SCREENPTR, and a program that never drew a pixel.
   bcGfxScreenList   = bcGroupGraphics + 70;
+  // ✅ DIVERGENZE 663 - fbgfx's BSAVE / BLOAD (an image or the screen as BMP, or a raw block): Dest = the error code
+  // (int), Src1 = the file name (string), Src2 = the image / memory pointer, 0 = the screen (int), Immediate[0..15] =
+  // BSAVE's size register, [16..31] = the palette pointer's register (int, 0 = none), bit 32 = BLOAD.
+  bcGfxBFile        = bcGroupGraphics + 71;
 
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
@@ -2197,6 +2204,7 @@ begin
         171: Result := 'ForeignCall';
         172: Result := 'ForeignCallF';
         173: Result := 'ValueForC';        // DIVERGENZE 561
+        174: Result := 'DataSetInt';       // DIVERGENZE 662
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';
@@ -2575,6 +2583,7 @@ begin
         57: Result := 'GfxDrawGML';
         58: Result := 'GfxPointCoord';
         70: Result := 'GfxScreenList';
+        71: Result := 'GfxBFile';          // DIVERGENZE 663
         59: Result := 'GfxCircleEx';
         60: Result := 'GfxPaintBorder';
         61: Result := 'GfxSetTarget';

@@ -11011,6 +11011,15 @@ begin
       Break;
     end;
 
+    // ✅ DIVERGENZE 663: fbgfx's BLOAD/BSAVE are POSITIONAL - "BLoad f, , @pal(0)" leaves the destination out and passes
+    // the palette third - so in MODERN an omitted argument keeps its slot as a valueless literal, as Dir() does.
+    if FModernMode and ((CmdName = 'BLOAD') or (CmdName = 'BSAVE')) and Context.Check(ttSeparParam) then
+    begin
+      Result.AddChild(TASTNode.CreateWithValue(antLiteral, Unassigned, Context.CurrentToken));
+      Context.Advance;
+      Continue;
+    end;
+
     // Skip commas
     if Context.Check(ttSeparParam) then
     begin
@@ -18924,14 +18933,21 @@ begin
       if Assigned(ExprNode) then ExprNode.Free;
       Context.CurrentIndex := SavedIdx;
     end;
-    // 🕳️ DIVERGENZE 662 - an ADDRESS in DATA ("Data @"fOObAR", @mydbl", fbc's quirk/casting): fbc stores the link-time
-    // address and READ hands it to a pointer. The pool here holds literal values only, so it is refused by NAME rather
-    // than left on the line (where it was a second statement and the pointers read back 0).
+    // ✅ DIVERGENZE 662 - an ADDRESS in DATA ("Data @"fOObAR", @mydbl, @proc", fbc's quirk/casting): fbc stores the
+    // link-time address and READ hands it to a pointer. The item stays an EXPRESSION, marked DATAADDR: the SSA gives the
+    // pool a placeholder where the DATA sits and the entry code writes the address once the program's cells exist.
     if FModernMode and Context.Check(ttOpAt) then
     begin
-      HandleError('DATA of an address ("@name") is not supported: the DATA pool holds literal values (DIVERGENZE 662)',
-                  Context.CurrentToken);
-      Break;
+      ExprNode := ParseExpression;
+      if not Assigned(ExprNode) then
+      begin
+        HandleError('Expected an address after "@" in DATA', Context.CurrentToken);
+        Break;
+      end;
+      ExprNode.Attributes.Values['DATAADDR'] := '1';
+      Result.AddChild(ExprNode);
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end
+      else Break;
     end;
     // Parse data item - can be number, string, or unquoted identifier (treated as string)
     if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then

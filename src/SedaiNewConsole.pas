@@ -327,6 +327,9 @@ type
     function  GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
     procedure GBResizeSurface(Surface: TGfxSurface; W, H: Integer);
     procedure GBSetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
+    procedure GBSetSurfaceImageFormat(Surface: TGfxSurface; Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+    procedure GBSyncImage(Surface: TGfxSurface; ToNative: Boolean);
+    function  GBSurfaceImageBpp(Surface: TGfxSurface): Integer;
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
     function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
@@ -363,6 +366,9 @@ type
     function  IGraphicsBackend.CreateSurface = GBCreateSurface;
     procedure IGraphicsBackend.ResizeSurface = GBResizeSurface;
     procedure IGraphicsBackend.SetSurfaceImageBuffer = GBSetSurfaceImageBuffer;
+    procedure IGraphicsBackend.SetSurfaceImageFormat = GBSetSurfaceImageFormat;
+    procedure IGraphicsBackend.SyncImage = GBSyncImage;
+    function  IGraphicsBackend.SurfaceImageBpp = GBSurfaceImageBpp;
     procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
     function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
     function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
@@ -3931,6 +3937,27 @@ procedure TVideoController.GBSetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PB
 begin
   if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) then
     FImageSurfaces[Surface - 1].UseImageBuffer(Buf, StridePixels);
+end;
+
+// DIVERGENZE 677: an image's pixel format, as the software backend keeps it (the image memory is the same class).
+procedure TVideoController.GBSetSurfaceImageFormat(Surface: TGfxSurface; Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+begin
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) then
+    FImageSurfaces[Surface - 1].UseImageFormat(Bpp, Pix, PitchBytes);
+end;
+
+procedure TVideoController.GBSyncImage(Surface: TGfxSurface; ToNative: Boolean);
+begin
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) then
+    if ToNative then FImageSurfaces[Surface - 1].ImagePush else FImageSurfaces[Surface - 1].ImagePull;
+end;
+
+function TVideoController.GBSurfaceImageBpp(Surface: TGfxSurface): Integer;
+begin
+  Result := 4;
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) and
+     (FImageSurfaces[Surface - 1].ImgBpp in [1, 2]) then
+    Result := FImageSurfaces[Surface - 1].ImgBpp;
 end;
 
 procedure TVideoController.GBDestroySurface(Surface: TGfxSurface);

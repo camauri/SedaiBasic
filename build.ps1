@@ -35,8 +35,16 @@
                      COPYPROP, COPYCOAL, PHIELIM, REGALLOC, PEEPHOLE, SUPERINSTR,
                      DOMTREE, DBE, BYTECODE, VM, CLEANUP, CONSOLE, AUDIO, ALL
 
+.PARAMETER StrictOnly
+    Lock the binaries to the STRICT memory mode: --memory=fb is refused (SEDAI_STRICT_ONLY).
+
+.PARAMETER Symbols
+    Release build, but NOT stripped (for a profiler; -Debug is not a substitute).
+
 .EXAMPLE
     .\build.ps1                    # Build all targets (release)
+    .\build.ps1 -Target sb -StrictOnly                # sb locked to the STRICT memory mode
+    .\build.ps1 -Target sb -Symbols                   # Release sb with symbols, for a profiler
     .\build.ps1 -Target sb         # Build only sb
     .\build.ps1 -Debug             # Build with debug info
     .\build.ps1 -Clean             # Clean and rebuild
@@ -46,6 +54,9 @@
     .\build.ps1 -Target sb -DebugFlags SSA,REGALLOC   # Build sb with multiple debug flags
 
 .NOTES
+    Environment: SEDAI_OLEVEL replaces -O1 and SEDAI_OEXTRA adds options, for measuring
+    optimisation settings; SEDAI_CPUOPT=none|avx|avx2 picks the instruction set.
+
     Copyright (c) 2025 Maurizio Cammalleri
     Released under GNU GPL v3 or Commercial License
 #>
@@ -69,6 +80,15 @@ param(
     # Build the CLI VM (sb) with the optional SDL2 window presenter, enabling `sb --window`.
     # Default off: the headless sb (regression target) takes no SDL2 window dependency.
     [switch]$Window,
+
+    # Lock the binaries to the STRICT memory mode (SEDAI_STRICT_ONLY): --memory=fb is refused and
+    # cannot be switched back on at run time. The define keys the unit directory, so a locked build
+    # never reuses the units of an unlocked one.
+    [switch]$StrictOnly,
+
+    # A RELEASE build that is not stripped, for a profiler. -Debug is no substitute: it also turns on
+    # -Ci -Cr -Co, and range and overflow checks change the very timings being measured.
+    [switch]$Symbols,
 
     # The C hot loop (src/hotdisp.c), worth 27-45% where it applies. ON BY DEFAULT when a C
     # compiler is there; -NoHotC leaves it out, -HotC makes a missing compiler an ERROR
@@ -742,8 +762,13 @@ function Build-Target {
     $opts += '-MObjFPC'
 
     if (-not $IsDebug) {
-        # Release optimizations
-        $opts += '-O1'
+        # Release optimizations.
+        # SEDAI_OLEVEL / SEDAI_OEXTRA: build-time knobs for measuring optimisation settings without
+        # editing this file. Not a supported configuration - the shipped default is -O1.
+        $opts += $(if ($env:SEDAI_OLEVEL) { $env:SEDAI_OLEVEL } else { '-O1' })
+        if ($env:SEDAI_OEXTRA) {
+            $opts += @($env:SEDAI_OEXTRA -split '\s+' | Where-Object { $_ -ne '' })
+        }
 
         # Instruction set from what the CPU HAS. Audio does NOT decide it, on any platform.
         #
@@ -779,8 +804,10 @@ function Build-Target {
         $opts += '-OoFASTMATH'
         $opts += '-OoCONSTPROP'
 
-        # Strip and smart linking
-        $opts += '-Xs'
+        # -Xs strips; -XX (smart linking) stays either way. With -Symbols, dropping -Xs is NOT
+        # enough: fpc links release builds stripped anyway, so -gw asks for DWARF explicitly. The
+        # range and overflow checks stay off and every optimisation flag above stays on.
+        if ($Symbols) { $opts += '-gw' } else { $opts += '-Xs' }
         $opts += '-XX'
     }
     else {
@@ -1078,6 +1105,12 @@ $failed = 0
 
 # Parse debug flags into defines
 $debugDefines = @()
+# ⛔ A define changes unit CONTENT, so it rides in $debugDefines: Get-UnitDir keys the lib directory on
+# it, and a locked build never reuses the units of an unlocked one (or the other way round).
+if ($StrictOnly) {
+    $debugDefines += 'SEDAI_STRICT_ONLY'
+    Write-Host "Memory mode: LOCKED to strict (--memory=fb refused)" -ForegroundColor Magenta
+}
 if ($DebugFlags -and $DebugFlags -ne '') {
     $flags = $DebugFlags.ToUpper() -split ','
     foreach ($flag in $flags) {

@@ -381,7 +381,7 @@ begin
       Result := True;
 
     // DATA/READ/RESTORE - always live (affects DATA pool state)
-    ssaDataAdd, ssaDataRead, ssaDataRestore:
+    ssaDataAdd, ssaDataSetInt, ssaDataRead, ssaDataRestore:
       Result := True;
 
     // File I/O operations - always live (side effects on file system)
@@ -407,7 +407,7 @@ begin
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxCircleExF, ssaGfxDrawGML, ssaGfxDrawString,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxPaletteUsing, ssaGfxColor,
-    ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow,
+    ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow, ssaGfxBFile,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
     ssaScreenLock, ssaScreenUnlock,   // the frame boundary IS the effect: never dead
     // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must

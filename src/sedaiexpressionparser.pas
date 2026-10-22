@@ -1875,7 +1875,9 @@ begin
   // 0, or 1 on a channel that is not open. They lex in this family, so "Print FileFlush(1)" was a syntax
   // error. Built as the filesystem function node; FileFlush's arguments are both optional, and an omitted
   // one is an empty literal as in Dir().
-  if ModernMode and ((UpperCase(Token.Value) = kFILEFLUSH) or (UpperCase(Token.Value) = kFILESETEOF)) and
+  // ✅ ...and BSAVE / BLOAD of fbgfx (DIVERGENZE 663), which answer 0 or an error code: "If BLoad(f, img) <> 0".
+  if ModernMode and ((UpperCase(Token.Value) = kFILEFLUSH) or (UpperCase(Token.Value) = kFILESETEOF) or
+                     (UpperCase(Token.Value) = 'BSAVE') or (UpperCase(Token.Value) = 'BLOAD')) and
      Context.Check(ttDelimParOpen) then
   begin
     Result := TASTNode.CreateWithValue(antFsFunction, UpperCase(Token.Value), Token);
@@ -2248,6 +2250,16 @@ begin
   if not HasValidContext then
   begin
     Result := nil;
+    Exit;
+  end;
+
+  // ⭐ DIVERGENZE 668: a bare "Pos" is fbc's Pos() - "Print Pos, 5", "x = Pos + 1", "Print Pos" all compile there and
+  // call it. Before ")" it stays the name below (OffsetOf(Box, pos) names the field).
+  if ModernMode and SameText(VarToStr(Token.Value), 'POS') and not Context.Check(ttDelimParOpen) and
+     not Context.Check(ttDelimParClose) then
+  begin
+    Result := TASTNode.CreateWithValue(antInputFunction, Token.Value, Token);
+    DoNodeCreated(Result);
     Exit;
   end;
 

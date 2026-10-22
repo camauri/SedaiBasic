@@ -69,6 +69,13 @@ type
       live - Buf = nil keeps them in the backend, otherwise Buf (owned by the caller: in the fb memory mode the libc block
       IMAGECREATE answers, past its header) is the buffer every primitive draws into. }
     procedure SetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
+    { ✅ DIVERGENZE 677: an IMAGECREATE image at fbc's depth - Bpp 1 (depth 1..8), 2 (15/16) or 4 bytes per pixel, its
+      bytes at Pix (nil: kept by the backend) with PitchBytes per row. SyncImage reconciles those bytes with the 32bpp
+      buffer the primitives draw into (ToNative False = bytes -> picture, before; True = picture -> bytes, after), and
+      SurfaceImageBpp answers 1, 2 or 4 (4 also for the screen and an unknown surface). }
+    procedure SetSurfaceImageFormat(Surface: TGfxSurface; Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+    procedure SyncImage(Surface: TGfxSurface; ToNative: Boolean);
+    function  SurfaceImageBpp(Surface: TGfxSurface): Integer;
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -155,6 +162,13 @@ type
       live - Buf = nil keeps them in the backend, otherwise Buf (owned by the caller: in the fb memory mode the libc block
       IMAGECREATE answers, past its header) is the buffer every primitive draws into. }
     procedure SetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
+    { ✅ DIVERGENZE 677: an IMAGECREATE image at fbc's depth - Bpp 1 (depth 1..8), 2 (15/16) or 4 bytes per pixel, its
+      bytes at Pix (nil: kept by the backend) with PitchBytes per row. SyncImage reconciles those bytes with the 32bpp
+      buffer the primitives draw into (ToNative False = bytes -> picture, before; True = picture -> bytes, after), and
+      SurfaceImageBpp answers 1, 2 or 4 (4 also for the screen and an unknown surface). }
+    procedure SetSurfaceImageFormat(Surface: TGfxSurface; Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+    procedure SyncImage(Surface: TGfxSurface; ToNative: Boolean);
+    function  SurfaceImageBpp(Surface: TGfxSurface): Integer;
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -234,6 +248,7 @@ begin
   if M.State.PaletteMode and M.State.PaletteEnabled then Exit;  // a nearest-index SEARCH, plus a
                                                                 // second buffer to write
   if M.RowPixels <> M.State.Width then Exit;                    // a padded image row: the arm steps by the width
+  if (Surface <> GFX_SCREEN_SURFACE) and (M.ImgBpp in [1, 2]) then Exit;   // 1/2-byte image: its bytes follow (677)
   Base := M.GraphicsBuffer; W := M.State.Width; H := M.State.Height;
   Result := (W > 0) and (H > 0);
 end;
@@ -374,6 +389,32 @@ begin
   if Assigned(M) then Result := M.State.Height else Result := 0;
 end;
 
+procedure TSoftwareGraphicsBackend.SetSurfaceImageFormat(Surface: TGfxSurface; Bpp: Integer; Pix: PByte; PitchBytes: Integer);
+var M: TGraphicsMemory;
+begin
+  if Surface = GFX_SCREEN_SURFACE then Exit;
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.UseImageFormat(Bpp, Pix, PitchBytes);
+end;
+
+procedure TSoftwareGraphicsBackend.SyncImage(Surface: TGfxSurface; ToNative: Boolean);
+var M: TGraphicsMemory;
+begin
+  if Surface = GFX_SCREEN_SURFACE then Exit;
+  M := MemoryOf(Surface);
+  if Assigned(M) then
+    if ToNative then M.ImagePush else M.ImagePull;
+end;
+
+function TSoftwareGraphicsBackend.SurfaceImageBpp(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
+begin
+  Result := 4;
+  if Surface = GFX_SCREEN_SURFACE then Exit;
+  M := MemoryOf(Surface);
+  if Assigned(M) and (M.ImgBpp in [1, 2]) then Result := M.ImgBpp;
+end;
+
 function TSoftwareGraphicsBackend.SurfaceDepth(Surface: TGfxSurface): Integer;
 var M: TGraphicsMemory;
 begin
@@ -410,6 +451,13 @@ var M: TGraphicsMemory;
 begin
   Data := nil; SizeBytes := 0;
   M := MemoryOf(Surface);
+  // DIVERGENZE 677: an image at 1 or 2 bytes per pixel hands out ITS bytes, header-less, PitchBytes per row
+  if Assigned(M) and (Surface <> GFX_SCREEN_SURFACE) and (M.ImgBpp in [1, 2]) and Assigned(M.ImgPixels) then
+  begin
+    Data := M.ImgPixels;
+    SizeBytes := M.ImgPitch * M.State.Height;
+    Exit(True);
+  end;
   // ⭐ AT A LOW DEPTH THE PROGRAM WRITES THE NATIVE BUFFER, not the RGBA one: an 8bpp program puts ONE
   // BYTE per pixel through SCREENPTR, and handing it the 32bpp buffer made it paint a quarter of the
   // picture in the wrong colours. The RGBA buffer stays what the presenter reads; SyncNativeToRGB
@@ -733,6 +781,8 @@ begin
       if (dx < 0) or (dx >= DW) then Continue;
       sc := MS.GetPixel(sx, sy);
       if (Mode = gbmTrans) and (sc = TRANS_KEY) then Continue;   // transparent pixel: leave dst
+      // DIVERGENZE 677: a 1-byte (8bpp and below) image's transparent colour is 0, as fbc's
+      if (Mode = gbmTrans) and (Src <> GFX_SCREEN_SURFACE) and (MS.ImgBpp = 1) and (sc = 0) then Continue;
       // ALPHA writes nothing at all when the factor is zero - which is why a fully transparent blit
       // leaves the destination's OWN alpha byte standing instead of zeroing it.
       if (Mode = gbmAlpha) and (((BlendVal = 0)) or ((BlendVal < 0) and (((sc shr 24) and $FF) = 0))) then Continue;

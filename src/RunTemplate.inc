@@ -1597,7 +1597,7 @@ EventPollCounter := 0;
           end;
 
         // DATA/READ/RESTORE - fall back to slow path
-        bcDataAdd, bcDataReadInt, bcDataReadFloat, bcDataReadString, bcDataRestore:
+        bcDataAdd, bcDataSetInt, bcDataReadInt, bcDataReadFloat, bcDataReadString, bcDataRestore:
           begin
             Ctx.PC := CurPC;
             ExecuteInstruction(Ctx, Instr^);

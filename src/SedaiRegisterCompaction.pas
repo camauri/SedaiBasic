@@ -492,9 +492,25 @@ begin
     if OpCode = bcConScreen then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
-    // IMAGECREATE: Immediate contains the fill-colour register index (int)
-    if OpCode = bcGfxImageCreate then
+    // ✅ DIVERGENZE 728: SCREENRES carries its DEPTH's register in Immediate[32-47] ($FFFF = not given). This scan and
+    // the remap below never named it, so a compaction that renumbered that register left SCREENRES reading another
+    // one - "ScreenRes(64, 64, 32)" in a loop gave an 8-bit screen on the second turn, with the optimizer only.
+    if (OpCode = bcGfxScreenRes) and (((Instr.Immediate shr 32) and $FFFF) <> $FFFF) then
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);
+
+    // BSAVE/BLOAD: Immediate[0-15] = size, [16-31] = palette pointer, both int registers; bit 32 = BLOAD (663)
+    if OpCode = bcGfxBFile then
+    begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);
+      MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);
+    end;
+
+    // IMAGECREATE: Immediate[0-15] = the fill-colour register, [16-31] = the depth's register or $FFFF (677)
+    if OpCode = bcGfxImageCreate then
+    begin
+      MarkIntRegUsed(Instr.Immediate and $FFFF);
+      if ((Instr.Immediate shr 16) and $FFFF) <> $FFFF then MarkIntRegUsed((Instr.Immediate shr 16) and $FFFF);
+    end;
 
     // SETMOUSE: Immediate[0-15] contains the visibility register index (int)
     if OpCode = bcSetmouse then
@@ -792,7 +808,7 @@ var
   OpCode: TBytecodeOp;
   Modified: Boolean;
   NewImm: Int64;
-  OldReg, NewReg: Integer;
+  OldReg, NewReg, OldReg2, NewReg2: Integer;
 begin
   for i := 0 to FProgram.GetInstructionCount - 1 do
   begin
@@ -1124,7 +1140,7 @@ begin
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
        (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) or   // PUT/GET #n, , *p, n: byte-count register
-       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or (OpCode = bcGfxImageCreate) or
+       (OpCode = bcGfxPset) or (OpCode = bcGfxPaint) or
        (OpCode = bcConScreen) or   // SCREEN(row,col[,flag]): Immediate[0-15] = colorflag register
        (OpCode = bcSetmouse) then   // SETMOUSE: Immediate[0-15] = visibility register
     begin
@@ -1137,6 +1153,54 @@ begin
           Instr.Immediate := NewReg and $FFFF;
           Modified := True;
         end;
+      end;
+    end;
+
+    // bcGfxBFile: Immediate[0-15] = size, [16-31] = palette pointer, bit 32 = BLOAD - kept (DIVERGENZE 663)
+    if OpCode = bcGfxBFile then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      NewReg := OldReg;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg];
+      OldReg2 := (Instr.Immediate shr 16) and $FFFF;
+      NewReg2 := OldReg2;
+      if (OldReg2 < Length(FIntRegMap)) and (FIntRegMap[OldReg2] >= 0) then NewReg2 := FIntRegMap[OldReg2];
+      if (NewReg <> OldReg) or (NewReg2 <> OldReg2) then
+      begin
+        Instr.Immediate := (Instr.Immediate and not Int64($FFFFFFFF)) or (Int64(NewReg) and $FFFF) or
+                           ((Int64(NewReg2) and $FFFF) shl 16);
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxScreenRes: Immediate[32-47] = the depth's register or $FFFF; bits 0-31 are pages and flags (DIVERGENZE 728)
+    if OpCode = bcGfxScreenRes then
+    begin
+      OldReg := (Instr.Immediate shr 32) and $FFFF;
+      if (OldReg <> $FFFF) and (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) and
+         (FIntRegMap[OldReg] <> OldReg) then
+      begin
+        NewReg := FIntRegMap[OldReg];
+        Instr.Immediate := (Instr.Immediate and not (Int64($FFFF) shl 32)) or ((Int64(NewReg) and $FFFF) shl 32);
+        Modified := True;
+      end;
+    end;
+
+    // bcGfxImageCreate: Immediate[0-15] = fill colour, [16-31] = depth or $FFFF (DIVERGENZE 677) - both remapped,
+    // and the second kept: rewriting the whole Immediate from the low half dropped the depth.
+    if OpCode = bcGfxImageCreate then
+    begin
+      OldReg := Instr.Immediate and $FFFF;
+      NewReg := OldReg;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg];
+      OldReg2 := (Instr.Immediate shr 16) and $FFFF;
+      NewReg2 := OldReg2;
+      if (OldReg2 <> $FFFF) and (OldReg2 < Length(FIntRegMap)) and (FIntRegMap[OldReg2] >= 0) then
+        NewReg2 := FIntRegMap[OldReg2];
+      if (NewReg <> OldReg) or (NewReg2 <> OldReg2) then
+      begin
+        Instr.Immediate := (Int64(NewReg) and $FFFF) or ((Int64(NewReg2) and $FFFF) shl 16);
+        Modified := True;
       end;
     end;
 

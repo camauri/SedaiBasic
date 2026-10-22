@@ -1,0 +1,135 @@
+# Builds the SedaiBasic executables on Linux and on Windows and attaches them to a GitHub release.
+#
+#   push a tag v*      -> both builds, then a DRAFT release on that tag with the two archives
+#                         (a draft is invisible until it is published by hand from the Releases page)
+#   Run workflow       -> both builds only; the archives are kept as workflow artifacts, no release
+#
+# Windows is built on a native runner with build.ps1, not cross-compiled from Linux.
+# Dependencies come from the same places a developer's machine gets them from:
+#   Linux   - FPC 3.2.2, gcc and the SDL2 libraries from apt; the SDL2 Pascal bindings via setup.sh
+#   Windows - scripts/windows/install-*.ps1 (FPC, gcc, SDL2 bindings, runtime DLLs, SedaiAudio)
+# SedaiAudio is compiled into sbv only: sb carries no audio (DIVERGENZE 585), and the MODERN
+# dialect has no sound statements. The FreeBASIC headers are NOT shipped: sb finds them through
+# the FreeBASIC installation named in sedai.conf.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SedaiAudio into deps/
+        uses: actions/checkout@v4
+        with:
+          repository: camauri/SedaiAudio
+          path: deps/SedaiAudioFoundation
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc gcc unzip curl libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev
+          fpc -iV
+
+      - name: SDL2 Pascal bindings
+        run: ./setup.sh --deps-only < /dev/null
+
+      - name: Build
+        run: ./build.sh --no-banner < /dev/null
+
+      - name: Package
+        id: pkg
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_REF_TYPE" == "tag" ]] || ver="dev-${GITHUB_SHA::7}"
+          name="sedaibasic-${ver}-x86_64-linux"
+          mkdir -p "dist/$name"
+          for b in sb sbc sbd sbv sbw; do
+            test -x "bin/x86_64-linux/$b" || { echo "missing bin/x86_64-linux/$b"; exit 1; }
+            cp "bin/x86_64-linux/$b" "dist/$name/"
+          done
+          cp README.md LICENCE.md INSTALL.md "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ${{ steps.pkg.outputs.file }}
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          .\scripts\windows\install-fpc.ps1 -Quiet
+          .\scripts\windows\install-gcc.ps1 -Quiet
+          .\scripts\windows\install-sdl2.ps1 -Quiet
+          .\scripts\windows\install-runtime-x86_64.ps1 -Quiet
+          .\scripts\windows\install-sedaiaudio.ps1 -Quiet
+
+      - name: Build
+        run: .\build.ps1 -NoBanner
+
+      - name: Package
+        id: pkg
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_REF_TYPE -ne 'tag') { $ver = "dev-" + $env:GITHUB_SHA.Substring(0, 7) }
+          $name = "sedaibasic-$ver-x86_64-win64"
+          $dst = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          foreach ($b in 'sb', 'sbc', 'sbd', 'sbv', 'sbw') {
+            $exe = "bin\x86_64-win64\$b.exe"
+            if (-not (Test-Path $exe)) { throw "missing $exe" }
+            Copy-Item $exe $dst
+          }
+          Copy-Item bin\x86_64-win64\*.dll $dst
+          Copy-Item bin\x86_64-win64\font $dst -Recurse
+          foreach ($f in 'README.md', 'LICENCE.md', 'INSTALL.md') { if (Test-Path $f) { Copy-Item $f $dst } }
+          Compress-Archive -Path $dst -DestinationPath "dist\$name.zip"
+          "file=dist\$name.zip" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ steps.pkg.outputs.file }}
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "SedaiBasic $GITHUB_REF_NAME" \
+            --generate-notes

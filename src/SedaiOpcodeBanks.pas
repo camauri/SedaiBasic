@@ -173,6 +173,8 @@ begin
     bcCallSubIndirect,
     // ⭐ DIVERGENZE 561 · 576: ValueForC reads the value in Src1 (int); what to make of it rides the Immediate.
     bcValueForC,
+    // ⭐ DIVERGENZE 662: DataSetInt writes the address in Src1 (int) into the DATA pool slot named by the Immediate.
+    bcDataSetInt,
     // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
@@ -445,6 +447,7 @@ begin
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
+    bcGfxBFile,        // BSAVE/BLOAD: Src2 = the image / memory pointer (int) (DIVERGENZE 663)
     bcGfxGet, bcGfxPut,  // GET/PUT: Src2 = y1 / y (int)
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src2 = visible / dst page (int)
     bcGfxWindow, bcGfxView,  // WINDOW/VIEW: Src2 = y1 (int)
@@ -690,6 +693,7 @@ begin
     bcStrig,          // STRIG: Dest = button state -1/0 (int)
     bcGfxPointCoord,  // POINTCOORD(n): Dest = pen coordinate (int)
     bcGfxScreenList,  // SCREENLIST(d): Dest = (width shl 16) or height (int)
+    bcGfxBFile,       // BSAVE/BLOAD (DIVERGENZE 663): Dest = the error code (int)
     bcGraphicRdot,    // Dest = pixel cursor info (int)
     bcGraphicGetMode, // Dest = current graphic mode (int)
     bcGraphicPos,     // POS(x): cursor column position (int)
@@ -959,6 +963,7 @@ begin
     bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src1 = the SOURCE string
     bcStrMidAssign,     // "Mid(t,start)=src": Src1 = the incoming t
     bcFileExists, bcFileLen, bcFileDateTime,  // FILEEXISTS/FILELEN/FILEDATETIME(path): Src1 = path string
+    bcGfxBFile,   // BSAVE/BLOAD (DIVERGENZE 663): Src1 = the file name
     bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src1 = source string
     bcStrLTrim, bcStrRTrim, bcStrTrim, bcStrUCase, bcStrLCase,  // B1.2: Src1 = source string
     bcEnviron,   // ENVIRON$(name) - Src1 = name string
@@ -1193,6 +1198,7 @@ begin
     bcGfxPset, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled,
     bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxGet, bcGfxPut, bcGfxView, bcGfxWindow,
     bcGfxImageCreate, bcGfxImageConvertRow,
+    bcGfxBFile,   // DIVERGENZE 663: Immediate[0-15] = size, [16-31] = palette pointer (bit 32 = BLOAD, not a register)
     // ⛔ bcGfxScreenRes CARRIES A REGISTER TOO, and this was the last of the THREE places a register
     // packed into an Immediate has to be named: the bank sizer (RunFast's pre-scan), the register
     // compactor's remap, and this liveness scan. Two of the three were done and the third was not, so
