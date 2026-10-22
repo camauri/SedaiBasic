@@ -60,7 +60,7 @@ jobs:
             test -x "bin/x86_64-linux/$b" || { echo "missing bin/x86_64-linux/$b"; exit 1; }
             cp "bin/x86_64-linux/$b" "dist/$name/"
           done
-          cp README.md LICENCE.md INSTALL.md "dist/$name/" 2>/dev/null || true
+          cp README.md LICENSE INSTALL.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
@@ -104,7 +104,7 @@ jobs:
           }
           Copy-Item bin\x86_64-win64\*.dll $dst
           Copy-Item bin\x86_64-win64\font $dst -Recurse
-          foreach ($f in 'README.md', 'LICENCE.md', 'INSTALL.md') { if (Test-Path $f) { Copy-Item $f $dst } }
+          foreach ($f in 'README.md', 'LICENSE', 'INSTALL.md') { if (Test-Path $f) { Copy-Item $f $dst } }
           Compress-Archive -Path $dst -DestinationPath "dist\$name.zip"
           "file=dist\$name.zip" >> $env:GITHUB_OUTPUT
 
