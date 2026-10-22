@@ -44,8 +44,10 @@ jobs:
       - name: SDL2 Pascal bindings
         run: ./setup.sh --deps-only < /dev/null
 
+      # Without a terminal the scripts never pick a compiler on their own, even when only one is found:
+      # it is named here.
       - name: Build
-        run: ./build.sh --no-banner < /dev/null
+        run: ./build.sh --no-banner --fpc "$(command -v fpc)" < /dev/null
 
       - name: Package
         id: pkg
@@ -85,7 +87,7 @@ jobs:
           .\scripts\windows\install-sedaiaudio.ps1 -Quiet
 
       - name: Build
-        run: .\build.ps1 -NoBanner
+        run: .\build.ps1 -NoBanner -Fpc "$PWD\fpc\3.2.2\bin\x86_64-win64\fpc.exe"
 
       - name: Package
         id: pkg
