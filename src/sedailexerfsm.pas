@@ -297,7 +297,8 @@ implementation
 
 uses
   DateUtils, StrUtils,
-  SedaiPreprocessor;   // GPPUndefNames: a keyword the program #undef'd is a name again (DIVERGENZE 606)
+  SedaiPreprocessor,   // GPPUndefNames: a keyword the program #undef'd is a name again (DIVERGENZE 606)
+  SedaiLangMode;       // GLangMode: fblite glues the &-suffix (D4)
 
 // Forward declaration for lazy extraction callback
 function StaticExtractTokenValue(Context: Pointer; RecIndex: Integer): string; forward;
@@ -2781,6 +2782,15 @@ begin
               AdvanceChar;
             end;
             // else: '#' + digit and not a #-keyword -> leave '#' for the file-handle-prefix token.
+          end;
+
+          // '&' is the LONG suffix in fblite / qb / deprecated (l& = 100000), glued only where it cannot be the start of
+          // something else: not before a name, a digit or a string (concatenation, &H10, &O7, &B1).
+          if (CurrentChar = '&') and SourceDeclaresNonFbDialect and
+             not (PeekChar(1) in ['A'..'Z', 'a'..'z', '0'..'9', '_', '"']) then
+          begin
+            TokenBufferAdd('&');
+            AdvanceChar;
           end;
 
           Result := ProcessIdentifier;

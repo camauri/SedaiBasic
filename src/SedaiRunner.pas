@@ -115,6 +115,11 @@ type
 
 const
   CLASSIC_ONLY_REFUSAL = 'sbv runs CLASSIC programs only (Commodore BASIC 7.0, with line numbers): %s is a MODERN program - run it with sb';
+  // ...and its mirror: sb is the MODERN environment (owner, 23 Oct 2026), and sbv --headless runs a CLASSIC
+  // program with no window and the same engine options.
+  // sbw too: the web serves MODERN only (owner, 23 Oct 2026).
+  WEB_MODERN_ONLY_REFUSAL = 'sbw runs MODERN programs only: %s is a CLASSIC program (Commodore BASIC 7.0, with line numbers)';
+  MODERN_ONLY_REFUSAL = 'sb runs MODERN programs only: %s is a CLASSIC program (Commodore BASIC 7.0, with line numbers) - run it with sbv, or with sbv --headless for no window';
 
 { PHASE_DIAG=1 - per-phase compile TIME, in milliseconds. See the bodies in the implementation. }
 procedure PhaseBegin;

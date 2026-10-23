@@ -114,6 +114,9 @@ $Script:PyDir        = Join-Path $BenchmarkDir "tests\py"
 $Script:LuaDir       = Join-Path $BenchmarkDir "tests\lua"
 $Script:OracleDir    = Join-Path $ProjectRoot  "job\tests\tools"
 $Script:SbExe        = Join-Path $ProjectRoot  "bin\x86_64-win64\sb.exe"
+# CLASSIC runs only in sbv (owner, 23 Oct 2026): a CLASSIC benchmark is timed on `sbv --headless`, chosen per
+# file by asking sb (`--dialect`) - outside the timed command, so the choice costs the measurement nothing.
+$Script:SbvExe       = Join-Path $ProjectRoot  "bin\x86_64-win64\sbv.exe"
 $Script:ThermoExe    = Join-Path $ProjectRoot  "job\tests\bench\nbody_fbc_o2.exe"
 $Script:ConfigFile   = Join-Path $BenchmarkDir "benchmark.config.json"
 
@@ -619,10 +622,12 @@ function Invoke-Benchmark {
     # --- SedaiBasic, four profiles ----------------------------------------
     if ($Script:RunSedai) {
         $src = Join-Path $BasDir $Bench.Bas
+        $exe = $SbExe; $lead = @()
+        if (((& $SbExe --dialect $src 2>$null) | Select-Object -First 1) -eq 'classic') { $exe = $SbvExe; $lead = @('--headless') }
         foreach ($p in $Script:Profiles) {
             if ($Script:ProfileFilter.Count -gt 0 -and $p.Key -notin $Script:ProfileFilter) { continue }
-            $result.Arms[$p.Key] = Invoke-Arm -Label $p.Label -Exe $SbExe `
-                -Arguments (@($src) + $sizeArgs + $p.Flags) -StdinFile $stdinFile `
+            $result.Arms[$p.Key] = Invoke-Arm -Label $p.Label -Exe $exe `
+                -Arguments ($lead + @($src) + $sizeArgs + $p.Flags) -StdinFile $stdinFile `
                 -OutFile (Join-Path $TempDir "$name.$($p.Key).out") -RunCount $RunCount -CooldownSeconds $CooldownSeconds
         }
     }

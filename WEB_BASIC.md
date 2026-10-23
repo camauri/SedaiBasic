@@ -41,34 +41,20 @@ curl "http://localhost:8080/hello.wbas?nome=Mario"
 
 | Extension | Description | Executable |
 |-----------|-------------|------------|
-| `.bas` | Standard BASIC (console) | sb.exe, sbv.exe |
+| `.bas` | Standard BASIC (console) | sb.exe (MODERN), sbv.exe (CLASSIC) |
 | `.wbas` | Web BASIC | sbw.exe |
-| `.basc` | Compiled bytecode | sb.exe, sbv.exe |
+| `.basc` | Compiled bytecode | sb.exe (MODERN), sbv.exe (CLASSIC) |
 
-## Dialects
+## Dialect
 
-A `.wbas` script may be written in either dialect, and `sbw` chooses per script from the source
-itself - exactly as `sb` and `sbc` do:
+A `.wbas` script is written in the **MODERN** dialect (FreeBASIC): a `Sub` has its own locals, numbers
+print as FreeBASIC prints them, and the preprocessor (`#define`, `#if`, `#include`, `#macro`) is there.
 
-| the source | dialect | what follows from it |
-|---|---|---|
-| some line begins with a number | **CLASSIC** (Commodore BASIC v7) | global-by-name variables, a trailing space after a printed number, `TAB`/`SPC` always emit their spaces |
-| no line numbers | **MODERN** (FreeBASIC) | a `Sub` has its own locals, FreeBASIC number formatting, the preprocessor (`#define`, `#if`, `#include`, `#macro`) |
+A script with line numbers is **CLASSIC** (Commodore BASIC v7), and `sbw` refuses it: the request gets a
+`500 Internal Server Error` page that names the reason. CLASSIC programs run in `sbv`.
 
-The detection is the same comment- and string-aware heuristic the other front ends use, so a number at
-the start of a line inside a comment or a string does not change the dialect.
-
-> **Before 1 September 2026 `sbw` was CLASSIC-only**, and forced every script through the Commodore
-> rules regardless of how it was written. A MODERN script therefore got Commodore scoping, no
-> preprocessor, unmasked floating-point exceptions and no `OPTION DIGITS`. If you have `.wbas` files
-> written against that behaviour and they rely on a `Sub` sharing a module variable by name, add line
-> numbers to keep them CLASSIC.
-
-### What is still CLASSIC-only, on purpose
-
-`TAB` and `SPC` are cursor movements. In MODERN, FreeBASIC emits them only onto a visible screen, and an
-HTTP response body is a redirected stream - so in a MODERN `.wbas` they produce nothing, which is what
-`fbc` does. In a CLASSIC `.wbas` the spaces are emitted as always.
+`TAB` and `SPC` are cursor movements. FreeBASIC emits them only onto a visible screen, and an HTTP
+response body is a redirected stream, so in a `.wbas` they produce nothing - which is what `fbc` does.
 
 ## Web BASIC Instructions
 
@@ -84,15 +70,15 @@ HTTP response body is a redirected stream - so in a MODERN `.wbas` they produce 
 **Security principle:** `GET$` and `POST$` return HTML-escaped values by default.
 
 ```basic
-10 REM Input: nome=Mario<script>alert(1)</script>
-20 PRINT GET$("nome")
-30 REM Output: Mario&lt;script&gt;alert(1)&lt;/script&gt;
+' Input: nome=Mario<script>alert(1)</script>
+Print Get$("nome")
+' Output: Mario&lt;script&gt;alert(1)&lt;/script&gt;
 ```
 
 For raw data (JSON processing, internal use):
 ```basic
-10 REM Only when necessary and with awareness
-20 JSON$ = GETRAW$("data")
+' Only when necessary and with awareness
+Dim As String json = GetRaw$("data")
 ```
 
 ### Encoding Functions
@@ -123,13 +109,13 @@ For raw data (JSON processing, internal use):
 ### hello.wbas - Simple HTML Page
 
 ```basic
-10 SETHEADER "Content-Type", "text/html; charset=utf-8"
-20 PRINT "<html><body>"
-30 PRINT "<h1>Welcome!</h1>"
-40 IF GET$("nome") <> "" THEN PRINT "<p>Hello "; GET$("nome"); "!</p>"
-50 PRINT "<p>Method: "; METHOD$; "</p>"
-60 PRINT "<p>Time: "; TIME$; "</p>"
-70 PRINT "</body></html>"
+SetHeader "Content-Type", "text/html; charset=utf-8"
+Print "<html><body>"
+Print "<h1>Welcome!</h1>"
+If Get$("nome") <> "" Then Print "<p>Hello " & Get$("nome") & "!</p>"
+Print "<p>Method: " & Method$ & "</p>"
+Print "<p>Time: " & Time & "</p>"
+Print "</body></html>"
 ```
 
 **Request:** `GET /hello.wbas?nome=Mario`
@@ -147,28 +133,29 @@ For raw data (JSON processing, internal use):
 ### api.wbas - JSON API
 
 ```basic
-10 SETHEADER "Content-Type", "application/json"
-20 ID$ = GETRAW$("id")
-30 IF ID$ = "" THEN ID$ = "0"
-40 PRINT "{""id"": "; ID$; ", ""status"": ""ok"", ""time"": """; TIME$; """}"
+SetHeader "Content-Type", "application/json"
+Dim As String id = GetRaw$("id")
+If id = "" Then id = "0"
+Print "{""id"": " & id & ", ""status"": ""ok"", ""time"": """ & Time & """}"
 ```
 
 ### form.wbas - Form Handling
 
 ```basic
-10 SETHEADER "Content-Type", "text/html; charset=utf-8"
-20 PRINT "<html><body>"
-30 IF METHOD$ = "POST" THEN GOTO 100
-40 REM Show form
-50 PRINT "<form method='post'>"
-60 PRINT "<input name='nome' placeholder='Name'>"
-70 PRINT "<button>Submit</button>"
-80 PRINT "</form>"
-90 GOTO 200
-100 REM Process POST
-110 PRINT "<h1>Hello "; POST$("nome"); "!</h1>"
-120 PRINT "<a href='/form.wbas'>Back</a>"
-200 PRINT "</body></html>"
+SetHeader "Content-Type", "text/html; charset=utf-8"
+Print "<html><body>"
+If Method$ = "POST" Then
+  ' Process POST
+  Print "<h1>Hello " & Post$("nome") & "!</h1>"
+  Print "<a href='/form.wbas'>Back</a>"
+Else
+  ' Show form
+  Print "<form method='post'>"
+  Print "<input name='nome' placeholder='Name'>"
+  Print "<button>Submit</button>"
+  Print "</form>"
+End If
+Print "</body></html>"
 ```
 
 ## Excluded Instructions
@@ -193,7 +180,8 @@ registrations sat inside the block of graphics keywords that `WEB_MODE` compiles
 know the names at all.
 
 ### How a refusal reports itself
-A script `sbw` cannot compile answers `500 Internal Server Error: Compilation failed`. Run the server
+A CLASSIC script (line numbers) answers `500 Internal Server Error` with the reason on the page. Any
+other script `sbw` cannot compile answers `500 Internal Server Error: Compilation failed`. Run the server
 with `--verbose` to get the real reason in the log (`SSA generation error: ...`, `Parser error: ...`,
 `Preprocessor error: ...`). Before 1 September 2026 every such refusal surfaced as `Access violation`,
 which named nothing.
@@ -205,11 +193,11 @@ which named nothing.
 Use `GET$`/`POST$` (not `GETRAW$`/`POSTRAW$`) when outputting to HTML:
 
 ```basic
-10 REM SAFE - HTML-escaped
-20 PRINT "<p>Hello "; GET$("name"); "</p>"
+' SAFE - HTML-escaped
+Print "<p>Hello " & Get$("name") & "</p>"
 
-30 REM UNSAFE - XSS vulnerable
-40 PRINT "<p>Hello "; GETRAW$("name"); "</p>"
+' UNSAFE - XSS vulnerable
+Print "<p>Hello " & GetRaw$("name") & "</p>"
 ```
 
 ### Path Traversal Protection

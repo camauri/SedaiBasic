@@ -1,0 +1,3205 @@
+{ SbCli.inc - the file runner shared by sb (MODERN) and sbv --headless (CLASSIC).
+  Included by SedaiBasicVM.lpr and SedaiVision.lpr after their uses clause and Version.inc. }
+
+var
+  // Which front end is running, set before SbCliMain: True = sbv --headless (CLASSIC programs only),
+  // False = sb (MODERN programs only). Owner, 23 Oct 2026: CLASSIC lives in sbv alone.
+  GCliClassic: Boolean = False;
+
+{ The command a user types to reach this runner, for the help text and the messages. }
+function CliCmd: string;
+begin
+  if GCliClassic then
+    Result := 'sbv --headless'
+  else
+    Result := 'sb';
+end;
+
+{ `--dialect FILE`: print "classic" or "modern" - the dialect the runner would read, from the same function
+  on the same preprocessed text (a .basc says it itself). Test scripts use it to pick sb or sbv --headless
+  (job/tests/tools/sbany.sh) without a second guess of their own. }
+procedure CliPrintDialect(const FileName: string);
+var
+  Src: TStringList;
+  Text: string;
+  Serializer: TBytecodeSerializer;
+  Prog: TBytecodeProgram;
+  IsModern: Boolean;
+begin
+  if TSedaiRunner.DetectFileType(FileName) = sftBytecode then
+  begin
+    Serializer := TBytecodeSerializer.Create;
+    try
+      Prog := Serializer.LoadFromFile(FileName);
+      IsModern := Prog.ModernMode;
+      Prog.Free;
+    finally
+      Serializer.Free;
+    end;
+  end
+  else
+  begin
+    Src := TStringList.Create;
+    try
+      Src.LoadFromFile(FileName);
+      Text := Src.Text;
+    finally
+      Src.Free;
+    end;
+    try
+      Text := PreprocessSource(Text, ExtractFilePath(ExpandFileName(FileName)), FileName);
+    except
+      on E: Exception do ;   // a source the preprocessor refuses: the runner will say so; judge the raw text
+    end;
+    // ...as the runner's gate does: line numbers under fblite / qb / deprecated are labels, not CLASSIC.
+    IsModern := (not TSedaiRunner.SourceHasLineNumbers(Text)) or SourceDeclaresNonFbDialect;
+  end;
+  if IsModern then WriteLn('modern') else WriteLn('classic');
+end;
+
+{ '' when this front end runs a program of that dialect, otherwise the refusal to print. One environment,
+  one dialect (owner, 9 Sep and 23 Oct 2026): sb runs MODERN, sbv runs CLASSIC. }
+function CliDialectRefusal(IsModern: Boolean; const FileName: string): string;
+begin
+  Result := '';
+  if GCliClassic and IsModern then
+    Result := Format(CLASSIC_ONLY_REFUSAL, [ExtractFileName(FileName)])
+  else if (not GCliClassic) and (not IsModern) then
+    Result := Format(MODERN_ONLY_REFUSAL, [ExtractFileName(FileName)]);
+end;
+
+
+// Console I/O is now in SedaiTerminalIO unit
+// TTerminalController and TTerminalInput replace the old TConsoleOutput/TConsoleInput
+
+// === BUILT-IN FUNCTIONS ===
+
+type
+  TBuiltinFunctions = class
+    function BuiltinSqr(const Args: array of Variant): Variant;
+    function BuiltinAbs(const Args: array of Variant): Variant;
+    function BuiltinInt(const Args: array of Variant): Variant;
+    // String functions
+    function BuiltinLen(const Args: array of Variant): Variant;
+    function BuiltinLeft(const Args: array of Variant): Variant;
+    function BuiltinMid(const Args: array of Variant): Variant;
+    function BuiltinRight(const Args: array of Variant): Variant;
+    function BuiltinAsc(const Args: array of Variant): Variant;
+    function BuiltinChr(const Args: array of Variant): Variant;
+    function BuiltinStr(const Args: array of Variant): Variant;
+    function BuiltinVal(const Args: array of Variant): Variant;
+  end;
+
+{$IFDEF UNIX}
+{ ⛔ CHI CHIAMA `exit` DECIDE SE UNA PROCEDURA REGISTRATA CON `atexit` PUO' GIRARE (DIVERGENZE 517).
+
+  Un programma puo' consegnare a C una procedura BASIC che C chiamera' alla fine (`g_atexit`, `on_exit`,
+  `__cxa_atexit`). Quelle procedure le chiama il runtime del C dentro `exit`, e fin qui non ci arrivavamo:
+  la RTL di Free Pascal termina per conto suo ESEGUENDO PRIMA LE PROPRIE FINALIZZAZIONI, e a quel punto il
+  gestore dei thread non c'e' piu' - il trampolino veniva entrato davvero e moriva su `GetCurrentThreadId`
+  con un `EThreadError` che nessuno vedeva. Non era «la VM non c'e' piu'»: la VM c'era, era la RTL a non
+  esserci.
+
+  ⇒ Quando una procedura BASIC e' finita in mano a C, l'uscita la chiama QUESTO programma: si va a
+  `exit` di libc con la RTL e la VM ancora intere, cosi' i gestori girano su un interprete vivo - ed e'
+  lo stesso ordine che `fbc` ottiene registrando il proprio `fb_End` per primo.
+
+  ⚠ Un `exit` di libc non torna e non fa girare le finalizzazioni della RTL, quindi cio' che DEVE
+  succedere DOPO i gestori si registra qui, per primo: `atexit` li chiama in ordine INVERSO, quindi il
+  primo registrato e' l'ultimo eseguito. Serve per svuotare `Output`, che ha un buffer suo di cui libc non
+  sa niente: senza, un `Print` dentro un gestore si perdeva.
+
+  🕳️ Su Windows resta il comportamento di prima: `exit` e `atexit` sono della CRT di quel sistema, e
+  la cosa va misurata la', non dedotta da qui. }
+function c_exit(code: LongInt): LongInt; cdecl; external 'c' name 'exit';
+function c_atexit(f: Pointer): LongInt; cdecl; external 'c' name 'atexit';
+
+procedure SbFlushLast; cdecl;
+begin
+  TerminalOutFlush;                        // ⛔ la console tiene 64 KB suoi: senza, si perde TUTTO l'output
+  RestoreConsoleCodePages;                 // no-op su Unix: il gemello della finalizzazione saltata
+  System.Flush(System.Output);
+  System.Flush(System.ErrOutput);
+end;
+{$ENDIF}
+
+var
+  GExitThroughLibc: Boolean = False;   // il programma ha dato una closure a C: si esce da libc (517)
+
+function TBuiltinFunctions.BuiltinSqr(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('SQR requires exactly one argument');
+  Result := Sqrt(Double(Args[0]));
+end;
+
+function TBuiltinFunctions.BuiltinAbs(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('ABS requires exactly one argument');
+  Result := Abs(Double(Args[0]));
+end;
+
+function TBuiltinFunctions.BuiltinInt(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('INT requires exactly one argument');
+  Result := Int(Double(Args[0]));
+end;
+
+// === STRING FUNCTIONS ===
+
+function TBuiltinFunctions.BuiltinLen(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('LEN requires exactly one argument');
+  Result := Length(VarToStr(Args[0]));
+end;
+
+function TBuiltinFunctions.BuiltinLeft(const Args: array of Variant): Variant;
+var
+  S: string;
+  N: Integer;
+begin
+  if Length(Args) <> 2 then
+    raise Exception.Create('LEFT$ requires two arguments');
+  S := VarToStr(Args[0]);
+  N := Integer(Args[1]);
+  if N < 0 then N := 0;
+  if N > Length(S) then N := Length(S);
+  Result := Copy(S, 1, N);
+end;
+
+function TBuiltinFunctions.BuiltinMid(const Args: array of Variant): Variant;
+var
+  S: string;
+  Start, Len: Integer;
+begin
+  if Length(Args) < 2 then
+    raise Exception.Create('MID$ requires at least two arguments');
+  S := VarToStr(Args[0]);
+  Start := Integer(Args[1]);
+  if Length(Args) >= 3 then
+    Len := Integer(Args[2])
+  else
+    Len := Length(S);  // Default: to end of string
+  Result := Copy(S, Start, Len);
+end;
+
+function TBuiltinFunctions.BuiltinRight(const Args: array of Variant): Variant;
+var
+  S: string;
+  N: Integer;
+begin
+  if Length(Args) <> 2 then
+    raise Exception.Create('RIGHT$ requires two arguments');
+  S := VarToStr(Args[0]);
+  N := Integer(Args[1]);
+  if N < 0 then N := 0;
+  if N > Length(S) then N := Length(S);
+  Result := Copy(S, Length(S) - N + 1, N);
+end;
+
+function TBuiltinFunctions.BuiltinAsc(const Args: array of Variant): Variant;
+var
+  S: string;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('ASC requires exactly one argument');
+  S := VarToStr(Args[0]);
+  if Length(S) > 0 then
+    Result := Ord(S[1])
+  else
+    Result := 0;
+end;
+
+function TBuiltinFunctions.BuiltinChr(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('CHR$ requires exactly one argument');
+  Result := Chr(Integer(Args[0]) and $FF);
+end;
+
+function TBuiltinFunctions.BuiltinStr(const Args: array of Variant): Variant;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('STR$ requires exactly one argument');
+  if VarIsFloat(Args[0]) then
+    Result := FloatToStr(Double(Args[0]))
+  else
+    Result := IntToStr(Integer(Args[0]));
+end;
+
+function TBuiltinFunctions.BuiltinVal(const Args: array of Variant): Variant;
+var
+  S: string;
+  FloatVal: Double;
+begin
+  if Length(Args) <> 1 then
+    raise Exception.Create('VAL requires exactly one argument');
+  S := Trim(VarToStr(Args[0]));
+  try
+    if Pos('.', S) > 0 then
+    begin
+      FloatVal := StrToFloat(S);
+      Result := FloatVal;
+    end
+    else
+      Result := StrToInt(S);
+  except
+    Result := 0;  // Return 0 on error
+  end;
+end;
+
+procedure RegisterBuiltinFunctions(Context: TExecutorContext; Functions: TBuiltinFunctions);
+begin
+  // Math functions
+  Context.RegisterFunction('SQR', @Functions.BuiltinSqr);
+  Context.RegisterFunction('ABS', @Functions.BuiltinAbs);
+  Context.RegisterFunction('INT', @Functions.BuiltinInt);
+
+  // String functions
+  Context.RegisterFunction('LEN', @Functions.BuiltinLen);
+  Context.RegisterFunction('LEFT$', @Functions.BuiltinLeft);
+  Context.RegisterFunction('MID$', @Functions.BuiltinMid);
+  Context.RegisterFunction('RIGHT$', @Functions.BuiltinRight);
+  Context.RegisterFunction('ASC', @Functions.BuiltinAsc);
+  Context.RegisterFunction('CHR$', @Functions.BuiltinChr);
+  Context.RegisterFunction('STR$', @Functions.BuiltinStr);
+  Context.RegisterFunction('VAL', @Functions.BuiltinVal);
+end;
+
+procedure PrintASTTree(Node: TASTNode; Indent: Integer = 0; TokenList: TTokenList = nil);
+var
+ i: Integer;
+ Prefix: string;
+ NodeInfo, AttrStr: string;
+begin
+ if not Assigned(Node) then Exit;
+
+ Prefix := StringOfChar(' ', Indent * 2);
+
+ // Format node information with type and value
+ if not VarIsEmpty(Node.Value) then
+   NodeInfo := Format('%s: "%s"', [
+     GetEnumName(TypeInfo(TASTNodeType), Ord(Node.NodeType)),
+     VarToStr(Node.Value)
+   ])
+ else
+   NodeInfo := GetEnumName(TypeInfo(TASTNodeType), Ord(Node.NodeType));
+
+ // ⭐ ...AND THE ATTRIBUTES, which is where half of what the parser decided actually lives. SHARED,
+ // STATIC, FIXEDLEN, BYREF, ELLIPSIS, CONSTDECL, ACCESS... none of it was shown, so reading a dump
+ // told you the SHAPE of a declaration and nothing about what the parser had CONCLUDED - and the
+ // answer had to be hunted for with a grep through 13.000 lines every single time. The vocabulary
+ // itself is indexed in job/markdown/GANCI.md; this prints what THIS program carries.
+ if Assigned(Node.Attributes) and (Node.Attributes.Count > 0) then
+ begin
+   AttrStr := '';
+   for i := 0 to Node.Attributes.Count - 1 do
+   begin
+     if AttrStr <> '' then AttrStr := AttrStr + ' ';
+     AttrStr := AttrStr + Node.Attributes[i];
+   end;
+   NodeInfo := NodeInfo + '   [' + AttrStr + ']';
+ end;
+
+ WriteLn(Format('%s%s', [Prefix, NodeInfo]));
+
+ // Print all children recursively
+ for i := 0 to Node.ChildCount - 1 do
+   PrintASTTree(Node.Child[i], Indent + 1, TokenList);
+end;
+
+{ Format time: always ms with 3 decimals, plus human-readable conversion in parentheses
+  < 1ms:        ms (with µs or ns conversion)
+  1-60000ms:    ms only (no parentheses needed)
+  > 60000ms:    ms (with hh:mm:ss.nnn conversion)
+}
+function FormatTimeEx(TimeMs: Double): string;
+var
+  TimeUs, TimeNs: Double;
+  Seconds: Double;
+  Hours, Minutes, Secs, Millis: Integer;
+begin
+  if TimeMs < 0.001 then
+  begin
+    // Less than 1µs -> show ns conversion
+    TimeNs := TimeMs * 1000000.0;
+    Result := Format('%.3f ms (%.0f ns)', [TimeMs, TimeNs]);
+  end
+  else if TimeMs < 1.0 then
+  begin
+    // 1µs to 1ms -> show µs conversion
+    TimeUs := TimeMs * 1000.0;
+    Result := Format('%.3f ms (%.2f µs)', [TimeMs, TimeUs]);
+  end
+  else if TimeMs < 60000.0 then
+  begin
+    // 1ms to 60s -> milliseconds only (no conversion needed)
+    Result := Format('%.3f ms', [TimeMs]);
+  end
+  else
+  begin
+    // > 60s -> show hh:mm:ss.nnn conversion
+    Seconds := TimeMs / 1000.0;
+    Hours := Trunc(Seconds) div 3600;
+    Minutes := (Trunc(Seconds) mod 3600) div 60;
+    Secs := Trunc(Seconds) mod 60;
+    Millis := Round((Seconds - Trunc(Seconds)) * 1000);
+    Result := Format('%.3f ms (%s:%s:%s.%s)',
+      [TimeMs,
+       FormatFloat('00', Hours),
+       FormatFloat('00', Minutes),
+       FormatFloat('00', Secs),
+       FormatFloat('000', Millis)]);
+  end;
+end;
+
+{ Format time with auto-scaling (ms -> µs -> ns) - legacy function }
+function FormatTime(TimeMs: Double): string;
+var
+  TimeUs, TimeNs: Double;
+begin
+  if TimeMs >= 1.0 then
+    Result := Format('%.2f ms', [TimeMs])
+  else
+  begin
+    TimeUs := TimeMs * 1000.0;  // Convert to microseconds
+    if TimeUs >= 1.0 then
+      Result := Format('%.2f µs', [TimeUs])
+    else
+    begin
+      TimeNs := TimeUs * 1000.0;  // Convert to nanoseconds
+      Result := Format('%.2f ns', [TimeNs]);
+    end;
+  end;
+end;
+
+{ Get system architecture string }
+function GetSystemArchitecture: string;
+begin
+  {$IFDEF CPUX86_64}
+    {$IFDEF WINDOWS}
+    Result := 'x86_64-win64';
+    {$ENDIF}
+    {$IFDEF LINUX}
+    Result := 'x86_64-linux';
+    {$ENDIF}
+    {$IFDEF DARWIN}
+    Result := 'x86_64-darwin';
+    {$ENDIF}
+  {$ELSE}
+    {$IFDEF CPUI386}
+      {$IFDEF WINDOWS}
+      Result := 'i386-win32';
+      {$ENDIF}
+      {$IFDEF LINUX}
+      Result := 'i386-linux';
+      {$ENDIF}
+    {$ELSE}
+      {$IFDEF CPUAARCH64}
+      Result := 'aarch64';
+      {$ELSE}
+      Result := 'unknown';
+      {$ENDIF}
+    {$ENDIF}
+  {$ENDIF}
+end;
+
+var
+  // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
+  OptTrueValue: Int64 = -1;
+  // --bounds-check: force array bounds checking on in every dialect (default off; MODERN follows FreeBASIC
+  // and skips it, CLASSIC always checks). A debugging aid analogous to FreeBASIC's -exx.
+  OptBoundsCheck: Boolean = False;
+  { --home: run the program AS IF from its own directory - chdir there before it starts.
+    ⛔⛔ EXPLICIT AND OPT-IN, AND THAT IS THE WHOLE SECURITY ARGUMENT (owner, 9 Sep 2026). Doing this
+    by default, or letting the read-only fallback cover a WRITE mode, would make the directory the
+    program is INSTALLED in writable by the program's own relative paths - in a web deployment that
+    is the served tree, and it is exactly where a stray OPEN FOR OUTPUT must not land. As a flag the
+    decision belongs to whoever LAUNCHES, not to the program, so nothing changes for anyone who does
+    not ask. The default stays: the current directory is the shell's, as it is for fbc, and only a
+    read-only lookup falls back beside the program.
+    🕳️ The owner has asked that the mechanism be STUDIED FURTHER before it grows: see
+    RESTART.md. It is a first, deliberately narrow step, not a settled design. }
+  OptHome: Boolean = False;
+  // --jit: compile eligible hot loops to native code (JIT J2/J3).
+  OptJit: Boolean = False;
+  OptAot: Boolean = False;
+  {$IFDEF JIT_PROFILE}
+  // --jit-profile: enable JIT hot-loop back-edge profiling and dump the hot loops after the run (J1).
+  OptJitProfile: Boolean = False;
+  {$ENDIF}
+  // Headless file-I/O handler shared by the CLI VM instances (lazily created, freed at exit).
+  GFileHandler: TVMFileHandler = nil;
+
+{ Attach the headless file handler's callbacks to a freshly created VM, so OPEN /
+  PRINT# / INPUT# / EOF / FREEFILE perform real file I/O in the CLI. }
+procedure WireFileHandler(AVM: TBytecodeVM);
+begin
+  if GFileHandler = nil then GFileHandler := TVMFileHandler.Create;
+  AVM.OnDiskFile := @GFileHandler.DiskFile;
+  AVM.OnFileData := @GFileHandler.FileData;
+  // Numeric fast path for EOF/LOF/LOC/SEEK/FREEFILE. FILEQUERY=0 leaves it unwired, so the queries
+  // go back through the string protocol and the two can be compared - for equality and for time -
+  // on ONE binary.
+  if GetEnvironmentVariable('FILEQUERY') <> '0' then
+    AVM.OnFileQuery := @GFileHandler.FileQuery;
+end;
+
+{ Keyword coverage self-check (--kw-check <list>).
+
+  For every name in the list, report what THIS build's front end makes of it. The verdict comes from
+  the real lexer, not from a table kept by hand: a name the lexer does not know comes back as
+  ttIdentifier, and anything else is a keyword it recognises. That is the whole point -- an inventory
+  maintained separately from the compiler drifts the moment a keyword is added, and BASIC.md's table
+  had drifted by 22 entries before this existed.
+
+  Two things it deliberately does NOT claim:
+    - "recognised" is not "implemented". A keyword accepted and ignored on purpose (EXPORT, the build
+      directives) is recognised, and says so; whether the SEMANTICS are right is what the manual's own
+      examples answer, which is the companion half of kwcheck.ps1.
+    - a MULTI-WORD entry from the manual's index ("Select Case", "Print #", "For...Next") is reported
+      per LEADING word, since that is the token the lexer decides on.
+
+  Lines may carry a "# comment" tail and blank lines are skipped, so the manual's extracted index can
+  be fed in as-is. Output is one TAB-separated record per name, for a script to aggregate. }
+procedure KwCheckReport(const ListFile: string);
+var
+  Names: TStringList;
+  Lexer: TLexerFSM;
+  Toks: TTokenList;
+  i, HashPos, Known, Unknown: Integer;
+  Nm, Lead, Verdict, Expanded: string;
+begin
+  if not FileExists(ListFile) then
+  begin
+    WriteLn(ErrOutput, 'kw-check: list file not found: ', ListFile);
+    Halt(2);
+  end;
+  Names := TStringList.Create;
+  try
+    Names.LoadFromFile(ListFile);
+    Known := 0;
+    Unknown := 0;
+    for i := 0 to Names.Count - 1 do
+    begin
+      Nm := Names[i];
+      HashPos := Pos('#', Nm);
+      // A leading '#' is a PREPROCESSOR directive and part of the name; only a later one is a comment.
+      if HashPos > 1 then Nm := Copy(Nm, 1, HashPos - 1);
+      Nm := Trim(Nm);
+      if Nm = '' then Continue;
+      // Decide on the LEADING word: "Select Case" is two tokens, and it is the first that tells the
+      // lexer a statement is starting.
+      Lead := Nm;
+      if Pos(' ', Lead) > 0 then Lead := Copy(Lead, 1, Pos(' ', Lead) - 1);
+      if Pos('.', Lead) > 0 then Lead := Copy(Lead, 1, Pos('.', Lead) - 1);   // "For...Next"
+      if Lead = '' then Continue;
+
+      Verdict := 'UNKNOWN';
+      Lexer := TLexerFSM.Create;
+      try
+        Lexer.SetHasLineNumbers(False);          // MODERN: this inventory is the FreeBASIC keyword set
+        Lexer.SetCaseSensitive(False);
+        Lexer.Source := Lead;
+        Toks := Lexer.ScanAllTokensFast;
+        if Assigned(Toks) and (Toks.Count > 0) then
+        begin
+          if Toks[0].TokenType = ttIdentifier then
+            Verdict := 'UNKNOWN'
+          else
+            Verdict := GetEnumName(TypeInfo(TTokenType), Ord(Toks[0].TokenType));
+        end;
+      finally
+        Lexer.Free;
+      end;
+      // The lexer is not the whole front end: the __FB_* family are PREPROCESSOR macros and never
+      // reach it as keywords at all. Asking only the lexer reported every one of them unknown -- 90
+      // false gaps, which is what made the first version of this report unusable. A macro answers by
+      // EXPANDING: preprocess the bare name and see whether it comes back as something else.
+      if Verdict = 'UNKNOWN' then
+      begin
+        Expanded := PreprocessSource(Lead, '');
+        if Trim(Expanded) <> Lead then Verdict := 'ppMacro'
+        else
+        begin
+          Expanded := PreprocessSource(Lead + '(a,b)', '');    // function-like macro
+          if Trim(Expanded) <> Lead + '(a,b)' then Verdict := 'ppMacro';
+        end;
+      end;
+      if Verdict = 'UNKNOWN' then Inc(Unknown) else Inc(Known);
+      WriteLn(Nm, #9, Verdict);
+    end;
+    WriteLn(ErrOutput, Format('kw-check: %d names, %d recognised, %d unknown',
+                              [Known + Unknown, Known, Unknown]));
+  finally
+    Names.Free;
+  end;
+end;
+
+{ Print version banner }
+procedure PrintVersion;
+begin
+  if GCliClassic then
+    WriteLn('SedaiBasic Vision (sbv) ver. ', SEDAIBASIC_VERSION, ' [', SEDAIBASIC_RELEASE_DATE, '] for ', GetSystemArchitecture)
+  else
+    WriteLn('SedaiBasic ver. ', SEDAIBASIC_VERSION, ' [', SEDAIBASIC_RELEASE_DATE, '] for ', GetSystemArchitecture);
+  WriteLn(SEDAIBASIC_COPYRIGHT);
+  WriteLn(SEDAIBASIC_LICENSE);
+end;
+
+{ Print help information }
+procedure PrintHelp;
+begin
+  PrintVersion;
+  WriteLn;
+  WriteLn('Usage: ', CliCmd, ' [options] <source.bas|program.basc> [program arguments]');
+  if GCliClassic then
+  begin
+    WriteLn('  Runs a CLASSIC (Commodore BASIC v7) program with no window, its output on stdout.');
+    WriteLn('  A MODERN program is refused: run it with sb.');
+  end
+  else
+    WriteLn('  Runs a MODERN program. A CLASSIC program (line numbers) is refused: run it with sbv.');
+  WriteLn('  Words after the program go to it (COMMAND$), except the options below. An unknown option');
+  WriteLn('  before the program is an error.');
+  WriteLn;
+  WriteLn('Supported file types:');
+  WriteLn('  .bas       BASIC source code (compiled at runtime)');
+  WriteLn('  .basc      Pre-compiled bytecode (faster startup)');
+  WriteLn;
+  WriteLn('Options:');
+  WriteLn('  --help              Show this help message');
+  WriteLn('  --verbose           Show loading, lexing, parsing, and VM execution info');
+  WriteLn('  --dump-ast          Show AST structure after parsing');
+  WriteLn('  --disasm            Show bytecode disassembly (after superinstructions)');
+  WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
+  WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
+  WriteLn('  --dialect           Print the program''s dialect (classic or modern) and stop');
+  WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
+  WriteLn('  --jit               Compile the hot loops to native code while the program runs');
+  WriteLn('  --aot               Compile the eligible procedures to native code before the program runs');
+  WriteLn('  -i DIR              Add DIR to the header search path (as fbc -i)');
+  WriteLn('  -p DIR              Add DIR to the library search path (as fbc -p)');
+  WriteLn('  --module FILE       Compile FILE.bas with the program as a further module');
+  WriteLn('  --memory=fb|strict  Memory mode: fb = FreeBASIC pointers (default), strict = isolated from the VM');
+  if not GCliClassic then
+  begin
+    WriteLn('  -lang fb            Adhere to fbc exactly: SedaiBasic''s extensions are refused (also: #lang "fb")');
+    WriteLn('  -lang fblite        fbc''s fblite dialect (also: #lang "fblite")');
+    WriteLn('                        Without -lang: MODERN, FreeBASIC with SedaiBasic''s extensions');
+  end;
+  WriteLn('  --home              Run the program as if from its own directory (chdir before it starts).');
+  WriteLn('                        Without it the current directory is the shell''s, as it is for fbc,');
+  WriteLn('                        and only a READ-ONLY relative path falls back beside the program.');
+  WriteLn('  --bounds-check      Hard-error on out-of-bounds array access (MODERN too; default follows dialect)');
+  WriteLn('  --date-locale       Month/day names and date parsing follow the SYSTEM locale (as fbc does).');
+  WriteLn('                        Default is deterministic: English names, ISO-ish dates, same everywhere.');
+  WriteLn('                        Also settable with SB_DATE_LOCALE=1; the flag wins over it.');
+  WriteLn('  --date-deterministic  The default, said explicitly (wins over SB_DATE_LOCALE=1)');
+  WriteLn('  --stats             Show execution statistics');
+  {$IFDEF WITH_WINDOW}
+  WriteLn('  --window            Open the graphics window at launch (by default it opens at the first SCREENRES/SCREEN)');
+  {$ENDIF}
+  WriteLn('  --headless          Never open a graphics window: draw off screen only (also: SB_HEADLESS=1)');
+  WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
+  WriteLn('                        -1 = Commodore BASIC style (default)');
+  WriteLn('                         1 = Modern BASIC style');
+  WriteLn;
+  {$IFDEF ANY_DEBUG_ENABLED}
+  WriteLn('Debug options (compile-time flags enabled in DebugFlags.inc):');
+  WriteLn('  --debug-all         Enable ALL debug output');
+  WriteLn('  --debug-ssa         SSA construction debug');
+  WriteLn('  --debug-gvn         Global Value Numbering debug');
+  WriteLn('  --debug-cse         Common Subexpression Elimination debug');
+  WriteLn('  --debug-dce         Dead Code Elimination debug');
+  WriteLn('  --debug-licm        Loop-Invariant Code Motion debug');
+  WriteLn('  --debug-algebraic   Algebraic Simplification debug');
+  WriteLn('  --debug-strength    Strength Reduction debug');
+  WriteLn('  --debug-constprop   Constant Propagation debug');
+  WriteLn('  --debug-copyprop    Copy Propagation debug');
+  WriteLn('  --debug-copycoal    Copy Coalescing debug');
+  WriteLn('  --debug-phielim     PHI Elimination debug');
+  WriteLn('  --debug-regalloc    Register Allocation debug');
+  WriteLn('  --debug-peephole    Peephole Optimization debug');
+  WriteLn('  --debug-superinstr  Superinstruction Fusion debug');
+  WriteLn('  --debug-domtree     Dominator Tree debug');
+  WriteLn('  --debug-dbe         Dead Block Elimination debug');
+  WriteLn('  --debug-bytecode    Bytecode Compilation debug');
+  WriteLn('  --debug-vm          Virtual Machine execution debug');
+  WriteLn('  --debug-cleanup     Memory cleanup/destructor debug');
+  WriteLn;
+  {$ELSE}
+  WriteLn('Debug options disabled (see DebugFlags.inc for details).');
+  WriteLn;
+  {$ENDIF}
+  {$IFDEF ENABLE_PROFILER}
+  WriteLn('Profiler options (compile-time flag enabled in ProfilerFlags.inc):');
+  WriteLn('  --profile[=MODE]    Enable profiler. MODE can be:');
+  WriteLn('                        sampling        Sample-based profiling, low overhead (default)');
+  WriteLn('                        hybrid          Sampling + selective instrumentation');
+  WriteLn('                        instrumentation Full instrumentation, accurate but slow');
+  WriteLn('  --profile-export=FILE Export profile data (format by extension: .json, .csv, .folded)');
+  WriteLn;
+  {$ELSE}
+  WriteLn('Profiler options disabled (see ProfilerFlags.inc for details).');
+  WriteLn;
+  {$ENDIF}
+  WriteLn('Examples:');
+  WriteLn('  ', CliCmd, ' program.bas              Run program (output only)');
+  WriteLn('  ', CliCmd, ' program.bas arg1 arg2    Run, passing arg1/arg2 to the program (COMMAND$)');
+  WriteLn('  ', CliCmd, ' program.bas --verbose    Run with verbose output');
+  WriteLn('  ', CliCmd, ' program.bas --stats      Run with execution statistics');
+  WriteLn('  ', CliCmd, ' program.bas --disasm     Show disassembly and run');
+  {$IFDEF ENABLE_PROFILER}
+  WriteLn('  ', CliCmd, ' program.bas --profile    Run with sampling profiler (default)');
+  WriteLn('  ', CliCmd, ' program.bas --profile=instrumentation');
+  WriteLn('                                          Run with full instrumentation');
+  WriteLn('  ', CliCmd, ' program.bas --profile --profile-export=out.json');
+  WriteLn('                                          Profile and export to JSON');
+  {$ENDIF}
+  WriteLn('  ', CliCmd, ' --help                   Show this help');
+end;
+
+var
+  OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
+  OptHeadless: Boolean = False; // sb --headless: never open a window, even on a build that has one
+  GTermCtrl: TTerminalController = nil;   // concrete terminal output device (for graphics attach under --window)
+  GProgramArgs: array of string;   // COMMAND$: everything on the command line after the script file
+  GExtraModules: TStringList = nil; // --module: the non-main modules of a multi-module program (162)
+  GSkipNextArg: Boolean = False;    // ...the file name that follows --module is not a program argument
+  // ⭐ FUSED MODE (DIVERGENZE 573): this very executable carries a .basc in its tail. Then the whole command
+  // line belongs to the program, as it does for an fbc executable, and the program's home is this file's
+  // directory - which is what a C library asking the kernel for "the executable" now gets too.
+  GFusedPayload: TMemoryStream = nil;
+{$IFDEF WITH_WINDOW}
+type
+  // ⭐ THE WINDOW OPENS WHEN THE PROGRAM ASKS FOR GRAPHICS, as fbc's does (owner, 23 Oct 2026). A build
+  // with the presenter used to need --window on the command line, so a FreeBASIC program run the normal
+  // way drew into a framebuffer nobody could see. Now the first SCREENRES / SCREEN that sets a graphics
+  // mode opens it; a text program never gets one. Only one thing is done at launch - installing this
+  // callback - so a text program pays nothing: the poll callback, which keeps the C hot loop out, is
+  // wired only once the window exists.
+  TAutoWindow = class
+    VM: TBytecodeVM;
+    SW: TSoftwareGraphicsBackend;
+    function Open: Boolean;
+  end;
+
+var
+  GPresenter: TWindowPresenter = nil;
+  GAutoWindow: TAutoWindow = nil;
+
+// Wire an existing presenter to the VM: shared by --window (at launch) and the automatic window.
+procedure WirePresenter(AVM: TBytecodeVM);
+begin
+  // ⛔ THE SPLIT: the POLL drains events (cheap, on an instruction counter), the PRESENT shows the
+  // picture (expensive, at a frame boundary). Wiring Pump to the poll made the instruction counter
+  // decide the frame rate - 158 presents per frame on a compute-heavy program.
+  AVM.EventPollCallback := @GPresenter.PollEvents;
+  AVM.PresentCallback := @GPresenter.Pump;
+  // ...but the dispatch loop only reaches that callback at blocking points, so a graphics
+  // program with no SLEEP in its loop would never present. Ask the VM for a wall-clock cadence
+  // from the graphics opcodes as well. 16 ms = about 60 presents a second. This property is
+  // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
+  // from interfering with SedaiVision's own rendering.
+  AVM.PresentCadenceMs := 16;
+  if GetEnvironmentVariable('SB_POLL_EVERY') <> '' then
+    AVM.EventPollInterval := StrToIntDef(GetEnvironmentVariable('SB_POLL_EVERY'), 10000);
+end;
+
+function TAutoWindow.Open: Boolean;
+begin
+  Result := False;
+  VM.ScreenModeCallback := nil;   // asked once: a later SCREENRES resizes the window that exists
+  try
+    GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
+  except
+    on E: Exception do
+    begin
+      // Not an error: the program asked for graphics, not for a window, and it still gets the graphics.
+      WriteLn(ErrOutput, '?no graphics window (', E.Message, '): drawing off screen');
+      Exit;
+    end;
+  end;
+  WirePresenter(VM);
+end;
+
+// Is there a screen to open a window on? On Unix the answer is in the environment; a session with
+// neither variable (ssh, a service, a CI runner) is headless, and opening a window there would fail.
+function DisplayAvailable: Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := (GetEnvironmentVariable('DISPLAY') <> '') or (GetEnvironmentVariable('WAYLAND_DISPLAY') <> '');
+  {$ELSE}
+  Result := True;
+  {$ENDIF}
+end;
+{$ENDIF}
+
+// Graphics setup shared by both run paths: a window presenter (sb --window, WITH_WINDOW build) or the
+// plain headless software backend (default — the regression target never opens a window).
+procedure SetupVMGraphics(AVM: TBytecodeVM);
+{$IFDEF WITH_WINDOW}
+var SW: TSoftwareGraphicsBackend;
+{$ENDIF}
+begin
+  {$IFDEF WITH_WINDOW}
+  if OptWindow then
+  begin
+    SW := TSoftwareGraphicsBackend.Create;
+    AVM.SetGraphicsBackend(SW, SW);
+    // Share the backend's framebuffer with the terminal output device so the C128 (BASIC v7) graphics
+    // commands (GRAPHIC/BOX/CIRCLE/COLOR/SETCOLOR/PAINT...) render into the same surface the window
+    // shows — not just the FreeBASIC graphics. Viewport-only (no text-on-graphics / sprites).
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsMemory(SW.ScreenMemory);
+    // ...and the backend itself, so PRINT inside a FreeBASIC graphics mode lands on that same surface.
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
+    GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
+    WirePresenter(AVM);
+    Exit;
+  end;
+  if not OptHeadless and (GetEnvironmentVariable('SB_HEADLESS') <> '1') and DisplayAvailable then
+  begin
+    // The headless wiring, with a backend this unit holds so the window can mirror it later.
+    SW := TSoftwareGraphicsBackend.Create;
+    AVM.SetGraphicsBackend(SW, SW);
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
+    GAutoWindow := TAutoWindow.Create;
+    GAutoWindow.VM := AVM;
+    GAutoWindow.SW := SW;
+    AVM.ScreenModeCallback := @GAutoWindow.Open;
+    Exit;
+  end;
+  {$ENDIF}
+  AVM.UseSoftwareGraphics;
+  // The headless default path. In FreeBASIC a graphics mode has NO separate text plane - the console IS
+  // the framebuffer - so the text device has to be told which surface to mirror PRINT onto. Without
+  // this, every gfx example that only PRINTS left the screen blank, and nothing said so.
+  // Wired HERE, where both sides are concrete: an IOutputDevice cannot be cast back to its class under
+  // CORBA interfaces, which is why AttachGraphicsMemory above is done the same way.
+  if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(AVM.GraphicsBackend);
+end;
+
+// After the program ends: keep the window open until the user closes it, then tear it down.
+procedure FinishVMGraphics(AVM: TBytecodeVM);
+begin
+  {$IFDEF WITH_WINDOW}
+  if Assigned(GPresenter) then
+  begin
+    AVM.EventPollCallback := nil;
+    GPresenter.ReportPumpCalls;
+    // FreeBASIC convention: the program terminates at END and the window closes with it. To keep the
+    // window visible after drawing, the program waits (SLEEP / a GETKEY loop) — those keep the event
+    // pump alive and presenting. We do NOT block here, so `END` actually ends the program.
+    FreeAndNil(GPresenter);
+  end;
+  if Assigned(GAutoWindow) then
+  begin
+    AVM.ScreenModeCallback := nil;
+    FreeAndNil(GAutoWindow);
+  end;
+  {$ENDIF}
+end;
+
+{$IFDEF LINUX}
+function libc_errno_location: PLongInt; cdecl; external 'c' name '__errno_location';
+{$ENDIF}
+
+procedure SetProgramStartErrno;
+// ⭐ DIVERGENZE 411 - ERRNO AS A PROGRAM OF fbc FINDS IT (owner, 14 Sep 2026: conform). "Print errno" answers 2
+// in every fbc program on Linux - WITH TERM unset too, so it is not libfb's tgetent (hInit returns before it).
+// It is what the dynamic loader leaves: the first thing any dynamically linked process does is
+// access("/etc/ld.so.preload") = ENOENT (strace), and nothing in fbc's startup touches errno after that. sb goes
+// through the same loader, but its own runtime sets errno back to 0 before a program can read it.
+// Once per program, on the main thread, right before the VM starts - never inside the run loop, which TROFF
+// re-enters mid-program and every worker thread runs too (a new thread's errno is its own).
+begin
+  {$IFDEF LINUX}
+  libc_errno_location^ := 2;
+  {$ENDIF}
+end;
+
+procedure TestBytecodeCompilation(const SourceFile: string;
+  OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec: Boolean
+  {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
+var
+  Source: TStringList;
+  Lexer: TLexerFSM;
+  Parser: TPackratParser;
+  TokenList: TTokenList;
+  ParserResult: TParsingResult;
+  SSAGen: TSSAGenerator;
+  SSAProgram: TSSAProgram;
+  Compiler: TBytecodeCompiler;
+  BytecodeProgram: TBytecodeProgram;
+  VM: TBytecodeVM;
+  Disassembler: TBytecodeDisassembler;
+  Output: IOutputDevice;
+  Input: IInputDevice;
+  Timer: THiResTimer;
+  SSATime, OptTime, CompileTime, ExecuteTime: Double;
+  // Per-pass timing (when OptStats is enabled)
+  TimeDBE, TimeDomTree, TimeSSAConstr, TimeGVN, TimeCSE, TimeAlgebraic: Double;
+  TimeStrength, TimeGosubInline, TimeConstProp, TimeCopyProp, TimeLICM: Double;
+  TimeLoopUnroll, TimeDCE, TimePhiElim, TimeCopyCoal, TimeRegAlloc: Double;
+  PassTimer: THiResTimer;
+  // Per-pass EFFECT (when OptStats is enabled), collected by PassMark below. The timings alone
+  // cannot tell a pass that is working from one that fires on nothing - both cost a fraction of a
+  // millisecond and look the same in the breakdown. This records whether the SSA program actually
+  // changed, and by how many instructions.
+  PassEffect: TStringList;
+  PassPrevHash: QWord;
+  PassPrevCount: Integer;
+  i, removed: Integer;
+  ErrorSourceLine: Integer;
+  MapFile: string;          // DIVERGENZE 718
+  MapLine: Integer;
+  ProgIsModern: Boolean;      // dialect of THIS program: drives fbc's abort message on an uncaught error
+  AbortDesc, AbortModule: string;
+  Refusal: string;            // the dialect this front end does not run (CliDialectRefusal)
+  QBLangDetected: Boolean;
+  ShowBanners: Boolean;
+  AotFuncList: TAotFuncs;
+  AotI: Integer;
+  AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff: Integer;
+  AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff: Integer;   // DIVERGENZE 687
+  {$IFDEF ENABLE_PROFILER}
+  Profiler: TProfiler;
+  ProfMode: TProfilerMode;
+  ExportExt: string;
+  {$ENDIF}
+  {$IFNDEF DISABLE_REG_ALLOC}
+  RegAlloc: TLinearScanAllocator;
+  SpillCount: Integer;
+  {$ENDIF}
+
+  // Record what a pass actually DID, by comparing the SSA program's content fingerprint before and
+  // after it. Called right after each pass's timing line, so the two answer different questions:
+  // the timer says what the pass cost, this says whether it earned it. A pass reported as "inert"
+  // rewrote nothing at all on this program - which is not automatically a defect (many passes
+  // legitimately find no opportunity in a given program), but a pass inert across the whole corpus
+  // is the signature of the GVN bug found on 2026-07-25: sound, timed, and doing nothing.
+  { OPTSKIP=<name>[,<name>...] skips SSA optimization passes by name at RUN time.
+    ⛔ WHY IT EXISTS (7 Sep 2026). Bisecting an optimizer MISCOMPILATION cost one full REBUILD per
+    pass, because the only switch was the compile-time {$DEFINE} in OptimizationFlags.inc - so a
+    program that answers under --no-opt and never terminates with optimizations on could not be
+    attributed to a pass in less than half an hour. It found one in twelve runs, and the answer was
+    not one pass but THREE that had to co-operate: skipping any of SubInlining, DBE or GVN made the
+    program finish, and none of the three alone was enough to hang it. This is the SSA-side twin of
+    SUPERINSTR=0 / SUPERMASK, which the bytecode passes have had all along.
+    Names are the ones the pass call sites use; the match is case-insensitive. }
+  function PassEnabled(const AName: string): Boolean;
+  var
+    Skip: string;
+  begin
+    Skip := UpperCase(GetEnvironmentVariable('OPTSKIP'));
+    Result := (Skip = '') or (Pos(',' + UpperCase(AName) + ',', ',' + Skip + ',') = 0);
+  end;
+
+  procedure PassMark(const AName: string);
+  var
+    H: QWord;
+    Cnt, Delta: Integer;
+  begin
+    // PHASE_DIAG=1 prints the TIME of every pass, whether or not --stats asked for its EFFECT:
+    // the two questions are separate, and until 7 Sep 2026 the time half stopped at the SSA passes.
+    PhaseMark(AName);
+    if not OptStats then Exit;
+    if not Assigned(SSAProgram) then Exit;
+    H := SSAProgram.Fingerprint(Cnt);
+    Delta := Cnt - PassPrevCount;
+    if H = PassPrevHash then
+      PassEffect.Add(Format('    %-14s inert     (%5d instrs)', [AName + ':', Cnt]))
+    else
+      // FPC's Format has no '+' flag - the sign goes in by hand.
+      PassEffect.Add(Format('    %-14s CHANGED   (%5d instrs, %s%d)',
+        [AName + ':', Cnt, Copy('+', 1, Ord(Delta >= 0)), Delta]));
+    PassPrevHash := H;
+    PassPrevCount := Cnt;
+  end;
+
+begin
+  // Determine if we should show banners (any option enabled)
+  ShowBanners := OptVerbose or OptDumpAST or OptDisasm or OptStats or AnyDebugActive;
+  PassEffect := nil;   // several early-exit paths run before it is created
+
+  if ShowBanners then
+  begin
+    WriteLn('========================================');
+    PrintVersion;
+    WriteLn('========================================');
+    WriteLn;
+
+    // Show optimization status only if any debug target is active
+    if AnyDebugActive then
+    begin
+      {$IFDEF DISABLE_ALL_OPTIMIZATIONS}
+      WriteLn('>>> OPTIMIZATION MODE: DISABLED <<<');
+      WriteLn('    All optimization passes are turned off.');
+      WriteLn('    Running baseline SSA → Compiler → VM path.');
+      {$ELSE}
+      WriteLn('>>> OPTIMIZATION MODE: ENABLED <<<');
+      WriteLn('    All optimization passes are active.');
+      {$ENDIF}
+      WriteLn;
+    end;
+  end;
+
+  // Load source
+  if OptVerbose then
+    WriteLn('Loading source: ', SourceFile);
+  PhaseBegin;
+  Source := TStringList.Create;
+  try
+    // ⭐ Several modules become one compilation, in fbc's measured order (DIVERGENZE 162): the
+    // non-main modules first, the main module last. Same funnel sbc uses, so the two cannot drift.
+    try
+      TSedaiRunner.LoadProgramModules(Source, SourceFile, GExtraModules);
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
+        Exit;
+      end;
+    end;
+
+    if OptVerbose then
+      WriteLn('Source loaded (', Source.Count, ' lines)');
+
+    // Pre-filter: remove Markdown fence lines (``` or ```vb) that some test files include
+    // We don't modify test files on disk; this only cleans the in-memory source before lexing.
+    removed := 0;
+    for i := Source.Count - 1 downto 0 do
+    begin
+      if Pos('```', Trim(Source[i])) = 1 then
+      begin
+        Source.Delete(i);
+        Inc(removed);
+      end;
+    end;
+    if OptVerbose and (removed > 0) then
+      WriteLn(Format('Pre-filter: removed %d fence line(s) from source (non-destructive).', [removed]));
+
+    // === PREPROCESSOR === (FreeBASIC #define/#undef/#ifdef/#ifndef/#else/#endif/#include).
+    // Pure text->text pass before lexing; #include paths resolve relative to the source file.
+    try
+      // -lang qb ('#lang "qb"' / the '$lang: "qb" metacommand) takes QB PRINT number spacing
+      // (FB zone width + TRAILING space after numerics, fbc-verified; fblite does NOT). Detected
+      // on the RAW text: the preprocessor strips both directive forms before the old site ran.
+      QBLangDetected := DetectQBLang(Source.Text);
+      Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
+      PhaseMark('preprocess');
+    except
+      on E: EPreprocessorError do
+      begin
+        WriteLn('ERROR: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
+        Exit;
+      end;
+    end;
+
+    // ⛔ ONE ENVIRONMENT, ONE DIALECT: decided on the preprocessed text, the same the lexer and the SSA
+    // read their dialect from below, so the refusal and the compilation cannot disagree.
+    // ⚠️ A file that declares fblite / qb / deprecated (or runs with -lang fblite) is not CLASSIC even with line
+    // numbers: there fbc reads them as LABELS ("10 Print ... : GoTo 10"), and sb takes the file.
+    Refusal := CliDialectRefusal((not TSedaiRunner.SourceHasLineNumbers(Source.Text)) or SourceDeclaresNonFbDialect,
+                                 SourceFile);
+    if Refusal <> '' then
+    begin
+      WriteLn('ERROR: ', Refusal);
+      ExitCode := 1;
+      Exit;
+    end;
+
+    if OptVerbose then
+      WriteLn;
+
+    // === LEXING ===
+    if OptVerbose then
+      WriteLn('=== LEXING ===');
+    Lexer := TLexerFSM.Create;
+    try
+      // Dialect auto-selected at LOAD by content: a program that uses line numbers
+      // is classic; otherwise FreeBASIC/Modern (no line numbers).
+      Lexer.SetHasLineNumbers(TSedaiRunner.SourceHasLineNumbers(Source.Text));
+      Lexer.SetRequireSpacesBetweenTokens(True);
+      Lexer.SetCaseSensitive(False);
+      Lexer.Source := Source.Text;
+      Lexer.PreScanOptions;
+
+      try
+        Timer := CreateHiResTimer;
+        TokenList := Lexer.ScanAllTokensFast;
+        PhaseMark('lex');
+        if OptVerbose then
+          WriteLn(Format('Tokenized %d tokens in %.2f ms',
+            [Lexer.TokenCount, Timer.ElapsedMilliseconds]));
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR during lexing: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+    finally
+      // Don't free lexer yet, TokenList needs it
+    end;
+    if OptVerbose then
+      WriteLn;
+
+    // === PARSING ===
+    if OptVerbose then
+      WriteLn('=== PARSING ===');
+    Parser := CreatePackratParser;
+    try
+      try
+        Timer := CreateHiResTimer;
+        ParserResult := Parser.Parse(TokenList);
+        PhaseMark('parse');
+        if OptVerbose then
+          WriteLn(Format('Parsed in %.2f ms', [Timer.ElapsedMilliseconds]));
+
+        if not ParserResult.Success then
+        begin
+          WriteLn('ERROR: Parsing failed!');
+          if ParserResult.Errors.Count > 0 then
+          begin
+            // ⭐ DIVERGENZE 718 - the line of the program (or of the header) the error stands on, not of the EXPANDED source:
+            // with "#include" in front, "print (" on line 3 was reported at 1561. SB_LINE_MAP=0 is the A/B.
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and
+               PPMapOutputLine(ParserResult.Errors[0].Line, MapFile, MapLine) then
+            begin
+              ParserResult.Errors[0].Line := MapLine;
+              if MapFile <> '' then
+                ParserResult.Errors[0].Message := ParserResult.Errors[0].Message + ' [in ' + ExtractFileName(MapFile) + ']';
+            end;
+            WriteLn('  ', ParserResult.Errors[0].ToString);
+          end;
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR during parsing: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+
+      if OptVerbose then
+        WriteLn('Parsing successful!');
+    finally
+      Parser.Free;
+    end;
+    if OptVerbose then
+      WriteLn;
+
+    // === AST DEBUG ===
+    if OptDumpAST then
+    begin
+      WriteLn('=== AST STRUCTURE ===');
+      PrintASTTree(ParserResult.AST, 0, TokenList);
+      WriteLn;
+    end;
+
+    // === SSA GENERATION ===
+    {$IFDEF DEBUG_SSA}
+    if DebugSSA then
+      WriteLn('=== SSA GENERATION ===');
+    {$ENDIF}
+    SSAGen := TSSAGenerator.Create;
+    try
+      // Dialect gate for FB lexical scope: MODERN when the source has no line numbers (mirrors the
+      // lexer config above), CLASSIC otherwise. CLASSIC keeps BASIC v7 global-by-name semantics.
+      ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+      SSAGen.ModernMode := ProgIsModern;
+      SSAGen.NativeMemory := GMemoryMode = mmFB;   // resolved before this compile (SedaiMemoryMode)
+      try
+        Timer := CreateHiResTimer;
+        SSAProgram := SSAGen.Generate(ParserResult.AST);
+        PhaseMark('ssa-gen');
+        SSATime := Timer.ElapsedMilliseconds;
+
+        if not Assigned(SSAProgram) then
+        begin
+          WriteLn('ERROR: SSA generation failed!');
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR during SSA generation: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn(Format('SSA generated in %.2f ms', [SSATime]));
+        WriteLn(Format('  Blocks: %d', [SSAProgram.Blocks.Count]));
+        WriteLn(Format('  Variables: %d', [SSAProgram.Variables.Count]));
+        WriteLn;
+        WriteLn('=== SSA DUMP (BEFORE SSA CONSTRUCTION) ===');
+        SSAProgram.PrintSSA;
+        WriteLn('=== END SSA DUMP ===');
+      end;
+      {$ENDIF}
+
+      // Start optimization timer
+      Timer := CreateHiResTimer;
+      // Initialize per-pass timers
+      TimeDBE := 0; TimeDomTree := 0; TimeSSAConstr := 0; TimeGVN := 0;
+      TimeCSE := 0; TimeAlgebraic := 0; TimeStrength := 0; TimeGosubInline := 0;
+      TimeConstProp := 0; TimeCopyProp := 0; TimeLICM := 0; TimeLoopUnroll := 0;
+      TimeDCE := 0; TimePhiElim := 0; TimeCopyCoal := 0; TimeRegAlloc := 0;
+      // Baseline for the per-pass effect report (see PassMark)
+      PassEffect := TStringList.Create;
+      if OptStats then PassPrevHash := SSAProgram.Fingerprint(PassPrevCount);
+
+      {$IFNDEF DISABLE_SUB_INLINING}
+      // SUB/FUNCTION INLINING (unification) - flatten small leaf calls FIRST, so the
+      // clones go through versioning and every later pass like hand-written code.
+      try
+        if PassEnabled('SubInlining') then SSAProgram.RunSubInlining;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Sub inlining failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      // ⛔ Its own mark. Without one, PassMark('DBE') was the first mark after ssa-gen and it billed
+      // SubInlining and XferForwarding to DEAD BLOCK ELIMINATION: on fbc's compound/select_const2 the
+      // line read 5.0 s while DBE itself, timed from inside, took 0.45 s. A phase that carries another
+      // pass's time sends the next reader to the wrong unit.
+      PassMark('SubInlining');
+      // ARGUMENT-SLOT FORWARDING - immediately after inlining, and only useful there. Inlining
+      // splices the callee's body in but leaves the argument protocol around it: the arguments are
+      // staged into the transfer bank and read straight back out, with no call in between any more.
+      // Measured on a three-statement SUB in a hot loop: five instructions of fourteen, and 52% of
+      // the running time against the same statements written inline by hand.
+      try
+        if PassEnabled('XferForwarding') then SSAProgram.RunXferForwarding;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Xfer forwarding failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      PassMark('XferForwarding');
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_DBE}
+      // DEAD BLOCK ELIMINATION - Remove unreachable blocks BEFORE dominator tree
+      // CRITICAL: Must run BEFORE dominator tree because dominator tree requires
+      // exactly ONE entry point (only entry block can have no predecessors)
+      {$IFDEF DEBUG_DBE}
+      if DebugDBE then
+      begin
+        WriteLn;
+        WriteLn('=== DEAD BLOCK ELIMINATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('DBE') then SSAProgram.RunDBE;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Dead block elimination failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeDBE := PassTimer.ElapsedMilliseconds;
+      PassMark('DBE');
+      {$ELSE}
+      {$IFDEF DEBUG_DBE}
+      if DebugDBE then
+      begin
+        WriteLn;
+        WriteLn('=== DEAD BLOCK ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping dead block elimination (optimization disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_DOMINATOR_TREE}
+      // PHASE 3 TIER 2: Build dominator tree AFTER dead block elimination
+      // CRITICAL: DBE may have removed blocks, so we must build dominator tree AFTER DBE
+      {$IFDEF DEBUG_DOMTREE}
+      if DebugDomTree then
+      begin
+        WriteLn;
+        WriteLn('=== DOMINATOR TREE CONSTRUCTION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        SSAProgram.BuildDominatorTree;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Dominator tree construction failed: ', E.Message);
+          WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+      if OptStats then TimeDomTree := PassTimer.ElapsedMilliseconds;
+      PassMark('Dom Tree');
+
+      // PHASE 3: Semi-Pruned SSA Construction with versioning
+      {$IFNDEF DISABLE_SSA_CONSTRUCTION}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('SSAConstruction') then SSAProgram.RunSSAConstruction;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: SSA construction failed: ', E.Message);
+          WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+      if OptStats then TimeSSAConstr := PassTimer.ElapsedMilliseconds;
+      PassMark('SSA Constr');
+      {$ELSE}
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn;
+        WriteLn('=== SSA CONSTRUCTION ===');
+        WriteLn('[DISABLED] Skipping SSA construction (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+      {$ELSE}
+      {$IFDEF DEBUG_DOMTREE}
+      if DebugDomTree then
+      begin
+        WriteLn;
+        WriteLn('=== DOMINATOR TREE CONSTRUCTION ===');
+        WriteLn('[DISABLED] Skipping dominator tree construction (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      // GVN and CSE are mutually exclusive - use one or the other
+      {$IFNDEF DISABLE_GVN}
+      {$IFDEF DISABLE_CSE}
+      // PHASE 3 TIER 2: Run GVN optimization (Steps 4-6)
+      {$IFDEF DEBUG_GVN}
+      if DebugGVN then
+      begin
+        WriteLn;
+        WriteLn('=== GLOBAL VALUE NUMBERING ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('GVN') then SSAProgram.RunGVN;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: GVN optimization failed: ', E.Message);
+          WriteLn('Continuing with unoptimized SSA...');
+        end;
+      end;
+      if OptStats then TimeGVN := PassTimer.ElapsedMilliseconds;
+      PassMark('GVN');
+      {$ELSE}
+      {$IFDEF DEBUG_GVN}
+      if DebugGVN then
+      begin
+        WriteLn;
+        WriteLn('=== GLOBAL VALUE NUMBERING ===');
+        WriteLn('[DISABLED] Skipping GVN (CSE is enabled - they are mutually exclusive)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+      {$ELSE}
+      {$IFDEF DEBUG_GVN}
+      if DebugGVN then
+      begin
+        WriteLn;
+        WriteLn('=== GLOBAL VALUE NUMBERING ===');
+        WriteLn('[DISABLED] Skipping GVN optimization (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_CSE}
+      {$IFDEF DISABLE_GVN}
+      // Common Subexpression Elimination (alternative to GVN)
+      {$IFDEF DEBUG_CSE}
+      if DebugCSE then
+      begin
+        WriteLn;
+        WriteLn('=== COMMON SUBEXPRESSION ELIMINATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('CSE') then SSAProgram.RunCSE;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: CSE failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeCSE := PassTimer.ElapsedMilliseconds;
+      PassMark('CSE');
+      {$ELSE}
+      {$IFDEF DEBUG_CSE}
+      if DebugCSE then
+      begin
+        WriteLn;
+        WriteLn('=== COMMON SUBEXPRESSION ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping CSE (GVN is enabled - they are mutually exclusive)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+      {$ELSE}
+      {$IFDEF DEBUG_CSE}
+      if DebugCSE then
+      begin
+        WriteLn;
+        WriteLn('=== COMMON SUBEXPRESSION ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping CSE (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_ALGEBRAIC}
+      // Algebraic Simplification
+      {$IFDEF DEBUG_ALGEBRAIC}
+      if DebugAlgebraic then
+      begin
+        WriteLn;
+        WriteLn('=== ALGEBRAIC SIMPLIFICATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('Algebraic') then SSAProgram.RunAlgebraic;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Algebraic simplification failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeAlgebraic := PassTimer.ElapsedMilliseconds;
+      PassMark('Algebraic');
+      {$ELSE}
+      {$IFDEF DEBUG_ALGEBRAIC}
+      if DebugAlgebraic then
+      begin
+        WriteLn;
+        WriteLn('=== ALGEBRAIC SIMPLIFICATION ===');
+        WriteLn('[DISABLED] Skipping algebraic simplification (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_STRENGTH_RED}
+      // Strength Reduction
+      {$IFDEF DEBUG_STRENGTH}
+      if DebugStrength then
+      begin
+        WriteLn;
+        WriteLn('=== STRENGTH REDUCTION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('StrengthReduction') then SSAProgram.RunStrengthReduction;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Strength reduction failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeStrength := PassTimer.ElapsedMilliseconds;
+      PassMark('Strength');
+      {$ELSE}
+      {$IFDEF DEBUG_STRENGTH}
+      if DebugStrength then
+      begin
+        WriteLn;
+        WriteLn('=== STRENGTH REDUCTION ===');
+        WriteLn('[DISABLED] Skipping strength reduction (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_GOSUB_INLINE}
+      // GOSUB Inlining
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn;
+        WriteLn('=== GOSUB INLINING ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('GosubInlining') then SSAProgram.RunGosubInlining;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: GOSUB inlining failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeGosubInline := PassTimer.ElapsedMilliseconds;
+      PassMark('GOSUB Inline');
+      {$ELSE}
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn;
+        WriteLn('=== GOSUB INLINING ===');
+        WriteLn('[DISABLED] Skipping GOSUB inlining (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_CONST_PROP}
+      // Simple constant propagation pass
+      // Propagates only single-assignment variables with immediate constant values
+      // Safe: Does not propagate registers (avoids reuse issues)
+      {$IFDEF DEBUG_CONSTPROP}
+      if DebugConstProp then
+      begin
+        WriteLn;
+        WriteLn('=== CONSTANT PROPAGATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('ConstProp') then SSAProgram.RunConstProp;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Constant propagation failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeConstProp := PassTimer.ElapsedMilliseconds;
+      PassMark('Const Prop');
+      {$ELSE}
+      {$IFDEF DEBUG_CONSTPROP}
+      if DebugConstProp then
+      begin
+        WriteLn;
+        WriteLn('=== CONSTANT PROPAGATION ===');
+        WriteLn('[DISABLED] Skipping constant propagation (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_COPY_PROP}
+      // Copy Propagation
+      {$IFDEF DEBUG_COPYPROP}
+      if DebugCopyProp then
+      begin
+        WriteLn;
+        WriteLn('=== COPY PROPAGATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('CopyProp') then SSAProgram.RunCopyProp;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Copy propagation failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeCopyProp := PassTimer.ElapsedMilliseconds;
+      PassMark('Copy Prop');
+      {$ELSE}
+      {$IFDEF DEBUG_COPYPROP}
+      if DebugCopyProp then
+      begin
+        WriteLn;
+        WriteLn('=== COPY PROPAGATION ===');
+        WriteLn('[DISABLED] Skipping copy propagation (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_LICM}
+      // Loop-Invariant Code Motion pass
+      {$IFDEF DEBUG_LICM}
+      if DebugLICM then
+      begin
+        WriteLn;
+        WriteLn('=== LOOP-INVARIANT CODE MOTION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('LICM') then SSAProgram.RunLICM;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Loop-invariant code motion failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeLICM := PassTimer.ElapsedMilliseconds;
+      PassMark('LICM');
+      {$ELSE}
+      {$IFDEF DEBUG_LICM}
+      if DebugLICM then
+      begin
+        WriteLn;
+        WriteLn('=== LOOP-INVARIANT CODE MOTION ===');
+        WriteLn('[DISABLED] Skipping loop-invariant code motion (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      // Index strength reduction: an array index of the form "invariant + counter" becomes a
+      // running index advanced by the counter's step. Placed HERE for two reasons that are not
+      // interchangeable: after LICM, because it writes the initial value into the preheader LICM
+      // creates; and before the range analysis, because the running indices it emits have to be
+      // re-proven in bounds by EvalDerivedIV or the loop gets its guards back and comes out SLOWER.
+      try
+        if PassEnabled('IndexReduction') then SSAProgram.RunIndexReduction;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Index reduction failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      PassMark('Index Reduction');
+
+      {$IFNDEF DISABLE_LOOP_UNROLL}
+      // Loop Unrolling - duplicates loop bodies for reduced overhead
+      // IMPORTANT: Rebuild dominator tree first because LICM may have created new blocks (pre-headers)
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn;
+        WriteLn('=== LOOP UNROLLING ===');
+        WriteLn('[UNROLL] Rebuilding dominator tree (LICM may have modified CFG)...');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        // Rebuild dominator tree to include any blocks added by LICM
+        SSAProgram.ClearDomTree;
+        SSAProgram.BuildDominatorTree;
+        if PassEnabled('LoopUnrolling') then SSAProgram.RunLoopUnrolling;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Loop unrolling failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeLoopUnroll := PassTimer.ElapsedMilliseconds;
+      PassMark('Loop Unroll');
+      {$ELSE}
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+      begin
+        WriteLn;
+        WriteLn('=== LOOP UNROLLING ===');
+        WriteLn('[DISABLED] Skipping loop unrolling (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_DCE}
+      // Dead code elimination pass - removes unused PHI nodes, LoadConst, etc.
+      // CRITICAL: Must run BEFORE PHI Elimination to remove dead PHI nodes
+      {$IFDEF DEBUG_DCE}
+      if DebugDCE then
+      begin
+        WriteLn;
+        WriteLn('=== DEAD CODE ELIMINATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('DCE') then SSAProgram.RunDCE;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Dead code elimination failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeDCE := PassTimer.ElapsedMilliseconds;
+      PassMark('DCE');
+      {$ELSE}
+      {$IFDEF DEBUG_DCE}
+      if DebugDCE then
+      begin
+        WriteLn;
+        WriteLn('=== DEAD CODE ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping dead code elimination (optimizations disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      {$IFNDEF DISABLE_RANGE_ANALYSIS}
+      // B4 bounds-check elimination: prove array accesses in-bounds and mark them
+      // BoundsSafe. After DCE (instruction positions are final), before PHI
+      // elimination (the induction-variable proof needs the PHIs). Sets a hint
+      // only - the instruction stream is untouched.
+      try
+        if PassEnabled('RangeAnalysis') then SSAProgram.RunRangeAnalysis;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Range analysis failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      {$ENDIF}
+
+      // PHI ELIMINATION - FINAL PASS BEFORE BYTECODE COMPILATION
+      // CRITICAL: Must run AFTER DCE so dead PHI nodes are already removed
+      // This converts remaining live PHI functions to Copy instructions
+      {$IFNDEF DISABLE_PHI_ELIM}
+      {$IFNDEF DISABLE_SSA_CONSTRUCTION}
+      {$IFDEF DEBUG_PHIELIM}
+      if DebugPhiElim then
+      begin
+        WriteLn;
+        WriteLn('=== PHI ELIMINATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('PhiElimination') then SSAProgram.RunPhiElimination;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: PHI elimination failed: ', E.Message);
+          WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+      if OptStats then TimePhiElim := PassTimer.ElapsedMilliseconds;
+      PassMark('PHI Elim');
+      {$ELSE}
+      {$IFDEF DEBUG_PHIELIM}
+      if DebugPhiElim then
+      begin
+        WriteLn;
+        WriteLn('=== PHI ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping PHI elimination (SSA construction disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+      {$ELSE}
+      {$IFDEF DEBUG_PHIELIM}
+      if DebugPhiElim then
+      begin
+        WriteLn;
+        WriteLn('=== PHI ELIMINATION ===');
+        WriteLn('[DISABLED] Skipping PHI elimination (optimization disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      // COPY COALESCING - Remove redundant Copy instructions from PHI Elimination
+      // CRITICAL: Must run AFTER PHI Elimination (generates Copy instructions)
+      //           and BEFORE Register Allocation (reduces register pressure)
+      {$IFNDEF DISABLE_COPY_COAL}
+      {$IFDEF DEBUG_COPYCOAL}
+      if DebugCopyCoal then
+      begin
+        WriteLn;
+        WriteLn('=== COPY COALESCING ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      try
+        if PassEnabled('CopyCoalescing') then SSAProgram.RunCopyCoalescing;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Copy coalescing failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      if OptStats then TimeCopyCoal := PassTimer.ElapsedMilliseconds;
+      PassMark('Copy Coal');
+      {$ELSE}
+      {$IFDEF DEBUG_COPYCOAL}
+      if DebugCopyCoal then
+      begin
+        WriteLn;
+        WriteLn('=== COPY COALESCING ===');
+        WriteLn('[DISABLED] Skipping copy coalescing (optimization disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      // STRING TEMP FUSION - let a string primitive write straight into its destination register,
+      // instead of a temporary that the next instruction copies. See TSSAProgram.RunStringTempFusion:
+      // it must run HERE, on the SSA, because the AOT compiles from this form -- doing it on the
+      // bytecode instead desynchronised the two and miscompiled Str() under --aot.
+      // ⚠️ This program has its OWN SSA pipeline: there are nine such sites in the tree, and a pass
+      // added to only some of them silently does nothing on the paths it missed.
+      // ⚠️ The three calls need the begin/end: without it the gate covers only the FIRST one and
+      // "STRFUSE=0" still fuses, which makes every A/B on this gate read a contaminated baseline.
+      if GetEnvironmentVariable('STRFUSE') <> '0' then
+      begin
+        // ⚠️ "except end" swallows the pass's own defects: a fusion that aborts halfway looks exactly
+        // like one that had nothing to do. Under STRFUSE_DIAG the exception is reported.
+        try SSAProgram.RunStringTempFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunStringTempFusion: ', E.Message);
+        end;
+        try SSAProgram.RunAscMidFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAscMidFusion: ', E.Message);
+        end;
+        try SSAProgram.RunStringTempFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunStringTempFusion (2nd): ', E.Message);
+        end;
+        // Last: it consumes a Mid whose temporary the fusions above have already had their chance
+        // at. Gated OFF inside the pass itself (STRCHARFUSE=1 to enable) - see the note there.
+        try SSAProgram.RunConcatCharFusion;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatCharFusion: ', E.Message);
+        end;
+        // ⚠️ RunAppendMappedFusion is NOT here any more - it runs AFTER register allocation, see the
+        // call further down and the reason there.
+        // Last of all: needs the final shape of the concatenations, including anything the fusions
+        // above rewrote.
+        try SSAProgram.RunConcatDeadSourceMark;
+        except on E: Exception do
+          if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+            WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatDeadSourceMark: ', E.Message);
+        end;
+      end;
+      // ⛔ IL SUO MARK. Senza, le cinque fusioni di stringa fatturavano tempo e memoria a `Reg Alloc`,
+      // che e' la passata DOPO - la stessa trappola gia' pagata da SubInlining e XferForwarding (vedi il
+      // commento al mark di SubInlining). Con HEAP_DIAG la differenza non e' accademica: la prima lettura
+      // attribuiva un picco di 366 MB a un allocatore che non lo alloca.
+      PassMark('Str Fusion');
+
+      // REGISTER ALLOCATION - Allocate physical registers to virtual registers
+      // Uses Linear Scan algorithm (O(n log n) complexity)
+      // CRITICAL: Must run AFTER PHI Elimination (no more PHI nodes)
+      //           and BEFORE Bytecode Compilation (needs physical registers)
+      {$IFNDEF DISABLE_REG_ALLOC}
+      {$IFDEF DEBUG_REGALLOC}
+      if DebugRegAlloc then
+      begin
+        WriteLn;
+        WriteLn('=== REGISTER ALLOCATION ===');
+      end;
+      {$ENDIF}
+      if OptStats then PassTimer := CreateHiResTimer;
+      RegAlloc := TLinearScanAllocator.Create(SSAProgram);
+      try
+        try
+          SpillCount := RegAlloc.Run;
+          {$IFDEF DEBUG_REGALLOC}
+          if DebugRegAlloc then
+            WriteLn('[RegAlloc] Register allocation completed with ', SpillCount, ' spills');
+          {$ENDIF}
+        except
+          on E: Exception do
+          begin
+            WriteLn('ERROR: Register allocation failed: ', E.Message);
+            WriteLn('Compilation aborted.');
+            ExitCode := 1;   // a compiler that fails must not report success
+            Exit;
+          end;
+        end;
+      finally
+        RegAlloc.Free;
+      end;
+      if OptStats then TimeRegAlloc := PassTimer.ElapsedMilliseconds;
+      PassMark('Reg Alloc');
+
+      // "acc += tab[Asc(Mid(s,i,1))+1]" into ONE instruction - AFTER register allocation, on purpose.
+      //
+      // ⭐ This is the whole reason the fusion can exist at all. The fused instruction has to name FIVE
+      // values - accumulator out, accumulator in, source string, table, index - and a TSSAInstruction
+      // has four operand slots, so with the source in Src1 the incoming accumulator is named by no
+      // operand. Run BEFORE allocation, that is fatal: PHI elimination and the allocator cannot see
+      // the accumulator arriving, the copies closing the loop-carried PHI are dropped, and a reset of
+      // the accumulator lands on a different register from the one the append grows - the miscompile
+      // that kept this switched off (job/tests/bas/bug_appendmapped_aot.bas).
+      //
+      // Run HERE the problem does not arise: the registers are already PHYSICAL, so the incoming and
+      // outgoing accumulator ARE the same register and Dest names both. Nothing renames anything after
+      // this point, and both consumers of the SSA - the bytecode compiler and the AOT, which compiles
+      // from SSA and has a native helper for this opcode - see the fused form.
+      //
+      // ⚠️ It still CONSUMES what RunConcatCharFusion produces, and that pass runs before allocation.
+      // That is fine: allocation rewrites the operands of ssaStrConcatCharAt, it does not remove it.
+      try SSAProgram.RunAppendMappedFusion;
+      except on E: Exception do
+        if GetEnvironmentVariable('STRFUSE_DIAG') = '1' then
+          WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunAppendMappedFusion: ', E.Message);
+      end;
+      {$ELSE}
+      {$IFDEF DEBUG_REGALLOC}
+      if DebugRegAlloc then
+      begin
+        WriteLn;
+        WriteLn('=== REGISTER ALLOCATION ===');
+        WriteLn('[DISABLED] Skipping register allocation (optimization disabled)');
+      end;
+      {$ENDIF}
+      {$ENDIF}
+
+      // End optimization timer
+      OptTime := Timer.ElapsedMilliseconds;
+
+    finally
+      SSAGen.Free;
+    end;
+    {$IFDEF DEBUG_BYTECODE}
+    if DebugBytecode then
+      WriteLn;
+    {$ENDIF}
+
+    // === BYTECODE COMPILATION ===
+    {$IFDEF DEBUG_BYTECODE}
+    if DebugBytecode then
+      WriteLn('=== BYTECODE COMPILATION ===');
+    {$ENDIF}
+    Compiler := TBytecodeCompiler.Create;
+    try
+      try
+        Timer := CreateHiResTimer;
+        BytecodeProgram := Compiler.Compile(SSAProgram);
+        CompileTime := Timer.ElapsedMilliseconds;
+
+        if not Assigned(BytecodeProgram) then
+        begin
+          WriteLn('ERROR: Bytecode compilation failed!');
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+        // Record the source dialect on the program so the VM can pick dialect-aware behaviour
+        // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
+        BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+        BytecodeProgram.NativeMemory := GMemoryMode = mmFB;   // ...and travels with the program
+        // "OPTION DIGITS n" rides out on the PARSE RESULT (the parser itself is
+        // long gone) and the VM applies it to the console behavior before running.
+        BytecodeProgram.OptionDigits := ParserResult.OptionDigits;
+        // ERMN reports the module an error came from. fbc bakes the source PATH as passed on
+        // its command line (native separators) into the executable and returns that - so do we
+        // (an fbc-compiled erfn.bas prints the full compile-time path, verified live). Assert's
+        // fbc-style "path(line):" prefix reuses the same value.
+        {$IFDEF WINDOWS}
+        BytecodeProgram.ModuleName := StringReplace(SourceFile, '/', '\', [rfReplaceAll]);
+        {$ELSE}
+        BytecodeProgram.ModuleName := SourceFile;
+        {$ENDIF}
+        BytecodeProgram.QBLang := QBLangDetected;
+        PhaseMark('bytecode-gen');
+
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR during bytecode compilation: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
+          Exit;
+        end;
+      end;
+
+      {$IFDEF DEBUG_BYTECODE}
+      if DebugBytecode then
+      begin
+        WriteLn(Format('Compiled in %.2f ms', [CompileTime]));
+        WriteLn(Format('  Instructions: %d', [BytecodeProgram.GetInstructionCount]));
+        WriteLn(Format('  Variables: %d', [BytecodeProgram.GetVariableCount]));
+        WriteLn(Format('  String constants: %d', [BytecodeProgram.StringConstants.Count]));
+      end;
+      {$ENDIF}
+    finally
+      Compiler.Free;
+    end;
+    {$IFDEF DEBUG_BYTECODE}
+    if DebugBytecode then
+      WriteLn;
+    {$ENDIF}
+
+    // === PEEPHOLE OPTIMIZATION ===
+    // Local bytecode optimizations (redundant copies, jump chains, etc.)
+    // Must run AFTER bytecode compilation and BEFORE superinstructions
+    {$IFNDEF DISABLE_PEEPHOLE}
+    {$IFDEF DEBUG_PEEPHOLE}
+    if DebugPeephole then
+      WriteLn('=== PEEPHOLE OPTIMIZATION ===');
+    {$ENDIF}
+    try
+      if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
+      PhaseMark('Peephole');
+      {$IFDEF DEBUG_PEEPHOLE}
+      if DebugPeephole then
+        WriteLn(Format('  Instructions after peephole: %d', [BytecodeProgram.GetInstructionCount]));
+      {$ENDIF}
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: Peephole optimization failed: ', E.Message);
+        WriteLn('Continuing without peephole...');
+      end;
+    end;
+    {$IFDEF DEBUG_PEEPHOLE}
+    if DebugPeephole then
+      WriteLn;
+    {$ENDIF}
+    {$ELSE}
+    {$IFDEF DEBUG_PEEPHOLE}
+    if DebugPeephole then
+    begin
+      WriteLn('=== PEEPHOLE OPTIMIZATION ===');
+      WriteLn('[DISABLED] Skipping peephole optimization (optimization disabled)');
+      WriteLn;
+    end;
+    {$ENDIF}
+    {$ENDIF}
+
+    // === DISASSEMBLY BEFORE SUPERINSTRUCTIONS (Optional) ===
+    if OptDisasmPre then
+    begin
+      WriteLn('=== BYTECODE DISASSEMBLY (BEFORE SUPERINSTRUCTIONS) ===');
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end;
+
+    // === SUPERINSTRUCTIONS ===
+    // Fuses common instruction sequences into single superinstructions
+    // Must run AFTER bytecode compilation and BEFORE VM execution
+    {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
+    {$IFDEF DEBUG_SUPERINSTR}
+    if DebugSuperinstr then
+      WriteLn('=== SUPERINSTRUCTIONS ===');
+    {$ENDIF}
+    try
+      if GSSAOptimizationsEnabled then RunSuperinstructionsAot(BytecodeProgram, SSAProgram);
+      PhaseMark('Superinstr');
+      {$IFDEF DEBUG_SUPERINSTR}
+      if DebugSuperinstr then
+        WriteLn(Format('  Instructions after fusion: %d', [BytecodeProgram.GetInstructionCount]));
+      {$ENDIF}
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: Superinstruction optimization failed: ', E.Message);
+        WriteLn('Continuing without superinstructions...');
+      end;
+    end;
+    {$IFDEF DEBUG_SUPERINSTR}
+    if DebugSuperinstr then
+      WriteLn;
+    {$ENDIF}
+    {$ELSE}
+    {$IFDEF DEBUG_SUPERINSTR}
+    if DebugSuperinstr then
+    begin
+      WriteLn('=== SUPERINSTRUCTIONS ===');
+      WriteLn('[DISABLED] Skipping superinstructions (optimization disabled)');
+      WriteLn;
+    end;
+    {$ENDIF}
+    {$ENDIF}
+
+    // === NOP COMPACTION ===
+    // Removes NOP instructions and adjusts jump targets
+    // Must run AFTER superinstructions (which generates NOPs)
+    {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
+    {$IFNDEF DISABLE_NOP_COMPACTION}
+    try
+      RunNopCompaction(BytecodeProgram);
+      PhaseMark('NopCompaction');
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: NOP compaction failed: ', E.Message);
+        WriteLn('Continuing with NOPs in bytecode...');
+      end;
+    end;
+    {$ENDIF}
+    {$ENDIF}
+
+    // === PEEPHOLE PASS 2 ===
+    // Second peephole pass to catch redundant jumps after NOP compaction
+    // Pattern: Jump N followed by instruction N (jump to next instruction)
+    {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
+    {$IFNDEF DISABLE_PEEPHOLE}
+    try
+      if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
+      PhaseMark('Peephole2');
+      // Run NOP compaction again to remove any new NOPs
+      {$IFNDEF DISABLE_NOP_COMPACTION}
+      RunNopCompaction(BytecodeProgram);
+      PhaseMark('NopCompaction2');
+      {$ENDIF}
+    except
+      on E: Exception do
+        ; // Ignore errors in second pass
+    end;
+    {$ENDIF}
+    {$ENDIF}
+
+    // === REGISTER COMPACTION ===
+    // Controlled by DISABLE_REG_COMPACTION in OptimizationFlags.inc
+    // Currently disabled by default - enable when type tracking is fixed
+    {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
+    {$IFNDEF DISABLE_REG_COMPACTION}
+    {$IFDEF DEBUG_REGALLOC}
+    if DebugRegAlloc then
+      WriteLn('=== REGISTER COMPACTION ===');
+    {$ENDIF}
+    try
+      if GSSAOptimizationsEnabled then RunRegisterCompaction(BytecodeProgram);
+      PhaseMark('RegCompaction');
+      {$IFDEF DEBUG_REGALLOC}
+      if DebugRegAlloc then
+        WriteLn;
+      {$ENDIF}
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: Register compaction failed: ', E.Message);
+        WriteLn('Continuing without compaction...');
+      end;
+    end;
+    {$ENDIF}
+    {$ENDIF}
+
+    // === DISASSEMBLY (Optional) ===
+    if OptDisasm then
+    begin
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end;
+
+    // === VM EXECUTION ===
+    if OptNoExec then
+    begin
+      // Skip execution - just compile and optionally disassemble
+      if OptVerbose then
+        WriteLn('=== SKIPPING VM EXECUTION (--no-exec) ===');
+      WriteLn('Compilation completed successfully.');
+      WriteLn('Instructions: ', BytecodeProgram.GetInstructionCount);
+      if OptStats then
+      begin
+        WriteLn;
+        WriteLn('=== COMPILATION STATISTICS ===');
+        WriteLn(Format('SSA generation:   %s', [FormatTimeEx(SSATime)]));
+        WriteLn(Format('Optimizations:    %s', [FormatTimeEx(OptTime)]));
+        WriteLn('  Per-pass breakdown:');
+        WriteLn(Format('    DBE:           %8.3f ms', [TimeDBE]));
+        WriteLn(Format('    Dom Tree:      %8.3f ms', [TimeDomTree]));
+        WriteLn(Format('    SSA Constr:    %8.3f ms', [TimeSSAConstr]));
+        WriteLn(Format('    GVN:           %8.3f ms', [TimeGVN]));
+        WriteLn(Format('    CSE:           %8.3f ms', [TimeCSE]));
+        WriteLn(Format('    Algebraic:     %8.3f ms', [TimeAlgebraic]));
+        WriteLn(Format('    Strength:      %8.3f ms', [TimeStrength]));
+        WriteLn(Format('    GOSUB Inline:  %8.3f ms', [TimeGosubInline]));
+        WriteLn(Format('    Const Prop:    %8.3f ms', [TimeConstProp]));
+        WriteLn(Format('    Copy Prop:     %8.3f ms', [TimeCopyProp]));
+        WriteLn(Format('    LICM:          %8.3f ms', [TimeLICM]));
+        WriteLn(Format('    Loop Unroll:   %8.3f ms', [TimeLoopUnroll]));
+        WriteLn(Format('    DCE:           %8.3f ms', [TimeDCE]));
+        WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
+        WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
+        WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
+        // What each pass actually DID. A timing says what a pass cost; this says whether it earned
+        // it. "inert" = the pass rewrote nothing at all on this program.
+        if Assigned(PassEffect) and (PassEffect.Count > 0) then
+        begin
+          WriteLn('  Per-pass effect:');
+          for i := 0 to PassEffect.Count - 1 do WriteLn(PassEffect[i]);
+        end;
+        WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
+        WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime)]));
+      end;
+      // Cleanup without VM
+      BytecodeProgram.Free;
+      SSAProgram.Free;
+      FreeAndNil(PassEffect);
+      ParserResult.Free;
+      Lexer.Free;
+    end
+    else
+    begin
+      // Execute the program
+      if OptVerbose then
+        WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
+      // Use TIOManager to create I/O devices based on mode
+      // Default is terminal mode (pure console, no SDL2)
+      GTermCtrl := TTerminalController.Create;
+      Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
+      Input := TTerminalInput.Create;
+      Output.Initialize('SedaiBasic', 80, 25);
+      // ⭐ DIVERGENZE 415: the program runs on a terminal as under fbc - keys without Enter, COLOR/LOCATE/
+      // CLS written to it, CSRLIN/POS asked of it, the terminal put back at exit. Before the VM exists,
+      // which reads TcActive for its console colours. Only when fbc's runtime would initialise.
+      TcStart;
+      VM := TBytecodeVM.Create;
+      WireFileHandler(VM);
+    {$IFDEF ENABLE_PROFILER}
+    Profiler := nil;
+    if OptProfile then
+    begin
+      // Determine profiler mode
+      // sampling = sample-based profiling, low overhead (default)
+      // hybrid = sampling + selective instrumentation
+      // instrumentation = full instrumentation, accurate but slow
+      if ProfileMode = 'sampling' then
+        ProfMode := pmSampling
+      else if ProfileMode = 'hybrid' then
+        ProfMode := pmHybrid
+      else if ProfileMode = 'instrumentation' then
+        ProfMode := pmInstrumentation
+      else
+      begin
+        WriteLn('WARNING: Unknown profiler mode "', ProfileMode, '", using sampling');
+        ProfMode := pmSampling;
+        ProfileMode := 'sampling';
+      end;
+
+      Profiler := TProfiler.Create(ProfMode);
+      VM.SetProfiler(Profiler);
+      if OptVerbose then
+        WriteLn('Profiler enabled (mode: ', ProfileMode, ')');
+    end;
+    {$ENDIF}
+    try
+      VM.SetOutputDevice(Output);
+      SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
+      VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
+      // ⛔ WHERE THE PROGRAM LIVES (DIVERGENZE 188, owner 9 Sep 2026). The VM did not know it: the
+      // front ends had the source file, the VM had only ParamStr(0) - which is the INTERPRETER. So
+      // EXEPATH answered bin/x86_64-linux and COMMAND$(0) the path of sb, and the universal FB idiom
+      // for a program finding its own data worked under fbc from every directory and here from none.
+      VM.SetProgramPaths(SourceFile);
+      // ⛔ AFTER SetProgramPaths, never before: the invocation directory has to be captured while it
+      // is still the invocation directory. --home is what the owner authorised as the EXPLICIT form
+      // of "run it where it lives"; see OptHome for why it is not a default.
+      if OptHome and (VM.ProgramDir <> '') then SetCurrentDir(VM.ProgramDir);
+      VM.SetInputDevice(Input);
+      VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
+      VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
+      VM.JitEnabled := OptJit;           // --jit: compile eligible hot loops to native
+      {$IFDEF JIT_PROFILE}
+      VM.JitProfile := OptJitProfile;    // --jit-profile: count loop back-edges (J1)
+      {$ENDIF}
+      VM.LoadProgram(BytecodeProgram);
+
+      // === AOT SURVEY (B1-S3, diagnostics only) ===
+      // Slices the SSA program into function regions and reports which are compilable with the B1
+      // scalar set (stderr). ⛔ It runs HERE, after the VM exists and with the record layout already
+      // handed over, because it must see the SAME gates the compiler will: run before that, GRecSize
+      // was 0, AotRecNative answered False, and every record field access was reported as taking the
+      // helper road when the compiled code lowers it natively. A diagnostic that disagrees with
+      // reality is worse than none.
+      if GetEnvironmentVariable('AOT_DIAG') = '1' then
+      begin
+        VM.GetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSurvey(SSAProgram, BytecodeProgram,
+                  BytecodeProgram.ModernMode and not OptBoundsCheck);  // same gate the compiler uses
+      end;
+
+      // === AOT (plan B, B1) ===
+      // Compile eligible whole SSA functions to native and register them under their
+      // entry PCs. Needs both the SSA program and the FINAL bytecode (PC/register maps).
+      if OptAot then
+      begin
+        // Hand the emitter the record-heap layout so a field access lowers natively instead of
+        // paying a helper call (which flushes and reloads the whole register pool around itself).
+        // Offsets only - the compiled code reads the live base from the context it is given.
+        VM.GetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        // ...and where the home span lives, so a compiled RTC_PTR64 load tests it inline (DIVERGENZE 687): set only at run
+        // time it arrived after this compile, and every such load called AotPtrHome.
+        VM.GetHomeLayout(AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff);
+        AotSetHomeLayout(AotHomeValidOff, AotHomeLoOff, AotHomeHiOff, AotRawLoOff, AotRawHiOff);
+        AotFuncList := AotCompileProgram(SSAProgram, BytecodeProgram, OptTrueValue,
+                                         BytecodeProgram.ModernMode and not OptBoundsCheck,
+                                         GetEnvironmentVariable('AOT_DIAG') = '1',
+                                         AotSkipMainDefault(OptJit));  // engine arbitration, AOT_MAIN overrides
+        for AotI := 0 to High(AotFuncList) do
+          VM.RegisterAotFunc(AotFuncList[AotI].EntryPC, AotFuncList[AotI].Mem,
+                             AotFuncList[AotI].LastPC);
+        VM.AotEnabled := Length(AotFuncList) > 0;
+      end;
+
+      try
+        SetProgramStartErrno;
+        Timer := CreateHiResTimer;
+        {$IFDEF ENABLE_PROFILER}
+        if OptProfile then
+          VM.Run  // Use slow path with profiler support
+        else
+          VM.RunFast;  // Use optimized execution loop
+        {$ELSE}
+        VM.RunFast;  // Use optimized execution loop
+        {$ENDIF}
+        ExecuteTime := Timer.ElapsedMilliseconds;
+        {$IFDEF JIT_PROFILE}
+        if OptJitProfile then VM.DumpHotLoops;  // JIT J1: report hot loops found by back-edge profiling
+        {$ENDIF}
+        FinishVMGraphics(VM);  // sb --window: keep the window open until closed
+        // ⛔ A RUN THAT ABORTED MUST NOT REPORT SUCCESS. The VM carries the program's own exit code -
+        // 1 from a failed ASSERT, n from "End n" - and it used to have nowhere to go: sb answered 0
+        // whatever happened, so every harness that reads $? was blind by construction. Only a NON-ZERO
+        // code is copied, so nothing that already set one (an uncaught runtime error, below) is undone.
+        if VM.ProgramExitCode <> 0 then ExitCode := VM.ProgramExitCode;
+      except
+        on E: Exception do
+        begin
+          // Default report is DETERMINISTIC (BASIC line + message only): bytecode PCs differ
+          // between optimized and --no-opt builds of the same program, so printing them by
+          // default made every runtime-erroring program a false OPTDIFF. --verbose restores
+          // the full dump (PC, failing instruction, surrounding bytecode).
+          // The program's own output may still be buffered: drain it FIRST, or this message
+          // lands ahead of text the program produced before failing.
+          TerminalOutFlush;
+          // ⭐ MODERN: an uncaught FreeBASIC RUNTIME ERROR aborts the way fbc's runtime aborts, word
+          // for word - a blank line, "Aborting due to runtime error N [(text)] at line L of <module>()",
+          // a blank line, and the error number as the EXIT CODE. That is what a FreeBASIC program's
+          // failure looks like, and a program that prints it is what its user is expecting to read.
+          // MEASURED against fbc 1.10.1; the module name is the source path exactly as it was passed
+          // on the command line, which is the same value ERMN already reports.
+          //
+          // ⛔ ONLY an error that CARRIES A FREEBASIC NUMBER. A Pascal exception leaking out of the VM
+          // (ERangeError on a raw pointer, EAccessViolation, an internal message) is OURS: fbc has no
+          // such error, there is no number to print, and dressing it in fbc's sentence would claim a
+          // fidelity we do not have. Those keep this project's own voice - which is also what lets a
+          // net tell "the program failed as fbc's would" from "we cannot do this".
+          // CLASSIC is untouched: its errors follow the Commodore table, and the two stay separate.
+          if ProgIsModern and (not OptVerbose) and (E is SedaiExecutorErrors.TExecutorException) and
+             (SedaiExecutorErrors.TExecutorException(E).ErrorCode <> 0) then
+          begin
+            ErrorSourceLine := 0;
+            if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
+              ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
+            // "#line n "file"" renames the position a diagnostic reports, which is exactly this one.
+            AbortModule := BytecodeProgram.ModuleName;
+            PPMapLine(ErrorSourceLine, ErrorSourceLine, AbortModule);
+            AbortDesc := FBAbortDescription(SedaiExecutorErrors.TExecutorException(E).ErrorCode);
+            if AbortDesc <> '' then AbortDesc := ' (' + AbortDesc + ')';
+            WriteLn;
+            // ⭐ ...and an error fbc reports at LINK time carries the name it was about. fbc never gets
+            // this far - its linker stops on "undefined reference to `NOTHERE'" - so fbc's sentence alone
+            // would say "illegal function call" and lose the one fact a user needs (DIVERGENZE 233).
+            if E is SedaiExecutorErrors.TExecutorLinkError then
+              WriteLn('Aborting due to runtime error ', SedaiExecutorErrors.TExecutorException(E).ErrorCode, AbortDesc,
+                      ' at line ', ErrorSourceLine, ' of ', AbortModule, '(): ', E.Message)
+            else
+            WriteLn('Aborting due to runtime error ', SedaiExecutorErrors.TExecutorException(E).ErrorCode, AbortDesc,
+                    ' at line ', ErrorSourceLine, ' of ', AbortModule, '()');
+            WriteLn;
+            TerminalOutFlush;
+            ExitCode := SedaiExecutorErrors.TExecutorException(E).ErrorCode;
+            Exit;
+          end;
+          Write('ERROR during VM execution');
+          if OptVerbose then
+            Write(' at PC=', VM.PC);
+          if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
+          begin
+            ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
+            with BytecodeProgram.GetInstruction(VM.PC) do
+            begin
+              if ErrorSourceLine > 0 then
+                WriteLn(' (BASIC LINE ', ErrorSourceLine, '): ', E.ClassName, ': ', E.Message)
+              else
+                WriteLn(': ', E.ClassName, ': ', E.Message);
+              if OptVerbose then
+                WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),
+                        ' Dest=', Dest, ' Src1=', Src1, ' Src2=', Src2);
+            end;
+            if OptVerbose then
+            begin
+              // Dump surrounding instructions to see the bytecode sequence
+              WriteLn;
+              WriteLn('Bytecode context (PC-7 to PC+2):');
+              for i := Max(0, VM.PC - 7) to Min(BytecodeProgram.GetInstructionCount - 1, VM.PC + 2) do
+              begin
+                with BytecodeProgram.GetInstruction(i) do
+                begin
+                  Write(Format('%4d: %-15s', [i, BytecodeOpToString(TBytecodeOp(OpCode))]));
+                  WriteLn(Format(' Dest=%3d Src1=%3d Src2=%3d Imm=%d', [Dest, Src1, Src2, Immediate]));
+                end;
+              end;
+            end;
+          end;
+          // ⛔ AND A RUN THAT DIED MUST NOT REPORT SUCCESS EITHER. This arm is OUR error - a Pascal
+          // exception leaking out of the VM, which fbc has no number for - so there is no fbc code to
+          // copy; 1 is what fbc's own runtime abort uses, and what every caller reads as "it failed".
+          ExitCode := 1;
+          Exit;
+        end;
+      end;
+
+      if OptStats then
+      begin
+        WriteLn;
+        WriteLn('=== EXECUTION STATISTICS ===');
+        {$IFDEF ENABLE_INSTRUCTION_COUNTING}
+        WriteLn(Format('Instructions executed: %d', [VM.InstructionsExecuted]));
+        if ExecuteTime > 0 then
+          WriteLn(Format('Time per instruction:  %s', [FormatTime(ExecuteTime / VM.InstructionsExecuted)]));
+        {$ENDIF}
+        WriteLn(Format('SSA generation:   %s', [FormatTimeEx(SSATime)]));
+        WriteLn(Format('Optimizations:    %s', [FormatTimeEx(OptTime)]));
+        WriteLn('  Per-pass breakdown:');
+        WriteLn(Format('    DBE:           %8.3f ms', [TimeDBE]));
+        WriteLn(Format('    Dom Tree:      %8.3f ms', [TimeDomTree]));
+        WriteLn(Format('    SSA Constr:    %8.3f ms', [TimeSSAConstr]));
+        WriteLn(Format('    GVN:           %8.3f ms', [TimeGVN]));
+        WriteLn(Format('    CSE:           %8.3f ms', [TimeCSE]));
+        WriteLn(Format('    Algebraic:     %8.3f ms', [TimeAlgebraic]));
+        WriteLn(Format('    Strength:      %8.3f ms', [TimeStrength]));
+        WriteLn(Format('    GOSUB Inline:  %8.3f ms', [TimeGosubInline]));
+        WriteLn(Format('    Const Prop:    %8.3f ms', [TimeConstProp]));
+        WriteLn(Format('    Copy Prop:     %8.3f ms', [TimeCopyProp]));
+        WriteLn(Format('    LICM:          %8.3f ms', [TimeLICM]));
+        WriteLn(Format('    Loop Unroll:   %8.3f ms', [TimeLoopUnroll]));
+        WriteLn(Format('    DCE:           %8.3f ms', [TimeDCE]));
+        WriteLn(Format('    PHI Elim:      %8.3f ms', [TimePhiElim]));
+        WriteLn(Format('    Copy Coal:     %8.3f ms', [TimeCopyCoal]));
+        WriteLn(Format('    Reg Alloc:     %8.3f ms', [TimeRegAlloc]));
+        // What each pass actually DID. A timing says what a pass cost; this says whether it earned
+        // it. "inert" = the pass rewrote nothing at all on this program.
+        if Assigned(PassEffect) and (PassEffect.Count > 0) then
+        begin
+          WriteLn('  Per-pass effect:');
+          for i := 0 to PassEffect.Count - 1 do WriteLn(PassEffect[i]);
+        end;
+        WriteLn(Format('Compilation time: %s', [FormatTimeEx(CompileTime)]));
+        WriteLn(Format('Execution time:   %s', [FormatTimeEx(ExecuteTime)]));
+        WriteLn(Format('Total time:       %s', [FormatTimeEx(SSATime + OptTime + CompileTime + ExecuteTime)]));
+      end;
+
+      {$IFDEF ENABLE_PROFILER}
+      // Profiler report and export
+      if OptProfile and Assigned(Profiler) then
+      begin
+        WriteLn;
+        Profiler.PrintReport;
+
+        // Export if requested
+        if ProfileExport <> '' then
+        begin
+          ExportExt := LowerCase(ExtractFileExt(ProfileExport));
+          if ExportExt = '.json' then
+            Profiler.ExportJSON(ProfileExport)
+          else if ExportExt = '.csv' then
+            Profiler.ExportCSV(ProfileExport)
+          else if ExportExt = '.folded' then
+            Profiler.ExportFoldedFlameGraph(ProfileExport)
+          else
+          begin
+            WriteLn('WARNING: Unknown export format "', ExportExt, '", defaulting to JSON');
+            Profiler.ExportJSON(ProfileExport);
+          end;
+          WriteLn('Profile data exported to: ', ProfileExport);
+        end;
+      end;
+      {$ENDIF}
+      finally
+        {$IFDEF ENABLE_PROFILER}
+        Profiler.Free;
+        {$ENDIF}
+        {$IFDEF UNIX}
+        // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
+        // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
+        // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        // ⭐ DIVERGENZE 475 - the program's atexit handlers run HERE, after its last line and before the VM is either
+        // torn down or left for the system: on the second road Destroy never runs.
+        VM.RunProgramExitHandlers;
+        GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
+        if not GExitThroughLibc then
+        begin
+        {$ENDIF}
+        VM.Free;
+        BytecodeProgram.Free;
+        SSAProgram.Free;
+        {$IFDEF UNIX}
+        end;
+        {$ENDIF}
+        FreeAndNil(PassEffect);
+      end;
+
+      ParserResult.Free;
+      Lexer.Free;
+    end;  // end of else (not OptNoExec)
+
+  finally
+    Source.Free;
+  end;
+
+  if ShowBanners then
+  begin
+    WriteLn;
+    WriteLn('========================================');
+    WriteLn('Test complete!');
+    WriteLn('========================================');
+  end;
+end;
+
+{ Execute a pre-compiled bytecode file (.basc) }
+procedure RunFromBytecode(const BytecodeFile: string;
+  OptVerbose, OptDisasm, OptStats, OptNoExec: Boolean
+  {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
+var
+  Serializer: TBytecodeSerializer;
+  BytecodeProgram: TBytecodeProgram;
+  VM: TBytecodeVM;
+  Disassembler: TBytecodeDisassembler;
+  Output: IOutputDevice;
+  Input: IInputDevice;
+  Timer: THiResTimer;
+  LoadTime, ExecuteTime: Double;
+  i: Integer;
+  ErrorSourceLine: Integer;
+  MapFile: string;          // DIVERGENZE 718
+  MapLine: Integer;
+  ShowBanners: Boolean;
+  Refusal: string;          // the dialect this front end does not run (CliDialectRefusal)
+  {$IFDEF ENABLE_PROFILER}
+  Profiler: TProfiler;
+  ProfMode: TProfilerMode;
+  ExportExt: string;
+  {$ENDIF}
+begin
+  ShowBanners := OptVerbose or OptDisasm or OptStats;
+
+  if ShowBanners then
+  begin
+    WriteLn('========================================');
+    PrintVersion;
+    WriteLn('========================================');
+    WriteLn;
+    WriteLn('Loading pre-compiled bytecode: ', BytecodeFile);
+  end;
+
+  // Load bytecode from file
+  Serializer := TBytecodeSerializer.Create;
+  try
+    Timer := CreateHiResTimer;
+    try
+      if GFusedPayload <> nil then
+        BytecodeProgram := Serializer.LoadFromStream(GFusedPayload)   // the tail of this executable
+      else
+        BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
+      // ⛔ A .basc was compiled for ONE memory mode and runs in it: a --memory asking for the other, or a
+      // build locked to STRICT meeting an fb file, is refused here through the error path below.
+      // ⛔ One environment, one dialect: the .basc says which it was compiled from.
+      Refusal := CliDialectRefusal(BytecodeProgram.ModernMode, BytecodeFile);
+      if Refusal <> '' then
+      begin
+        FreeAndNil(BytecodeProgram);
+        raise Exception.Create(Refusal);
+      end;
+      AdoptCompiledMemoryMode(BytecodeProgram.NativeMemory);
+      // ⛔⛔ THE FUSION PASS RUNS HERE AND NOT IN `sbc`. Whether fusing pays depends on the ENGINE,
+      // and only this side knows which one: RunSuperinstructions' own gate reads GJitWillRun, which
+      // --jit has already set by the time we get here. `sbc` cannot know, always fused, and a
+      // `.basc` cannot be un-fused - which made `sb prog.basc --jit` TEN AND A HALF TIMES slower
+      // than `sb prog.bas --jit` on the same program (fannkuch N=11: 21 641 ms against 2 019, with
+      // the JIT compiling zero loops instead of seven). See FuseAtLoad for the whole measurement.
+      // ⚠️ This path does NOT go through TSedaiRunner, which carries the same call for `sbv`: two
+      // sites, one function, and the reason is written in both.
+      FuseAtLoad(BytecodeProgram);
+      LoadTime := Timer.ElapsedMilliseconds;
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR loading bytecode: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
+        Exit;
+      end;
+    end;
+
+    if OptVerbose then
+    begin
+      WriteLn(Format('Bytecode loaded in %.2f ms', [LoadTime]));
+      WriteLn(Format('  Instructions: %d', [BytecodeProgram.GetInstructionCount]));
+      WriteLn(Format('  Variables: %d', [BytecodeProgram.GetVariableCount]));
+      WriteLn(Format('  String constants: %d', [BytecodeProgram.StringConstants.Count]));
+      WriteLn;
+    end;
+
+    // === DISASSEMBLY (Optional) ===
+    if OptDisasm then
+    begin
+      WriteLn('=== BYTECODE DISASSEMBLY ===');
+      Disassembler := TBytecodeDisassembler.Create;
+      try
+        WriteLn(Disassembler.Disassemble(BytecodeProgram));
+      finally
+        Disassembler.Free;
+      end;
+      WriteLn;
+    end;
+
+    // === VM EXECUTION ===
+    if OptNoExec then
+    begin
+      if OptVerbose then
+        WriteLn('=== SKIPPING VM EXECUTION (--no-exec) ===');
+      WriteLn('Bytecode loaded successfully.');
+      WriteLn('Instructions: ', BytecodeProgram.GetInstructionCount);
+      BytecodeProgram.Free;
+    end
+    else
+    begin
+      if OptVerbose then
+        WriteLn('=== VIRTUAL MACHINE EXECUTION ===');
+
+      GTermCtrl := TTerminalController.Create;
+      Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
+      Input := TTerminalInput.Create;
+      Output.Initialize('SedaiBasic', 80, 25);
+      // ⭐ DIVERGENZE 415: the program runs on a terminal as under fbc - keys without Enter, COLOR/LOCATE/
+      // CLS written to it, CSRLIN/POS asked of it, the terminal put back at exit. Before the VM exists,
+      // which reads TcActive for its console colours. Only when fbc's runtime would initialise.
+      TcStart;
+      VM := TBytecodeVM.Create;
+      WireFileHandler(VM);
+      {$IFDEF ENABLE_PROFILER}
+      Profiler := nil;
+      if OptProfile then
+      begin
+        if ProfileMode = 'sampling' then
+          ProfMode := pmSampling
+        else if ProfileMode = 'hybrid' then
+          ProfMode := pmHybrid
+        else if ProfileMode = 'instrumentation' then
+          ProfMode := pmInstrumentation
+        else
+        begin
+          WriteLn('WARNING: Unknown profiler mode "', ProfileMode, '", using sampling');
+          ProfMode := pmSampling;
+          ProfileMode := 'sampling';
+        end;
+
+        Profiler := TProfiler.Create(ProfMode);
+        VM.SetProfiler(Profiler);
+        if OptVerbose then
+          WriteLn('Profiler enabled (mode: ', ProfileMode, ')');
+      end;
+      {$ENDIF}
+      try
+        VM.SetOutputDevice(Output);
+        SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
+        VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
+        VM.SetProgramPaths(BytecodeFile); // ...and for a .basc it is the .basc's own directory
+        if OptHome and (VM.ProgramDir <> '') then SetCurrentDir(VM.ProgramDir);
+        VM.SetInputDevice(Input);
+        VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
+        VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
+        // --jit works here exactly as it does for a source run: the loop JIT compiles from the
+        // BYTECODE, which is all a .basc has. Without this assignment the flag was accepted and
+        // silently ignored, and a .basc ran fully interpreted - 17.6 s against 0.93 s on n-body.
+        // (--aot is a different story and stays out: it compiles from the SSA program, which only
+        // exists when compiling from source. A .basc carries no SSA.)
+        VM.JitEnabled := OptJit;
+        {$IFDEF JIT_PROFILE}
+        VM.JitProfile := OptJitProfile;
+        {$ENDIF}
+        VM.LoadProgram(BytecodeProgram);
+
+        try
+          SetProgramStartErrno;
+          Timer := CreateHiResTimer;
+          {$IFDEF ENABLE_PROFILER}
+          if OptProfile then
+            VM.Run
+          else
+            VM.RunFast;
+          {$ELSE}
+          VM.RunFast;
+          {$ENDIF}
+          ExecuteTime := Timer.ElapsedMilliseconds;
+          FinishVMGraphics(VM);  // sb --window: keep the window open until closed
+          // ⛔⛔ THE SAME PROGRAM MUST ANSWER THE SAME EXIT CODE FROM .bas AND FROM .basc, and this
+          // line was missing on THIS twin only: a failed ASSERT (or "End n") set VM.ProgramExitCode,
+          // the run-from-source path above copied it, and the bytecode path answered 0 — so
+          // "sb prog.bas" exited 1 while "sb prog.basc" exited 0 on the identical program, with the
+          // identical message printed. ⭐ Interpreter, --aot and --jit were all right; only the .basc
+          // route was blind, which is why no engine A/B could see it.
+          // ⚠️ And basc_sweep cannot: it compares the OUTPUT, which was identical all along.
+          if VM.ProgramExitCode <> 0 then ExitCode := VM.ProgramExitCode;
+        except
+          on E: Exception do
+          begin
+            // Same report as the run-from-source handler: a program must report errors
+            // identically whether launched from .bas or .basc — deterministic by default
+            // (BASIC line + message), full PC/bytecode dump only with --verbose.
+            TerminalOutFlush;   // drain the program's buffered output before this message
+            Write('ERROR during VM execution');
+            if OptVerbose then
+              Write(' at PC=', VM.PC);
+            if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
+            begin
+              ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            if (GetEnvironmentVariable('SB_LINE_MAP') <> '0') and PPMapOutputLine(ErrorSourceLine, MapFile, MapLine) and
+               (MapFile = '') then ErrorSourceLine := MapLine;   // DIVERGENZE 718: the program's own line
+              with BytecodeProgram.GetInstruction(VM.PC) do
+              begin
+                if ErrorSourceLine > 0 then
+                  WriteLn(' (BASIC LINE ', ErrorSourceLine, '): ', E.ClassName, ': ', E.Message)
+                else
+                  WriteLn(': ', E.ClassName, ': ', E.Message);
+                if OptVerbose then
+                  WriteLn('Failing instruction: ', BytecodeOpToString(TBytecodeOp(OpCode)),
+                          ' Dest=', Dest, ' Src1=', Src1, ' Src2=', Src2);
+              end;
+              if OptVerbose then
+              begin
+                WriteLn;
+                WriteLn('Bytecode context (PC-7 to PC+2):');
+                for i := Max(0, VM.PC - 7) to Min(BytecodeProgram.GetInstructionCount - 1, VM.PC + 2) do
+                begin
+                  with BytecodeProgram.GetInstruction(i) do
+                  begin
+                    Write(Format('%4d: %-15s', [i, BytecodeOpToString(TBytecodeOp(OpCode))]));
+                    WriteLn(Format(' Dest=%3d Src1=%3d Src2=%3d Imm=%d', [Dest, Src1, Src2, Immediate]));
+                  end;
+                end;
+              end;
+            end;
+            Exit;
+          end;
+        end;
+
+        if OptStats then
+        begin
+          WriteLn;
+          WriteLn('=== EXECUTION STATISTICS ===');
+          {$IFDEF ENABLE_INSTRUCTION_COUNTING}
+          WriteLn(Format('Instructions executed: %d', [VM.InstructionsExecuted]));
+          if ExecuteTime > 0 then
+            WriteLn(Format('Time per instruction:  %s', [FormatTime(ExecuteTime / VM.InstructionsExecuted)]));
+          {$ENDIF}
+          WriteLn(Format('Load time:       %s', [FormatTimeEx(LoadTime)]));
+          WriteLn(Format('Execution time:  %s', [FormatTimeEx(ExecuteTime)]));
+          WriteLn(Format('Total time:      %s', [FormatTimeEx(LoadTime + ExecuteTime)]));
+        end;
+
+        {$IFDEF ENABLE_PROFILER}
+        if OptProfile and Assigned(Profiler) then
+        begin
+          WriteLn;
+          Profiler.PrintReport;
+
+          if ProfileExport <> '' then
+          begin
+            ExportExt := LowerCase(ExtractFileExt(ProfileExport));
+            if ExportExt = '.json' then
+              Profiler.ExportJSON(ProfileExport)
+            else if ExportExt = '.csv' then
+              Profiler.ExportCSV(ProfileExport)
+            else if ExportExt = '.folded' then
+              Profiler.ExportFoldedFlameGraph(ProfileExport)
+            else
+            begin
+              WriteLn('WARNING: Unknown export format "', ExportExt, '", defaulting to JSON');
+              Profiler.ExportJSON(ProfileExport);
+            end;
+            WriteLn('Profile data exported to: ', ProfileExport);
+          end;
+        end;
+        {$ENDIF}
+      finally
+        {$IFDEF ENABLE_PROFILER}
+        Profiler.Free;
+        {$ENDIF}
+        {$IFDEF UNIX}
+        // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
+        // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
+        // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        // ⭐ DIVERGENZE 475 - the program's atexit handlers run HERE, after its last line and before the VM is either
+        // torn down or left for the system: on the second road Destroy never runs.
+        VM.RunProgramExitHandlers;
+        GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
+        if not GExitThroughLibc then
+        begin
+        {$ENDIF}
+        VM.Free;
+        BytecodeProgram.Free;
+        {$IFDEF UNIX}
+        end;
+        {$ENDIF}
+      end;
+    end;
+
+  finally
+    Serializer.Free;
+  end;
+
+  if ShowBanners then
+  begin
+    WriteLn;
+    WriteLn('========================================');
+    WriteLn('Execution complete!');
+    WriteLn('========================================');
+  end;
+end;
+
+{ THE COMMAND LINE OF THE FILE RUNNER. `sb` calls it for MODERN programs and `sbv --headless` for CLASSIC
+  ones (owner, 23 Oct 2026: CLASSIC runs only in sbv) - one body, so the two front ends cannot drift apart
+  the way four copies of the SSA pipeline once did. GCliClassic, set by the caller, says which dialect
+  this run accepts. }
+procedure SbCliMain;
+var
+  TestFile: string;
+  FileType: TSedaiFileType;
+  OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptHelp, OptNoExec: Boolean;
+  {$IFDEF ENABLE_PROFILER}
+  OptProfile: Boolean;
+  ProfileMode: string;
+  ProfileExport: string;
+  {$ENDIF}
+  i: Integer;
+  Param: string;
+  BadOption: string;   // the first option sb does not know, said before anything runs (as fbc does)
+  OptDialect: Boolean;  // --dialect: print the program's dialect and stop (CliPrintDialect)
+  VerifyMsg: string;
+  VerifyI: Integer;
+  FusedFlags: LongWord;
+
+begin
+    // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
+    // string BUILT at run time carries DefaultSystemCodePage, which is CP_ACP (0) because no cwstring
+    // unit is linked. FPC compares the two code pages on every concatenation: when they differ it takes
+    // ansistr_concat_COMPLEX, which converts BOTH operands to UnicodeString, concatenates, and converts
+    // the result back. So `s := s + 'literal'` - the single most common statement in this compiler - was
+    // paying a full UTF-16 round trip, and AnsiCompareText paid the same conversion on both arguments.
+    // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
+    // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
+    SetMultiByteConversionCodePage(CP_UTF8);
+  {$IFDEF UNIX}
+  // ⛔ PRIMO REGISTRATO = ULTIMO ESEGUITO (DIVERGENZE 517): `atexit` chiama in ordine inverso, e
+  // questo deve venire dopo ogni gestore che il programma registrera'. Vedi la nota su `c_exit`.
+  c_atexit(@SbFlushLast);
+  {$ENDIF}
+  try
+    // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
+    // (FreeBASIC/C semantics) instead of raising a Pascal exception that would abort the program. FPC
+    // leaves these unmasked by default. The VM already guards integer and explicit division by zero by
+    // value, so this only affects genuine float edge cases (e.g. an escaping Mandelbrot iterate overflowing).
+    SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+
+    // Set console code page to UTF-8 for proper character encoding. SetupConsoleUTF8 saves the previous
+    // code pages (restored from SedaiConsoleState's finalization) and does nothing at all when stdout is
+    // redirected or piped: the console belongs to the parent shell, and a run that is killed rather than
+    // exiting -- as the regression harness does on timeout -- would never restore it.
+    {$IFDEF WINDOWS}
+    SetupConsoleUTF8;
+    SetTextCodePage(Output, CP_UTF8);
+    SetTextCodePage(Input, CP_UTF8);
+    SetMultiByteConversionCodePage(CP_UTF8);
+    DefaultSystemCodePage := CP_UTF8;
+    {$ENDIF}
+
+    // Force BASIC-compatible number formatting process-wide. The lexer's constructor sets the
+    // same thing, but a .basc run never creates a lexer -- without this, PRINT of a float
+    // followed the OS locale (e.g. a comma decimal separator on an Italian system).
+    DefaultFormatSettings.DecimalSeparator := '.';
+    DefaultFormatSettings.ThousandSeparator := ',';
+
+    // Initialize random number generator
+    Randomize;
+
+    // ⭐ A FUSED PROGRAM (DIVERGENZE 573): checked before ANYTHING reads the command line, because in a fused
+    // file the command line is the PROGRAM's - no sb flag is recognised (an fbc executable has none), not even
+    // the diagnostic ones below. What `sb` would take from a flag was decided at fusion time and sits in the
+    // trailer. ⛔ HERMETIC: no sedai.conf is read (an fbc executable reads no configuration file); what the
+    // run needs - the memory mode above all - travels in the .basc. Environment knobs (HOTC_DIAG, SB_*) stay:
+    // they are diagnostics, not configuration. SB_NO_FUSED=1 runs this file as the plain sb it contains.
+    if (not GCliClassic) and (GetEnvironmentVariable('SB_NO_FUSED') <> '1') then
+    begin
+      TestFile := SelfExecutablePath;
+      if ReadFusedPayload(TestFile, GFusedPayload, FusedFlags) then
+      begin
+        SetLength(GProgramArgs, ParamCount);
+        for i := 1 to ParamCount do GProgramArgs[i - 1] := ParamStr(i);
+        OptJit := (FusedFlags and FUSED_FLAG_JIT) <> 0;
+        OptHome := (FusedFlags and FUSED_FLAG_HOME) <> 0;
+        GFusedRun := True;   // the lookup beside the program (188) is fbc's current directory again
+        RunFromBytecode(TestFile, False, False, False, False
+          {$IFDEF ENABLE_PROFILER}, False, '', ''{$ENDIF});
+        FreeAndNil(GFusedPayload);
+        Exit;
+      end;
+    end;
+
+    // Initialize debug flags from command-line parameters
+    InitDebugFlags;
+
+    // VM dispatch plan, milestone M1: one-shot opcode-table self-check (dense-map bijection/coverage).
+    // Diagnostic only; prints the summary and exits without touching the dispatch path.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--verify-opcodes') then
+    begin
+      // ⛔ 1 (not 0) on failure. This used to Halt(0) either way, so a script that trusted the exit
+      // code got a green net from a broken map; only a human reading the last LINE could tell.
+      if VerifyOpcodeTable(VerifyMsg) then
+      begin
+        WriteLn('opcode-table OK: ', VerifyMsg);
+        Halt(0);
+      end
+      else
+      begin
+        WriteLn('opcode-table FAIL: ', VerifyMsg);
+        Halt(1);
+      end;
+    end;
+
+    // Every opcode the compiler can emit, with the name the disassembler would print for it. One line
+    // per opcode, sorted by code. Diagnostic only -- but it is also the NET for any change to how
+    // names are produced: capture it before, capture it after, and require the diff to contain only
+    // the lines you meant to change.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--dump-opnames') then
+    begin
+      for VerifyI := 0 to OPCODE_LIST_COUNT - 1 do
+        WriteLn(Format('$%.4X %s', [OPCODES[VerifyI],
+                       BytecodeOpToString(TBytecodeOp(OPCODES[VerifyI]))]));
+      Halt(0);
+    end;
+
+    // Keyword coverage self-check: read a list of names (one per line) and report, for each, whether
+    // THIS build's front end knows it. The answer comes from the real lexer -- a name it does not know
+    // comes back as ttIdentifier, anything else is a keyword it recognises -- so the check can never
+    // drift from the compiler the way a hand-maintained table does. Diagnostic only; prints and exits.
+    // Companion tool: job/tests/tools/kwcheck.ps1, which feeds it the FreeBASIC manual's own index.
+    if (ParamCount >= 2) and (LowerCase(ParamStr(1)) = '--kw-check') then
+    begin
+      KwCheckReport(ParamStr(2));
+      Halt(0);
+    end;
+
+    // JIT J2 foundation self-test: emit a tiny native function and call it (proves the
+    // emitter + executable-memory + native-call pipeline works). Prints the result and exits.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--jit-selftest') then
+    begin
+      if JitSelfTest(VerifyMsg) then
+        WriteLn('jit-selftest OK: ', VerifyMsg)
+      else
+        WriteLn('jit-selftest FAIL: ', VerifyMsg);
+      Halt(0);
+    end;
+
+    // Parse command-line parameters
+    TestFile := '';
+    BadOption := '';
+    OptVerbose := False;
+    OptDumpAST := False;
+    OptDisasm := False;
+    OptDisasmPre := False;
+    OptStats := False;
+    OptHelp := False;
+    OptNoExec := False;
+    OptDialect := False;
+    OptTrueValue := -1;  // Default: Commodore BASIC style (TRUE = -1)
+    GExtraModules := TStringList.Create;   // --module (DIVERGENZE 162)
+    {$IFDEF ENABLE_PROFILER}
+    OptProfile := False;
+    ProfileMode := 'sampling';  // Default to low-overhead sampling
+    ProfileExport := '';
+    {$ENDIF}
+
+    for i := 1 to ParamCount do
+    begin
+      Param := LowerCase(ParamStr(i));
+      if Param = '--verbose' then
+        OptVerbose := True
+      else if Param = '--dump-ast' then
+        OptDumpAST := True
+      else if Param = '--disasm' then
+        OptDisasm := True
+      else if Param = '--disasm-pre' then
+        OptDisasmPre := True
+      else if Param = '--stats' then
+        OptStats := True
+      else if Param = '--no-exec' then
+        OptNoExec := True
+      else if Param = '--dialect' then
+        OptDialect := True
+      // ⭐ WHERE THINGS ARE, said on the command line - the most specific of the five places allowed to
+      // say it (see SedaiConfig). Spelled as fbc spells them, "-i" for headers and "-p" for libraries,
+      // because a program written for fbc is built with fbc's own flags and copying them costs nothing.
+      // ⛔ These go IN FRONT of anything sedai.conf or the environment gave: the run outranks the file.
+      else if (Param = '-i') and (i < ParamCount) then
+      begin
+        AddIncludeSearchPath(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
+      else if (Param = '-p') and (i < ParamCount) then
+      begin
+        AddLibrarySearchPath(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
+      else if (Param = '-lang') and (i < ParamCount) then
+      begin
+        GLangFlag := ParamStr(i + 1);   // fb | fblite (SedaiLangMode); checked after the loop
+        GSkipNextArg := True;
+      end
+      else if Pos(MEMORY_MODE_FLAG, Param) = 1 then
+        GMemoryModeFlag := Copy(Param, Length(MEMORY_MODE_FLAG) + 1, MaxInt)   // fb | strict (SedaiMemoryMode)
+      else if (Param = '--no-opt') or (Param = '--no-optimize') then
+        GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
+      else if (Param = '--home') then
+        OptHome := True          // run the program as if from its own directory - see OptHome
+      else if (Param = '--bounds-check') or (Param = '--boundscheck') then
+        OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
+      else if (Param = '--date-locale') or (Param = '--datelocale') then
+        SetDateLocaleMode(True)  // month/day names and date parsing follow the SYSTEM locale, as fbc does
+      else if (Param = '--date-deterministic') then
+        SetDateLocaleMode(False) // explicit default: English names, ISO-ish parsing, same on every machine
+      else if (Param = '--jit') then
+        begin
+          OptJit := True;  // JIT: compile eligible hot loops to native code (J2/J3)
+          GJitWillRun := True;   // ...e le superistruzioni devono stare zitte: vedi il flag
+        end
+      else if (Param = '--aot') then
+      begin
+        OptAot := True;  // AOT (plan B): compile eligible whole SSA functions to native
+        // Let the SSA pipeline know which engine is coming: RunConcatCharFusion emits a shape that
+        // pays under the AOT and costs when interpreted (see the note in that pass).
+        GAotWillRun := True;
+      end
+      {$IFDEF JIT_PROFILE}
+      else if (Param = '--jit-profile') or (Param = '--jitprofile') then
+        OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run
+      {$ENDIF}
+      else if Param = '--headless' then
+        OptHeadless := True   // accepted on every build: a build with no window is headless already
+      else if Param = '--window' then
+      begin
+        OptWindow := True;   // present graphics in an SDL2 window
+        {$IFNDEF WITH_WINDOW}
+        // ⛔ SAY SO. WITH_WINDOW is a {$DEFINE}, so on a build without it this flag used to be accepted
+        // and IGNORED: the program ran headless, printed its frame rate, exited cleanly - and no window
+        // ever appeared. Nothing was wrong with the program, nothing was wrong with the command line,
+        // and there was no way to tell from the outside. That is the same shape as an exit code of 0
+        // meaning "did not complain" rather than "worked".
+        WriteLn(ErrOutput, '?--window: this build has no window presenter (rebuild with: ./build.sh sb --window)');
+        {$ENDIF}
+      end
+      else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
+        OptHelp := True
+      {$IFDEF ENABLE_PROFILER}
+      else if (Param = '--profile') then
+      begin
+        OptProfile := True;
+        // Keep default mode (full)
+      end
+      else if Pos('--profile=', Param) = 1 then
+      begin
+        OptProfile := True;
+        ProfileMode := Copy(Param, 11, Length(Param));
+      end
+      else if Pos('--profile-export=', Param) = 1 then
+        ProfileExport := Copy(ParamStr(i), 18, Length(ParamStr(i)))  // Use original case for filename
+      {$ENDIF}
+      else if Pos('--true-value=', Param) = 1 then
+      begin
+        // Parse TRUE value: -1 (Commodore BASIC) or 1 (modern BASIC)
+        OptTrueValue := StrToInt64Def(Copy(Param, 14, Length(Param)), -1);
+        if (OptTrueValue <> -1) and (OptTrueValue <> 1) then
+        begin
+          WriteLn('WARNING: --true-value must be -1 or 1, using default -1');
+          OptTrueValue := -1;
+        end;
+      end
+      else if (Param = '--module') and (i < ParamCount) then
+      begin
+        // ⭐⭐ A FLAG, NOT A POSITIONAL, and that is the whole design (DIVERGENZE 162). "fbc a.bas
+        // b.bas" names modules because fbc is a COMPILER; `sb` is a runner, and words after the source
+        // are the PROGRAM's arguments (Command$) - measured byte for byte against a binary compiled by
+        // fbc, __FB_ARGC__ = 3 on both. Taking a second .bas as a module would silently steal an
+        // argument from every program that reads Command$. `sbc` has no such contract, so THERE the
+        // positional spelling is fbc's own.
+        GExtraModules.Add(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
+      else if GSkipNextArg then
+        GSkipNextArg := False
+      else if ApplyDebugFlag(Param) then
+        // --debug-*: InitDebugFlags has already set it; named here only so that it is not unknown
+      else if TestFile <> '' then
+      begin
+        // Arguments after the script are program arguments (for COMMAND$). Known sb flags are still
+        // recognised anywhere (see above); any other word goes to the program, a dash or not - it is what
+        // the program would receive from an executable fbc built.
+        SetLength(GProgramArgs, Length(GProgramArgs) + 1);
+        GProgramArgs[High(GProgramArgs)] := ParamStr(i);
+      end
+      else if (Param <> '') and (Param[1] = '-') then
+      begin
+        // ⛔ An option sb does not know, BEFORE the program: refused, as fbc refuses it. It used to be
+        // dropped in silence, so a misspelt "--jti" ran the program on the interpreter and said nothing.
+        if BadOption = '' then BadOption := ParamStr(i);
+      end
+      else
+        TestFile := ParamStr(i);   // first non-flag argument = the script/bytecode file
+    end;
+
+    if BadOption <> '' then
+    begin
+      WriteLn(ErrOutput, 'ERROR: unknown option "', BadOption, '" (', CliCmd, ' --help lists the options)');
+      ExitCode := 1;
+      Exit;
+    end;
+    if GLangFlag <> '' then
+    begin
+      if GCliClassic then
+        VerifyMsg := '-lang applies to MODERN programs, which run in sb; sbv runs CLASSIC'
+      else
+        CheckLangFlag(GLangFlag, VerifyMsg);   // '' when the value is fb or fblite
+      if VerifyMsg <> '' then
+      begin
+        WriteLn(ErrOutput, 'ERROR: ', VerifyMsg);
+        ExitCode := 1;
+        Exit;
+      end;
+    end;
+
+    // ⭐ THE CONFIGURATION, read once the source file is known - its directory is the most specific of
+    // the five places allowed to say where things are (see SedaiConfig). ⛔ Without this call the whole
+    // file was inert: ConfigList answered an empty list, so "sedai.conf" beside a program did nothing
+    // and every include had to be given with -i on the command line. Written and never wired.
+    LoadConfig(ExtractFilePath(ExpandFileName(TestFile)));
+
+    // Show help if requested or no file provided
+    if OptHelp or (TestFile = '') then
+    begin
+      PrintHelp;
+      Exit;
+    end;
+
+    // Convenience: "sb hello" finds "hello.bas" (then "hello.basc"). Only when the name as typed
+    // does not exist, so an explicit "sb hello.bas" still wins and a real path is never shadowed.
+    if not FileExists(TestFile) then
+    begin
+      if FileExists(TestFile + '.bas') then
+        TestFile := TestFile + '.bas'
+      else if FileExists(TestFile + '.basc') then
+        TestFile := TestFile + '.basc';
+    end;
+
+    // Check if file exists
+    if not FileExists(TestFile) then
+    begin
+      WriteLn('ERROR: File not found: ', TestFile);
+      ExitCode := 1;
+      ExitCode := 1;   // a compiler that fails must not report success
+      Exit;
+    end;
+
+    if OptDialect then
+    begin
+      CliPrintDialect(TestFile);
+      Exit;
+    end;
+
+    // Detect file type and run appropriate handler
+    FileType := TSedaiRunner.DetectFileType(TestFile);
+
+    case FileType of
+      sftSource:
+        // Compile and run .bas source file - in the memory mode the command line, sedai.conf or the build
+        // says (SedaiMemoryMode), resolved BEFORE generating: the SSA chooses the pointer model.
+        if not ResolveSourceMemoryMode then
+          ExitCode := 1
+        else
+        TestBytecodeCompilation(TestFile, OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec
+          {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+
+      sftBytecode:
+        begin
+          // Run pre-compiled .basc bytecode
+          // Note: --dump-ast and --disasm-pre are not applicable for bytecode
+          if OptDumpAST then
+            WriteLn('WARNING: --dump-ast not available for .basc files (no AST)');
+          if OptDisasmPre then
+            WriteLn('WARNING: --disasm-pre not available for .basc files (already optimized)');
+
+          RunFromBytecode(TestFile, OptVerbose, OptDisasm, OptStats, OptNoExec
+            {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
+        end;
+
+      else
+        begin
+          WriteLn('ERROR: Unknown file type: ', TestFile);
+          WriteLn('Supported extensions: .bas (source), .basc (bytecode)');
+          ExitCode := 1;
+        end;
+    end;
+
+  except
+    on E: Exception do
+    begin
+      WriteLn('FATAL ERROR: ', E.Message);
+      // Hold the window open only when a human is actually there to close it (sb launched by
+      // double-click, stdin attached to a console). Under a pipe, a redirect or a test harness nobody
+      // can press anything: the wait never ends, sb never exits, and the run becomes a stray process
+      // that has to be hunted down and killed.
+      if StdInIsConsole then
+      begin
+        WriteLn;
+        WriteLn('Press Enter to exit...');
+        ReadLn;
+      end;
+      ExitCode := 1;
+    end;
+  end;
+
+  {$IFDEF UNIX}
+  // ...e QUI, dopo ogni altra cosa che il programma stampa, si esce da libc (DIVERGENZE 517).
+  if GExitThroughLibc then c_exit(ExitCode);
+  {$ENDIF}
+end;

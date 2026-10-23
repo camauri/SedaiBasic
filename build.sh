@@ -691,6 +691,14 @@ PLATFORM_DIR="$CPU-$OS"
 
 FPC="$(find_fpc "$PLATFORM_DIR")" || exit 1
 
+# The version the banners print (src/Version.inc reads it with {$I %SEDAI_VERSION%}). The release workflow
+# sets it from the tag; a local build takes `git describe`, so a binary says which commit it came from.
+if [[ -z "${SEDAI_VERSION:-}" ]]; then
+    SEDAI_VERSION="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)"
+    [[ -z "$SEDAI_VERSION" ]] && SEDAI_VERSION="dev"
+fi
+export SEDAI_VERSION
+
 # ⭐ The hot arithmetic/branch/array opcodes, compiled by a C compiler instead of by FPC. ON BY DEFAULT
 # since 20 Aug 2026 and never required: with --no-hot-c the interpreter is exactly the Pascal loop it
 # has always been. (This comment said "opt-in" long after it stopped being true.)

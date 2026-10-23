@@ -82,6 +82,10 @@ var
 { Initialize debug flags from command-line parameters }
 procedure InitDebugFlags;
 
+{ Sets the flag Param names and answers True, or answers False when Param is not a debug flag of this
+  build. The front ends ask it while they refuse unknown options: one list, here. }
+function ApplyDebugFlag(const Param: string): Boolean;
+
 { Check if any debug flag is active (for performance-critical code) }
 function AnyDebugActive: Boolean;
 
@@ -90,16 +94,10 @@ implementation
 uses
   SysUtils;
 
-procedure InitDebugFlags;
-var
-  i: Integer;
-  Param: string;
+function ApplyDebugFlag(const Param: string): Boolean;
 begin
-  for i := 1 to ParamCount do
-  begin
-    Param := LowerCase(ParamStr(i));
-
-    if Param = '--debug-all' then
+  Result := True;
+  if Param = '--debug-all' then
     begin
       DebugAll := True;
       {$IFDEF DEBUG_SSA}DebugSSA := True;{$ENDIF}
@@ -187,8 +185,16 @@ begin
     {$IFDEF DEBUG_CLEANUP}
     else if Param = '--debug-cleanup' then DebugCleanup := True
     {$ENDIF}
-    ;
-  end;
+    else
+      Result := False;
+end;
+
+procedure InitDebugFlags;
+var
+  i: Integer;
+begin
+  for i := 1 to ParamCount do
+    ApplyDebugFlag(LowerCase(ParamStr(i)));
 end;
 
 function AnyDebugActive: Boolean;

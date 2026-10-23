@@ -419,7 +419,17 @@ begin
         end;
       end
       else if (Pos('-', Param) <> 1) and (InputFile = '') then
-        InputFile := Param;
+        InputFile := Param
+      else
+      begin
+        // ⛔ An unknown option, or a second file: refused, as fbc refuses it. Both used to be dropped.
+        if Pos('-', Param) = 1 then
+          WriteLn(ErrOutput, 'ERROR: unknown option "', Param, '" (sbd --help lists the options)')
+        else
+          WriteLn(ErrOutput, 'ERROR: unexpected argument "', Param, '": sbd takes one file');
+        ExitCode := 1;
+        Exit;
+      end;
 
       Inc(i);
     end;

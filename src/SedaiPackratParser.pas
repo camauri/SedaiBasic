@@ -81,6 +81,8 @@ type
       handed to the runtime, because it changes how a value is SHOWN, not how
       the program is built. }
     FOptionDigits: Integer;
+    // fblite: an "Option ByVal" was seen, so a parameter with no BYVAL/BYREF is BYVAL again (D4).
+    FOptionByVal: Boolean;
     // Constant capacity of the last "As String * n" TYPE-field type parsed (0 = none). Set by
     // ParseRecordFieldType, consumed when that field's node is built.
     FLastFieldFixedLen: Integer;
@@ -160,6 +162,7 @@ type
     FDeclOverloadSigs: TStringList;   // "<name>>T|A|R|D,..." per module-level OVERLOAD DECLARE, for the SSA
     FProcNameSeen: TStringList;       // "<ns>|<base>" of every module-level DECLARE or SUB/FUNCTION met so far
     FProcNameOvl: TStringList;        // ...those whose FIRST appearance said OVERLOAD (DIVERGENZE 472)
+    FProcBodySeen: TStringList;       // "<ns>|<base>" of every module-level SUB/FUNCTION BODY met so far (-lang fb)
     FProtoDecls: TStringList;         // "<ns>|<base>=<kind>#1<return>#1<variadic>#1<key>" per non-overloaded DECLARE
     FOvlProtos: TStringList;          // "<ns>|<base>"#2"<kind>#1<return>#1<variadic>#1<key>" per OVERLOAD DECLARE
     FNsPrefix: string;               // the namespace body being parsed ('' at module level)
@@ -288,6 +291,7 @@ type
     procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
     procedure SynthesizeHeaderThunks;                    // MODERN: "@Year" of a header routine gets a procedure (508)
     procedure RejectUndeclaredHeaderRoutines(Root: TASTNode);  // MODERN: file.bi & co. routines need their header (504)
+    procedure RejectStrictFbBuiltins(Root: TASTNode);           // -lang fb: SedaiBasic's own builtins are not names (D3)
     function MakeStaticRefDef(const DottedName, TypeName: string; InitExpr: TASTNode;
       Tok: TLexerToken): TASTNode;                       // "Static ByRef" member definition as a Shared reference (269)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
@@ -602,7 +606,21 @@ uses
   SedaiFbReserved,     // DIVERGENZE 717: a module procedure may not take a name fbc keeps for itself
 
   SedaiLexerFSM,       // SynthesizeHeaderThunks lexes the thunks it appends (508)
-  SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
+  SedaiPreprocessor,   // SourceDeclaresNonFbDialect: which -lang the source asked for
+  SedaiLangMode;       // GLangMode: modern / fb / fblite (owner, 23 Oct 2026)
+
+{ -lang fb (owner, 23 Oct 2026, D3): the text of the refusal of a SedaiBasic extension. WHAT names it, FBC is
+  the error fbc gives for the same source. }
+function StrictFbRefusal(const What, Fbc: string): string;
+begin
+  Result := What + ' is a SedaiBasic extension, refused under -lang fb (fbc: ' + Fbc + ')';
+end;
+
+{ -lang fblite (D4): the text of the refusal of what fbc keeps for -lang fb (the OOP, Scope, Var). }
+function FbLiteRefusal(const What, Fbc: string): string;
+begin
+  Result := What + ' is not part of -lang fblite (fbc: ' + Fbc + ')';
+end;
 
 // ⛔ A "#" that is a FILE-HANDLE PREFIX, never a STRING LITERAL whose text is "#": the tests below used to compare
 // the VALUE alone, so "Print ""#"";" read as "Print #" and was refused ("Expected file number after PRINT #"),
@@ -755,6 +773,10 @@ begin
   FProcNameSeen.Sorted := True;
   FProcNameSeen.Duplicates := dupIgnore;
   FProcNameOvl := TStringList.Create;
+  FProcBodySeen := TStringList.Create;
+  FProcBodySeen.CaseSensitive := False;
+  FProcBodySeen.Sorted := True;
+  FProcBodySeen.Duplicates := dupIgnore;
   FProtoDecls := TStringList.Create;
   FOvlProtos := TStringList.Create;
   FProtoDecls.CaseSensitive := False;
@@ -854,6 +876,7 @@ begin
   FDeclOverloadSigs.Free;
   FProcNameSeen.Free;
   FProcNameOvl.Free;
+  FProcBodySeen.Free;
   ClearProtoLists;
   FProtoDecls.Free;
   FOvlProtos.Free;
@@ -1585,6 +1608,7 @@ begin
   FDeclOverloadSigs.Clear;
   FProcNameSeen.Clear;
   FProcNameOvl.Clear;
+  FProcBodySeen.Clear;
   ClearProtoLists;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
@@ -1639,6 +1663,7 @@ begin
     ApplyDialectProfile;   // install the dialect's statement handlers for this parse
     FOptionBase := 0;      // reset per parse; set by an "OPTION BASE 1" directive as it is encountered
     FOptionDigits := 0;    // 0 = not specified: the dialect default (16 / 7) stands
+    FOptionByVal := False;
 
     DoParsingStarted;
 
@@ -1691,6 +1716,7 @@ begin
   FDeclOverloadSigs.Clear;
   FProcNameSeen.Clear;
   FProcNameOvl.Clear;
+  FProcBodySeen.Clear;
   ClearProtoLists;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
@@ -1864,6 +1890,8 @@ begin
   if FModernMode then RejectNonConstSharedRef(Result);
   // ⛔ ...and a routine of fbc's own headers (file.bi, datetime.bi, ...) exists only once its header declared it (504).
   if FModernMode then RejectUndeclaredHeaderRoutines(Result);
+  // ⛔ ...and under -lang fb the builtins SedaiBasic adds are not there at all (owner, 23 Oct 2026, D3).
+  if FModernMode and LangStrictFb then RejectStrictFbBuiltins(Result);
 
  // The module-level FORWARD declarations, handed to the namespace pass on the root: a name the program
  // declares that way is one of its own and beats a "Using" import, and it emitted no node to say so.
@@ -2236,6 +2264,8 @@ begin
      (SameText(Token.Value, 'OVERRIDE'))) and
     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
  begin
+   if LangStrictFb and SameText(Token.Value, 'OVERRIDE') then
+     HandleError(StrictFbRefusal('OVERRIDE', 'error 17: Syntax error, found ' + #39 + 'Override' + #39), Token);
    Context.Advance;                    // the decorator
    { ⚠️ Le PARENTESI non sono stile: dentro una funzione il suo stesso nome NUDO è la variabile di
      RISULTATO, non una chiamata, e l'assegnazione diventa `Result := Result` con il risultato non
@@ -2980,6 +3010,10 @@ begin
         // ⭐ MODERN "Interface name ... End Interface". INTERFACE is not a reserved word (making it
         // one would break every program that uses it as a variable), so it is matched by spelling
         // and only in the shape that cannot mean anything else: the word followed by a NAME.
+        if LangStrictFb and (SameText(Token.Value, 'INTERFACE')) and Assigned(Context.PeekNext) and
+           (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+           (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
+          HandleError(StrictFbRefusal('INTERFACE', 'error 42: Variable not declared, Interface'), Token);
         if (SameText(Token.Value, 'INTERFACE')) and Assigned(Context.PeekNext) and
            (Length(VarToStr(Context.PeekNext.Value)) > 0) and
            (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
@@ -4778,6 +4812,10 @@ begin
         // copied back into the caller's variable argument). Recorded for the SSA call lowering; BYREF
         // is also the implicit default, but only an explicit BYREF opts a scalar into write-back.
         if ParamMode = kBYREF then ParamNode.Attributes.Values['BYREF'] := '1';
+        // ⭐ fblite passes BYREF by default (fbc: "ByRef is the default in -lang fblite and qb"), so a Sub
+        // that assigns its parameter changes the caller's variable; "Option ByVal" restores fb's default.
+        if (ParamMode = '') and (GLangMode = lmFbLite) and not FOptionByVal then
+          ParamNode.Attributes.Values['BYREF'] := '1';
         if not Unnamed then Context.Advance;
         // FreeBASIC array parameter: "name() AS type" (empty parens; arrays are always passed ByRef,
         // with unspecified bounds). Consume the "()" and mark the parameter as an array. Without this
@@ -4979,6 +5017,8 @@ begin
   MethodType := '';
   OpSym := '';
   OpSymbolForm := False;
+  if (Kind = kOPERATOR) and (GLangMode = lmFbLite) then
+    HandleError(FbLiteRefusal('OPERATOR', 'error 146: Only valid in -lang fb, found ' + #39 + 'Operator' + #39), Token);
   if Kind = kOPERATOR then
   begin
     // Two OPERATOR forms:
@@ -5405,6 +5445,17 @@ begin
      (Pos('~', NameNode.ValueUpper) = 0) then
   begin
     NoteProcNameSeen(FNsPrefix + '|' + NameNode.ValueUpper, SaidOverload);
+    // -lang fb: FreeBASIC has no implicit overloading, so a SECOND BODY of one name needs the name to be an
+    // OVERLOAD set ("error 4: Duplicated definition"). Without -lang the implicit overload is SedaiBasic's.
+    // ⚠️ Not an OPERATOR: a global operator is lowered as a FUNCTION here, and two of one symbol are an overload set
+    // in fbc by nature ("Operator +" needs no OVERLOAD). Its NameTok is not set either - NameNode carries the token.
+    if LangStrictFb and (Pos('OPERATOR', NameNode.ValueUpper) = 0) and
+       (FProcBodySeen.IndexOf(FNsPrefix + '|' + NameNode.ValueUpper) >= 0) and
+       (FProcNameOvl.IndexOf(FNsPrefix + '|' + NameNode.ValueUpper) < 0) and
+       not ((GPPUndefNames <> nil) and (GPPUndefNames.IndexOf(NameNode.ValueUpper) >= 0)) then
+      Context.AddError(StrictFbRefusal('A second body of ' + NameNode.ValueUpper + ' without OVERLOAD',
+        'error 4: Duplicated definition'), NameNode.Token);
+    FProcBodySeen.Add(FNsPrefix + '|' + NameNode.ValueUpper);
     // ...and a body is checked against the DECLARE that announced it.
     if NameNode.Attributes.Values['FUNCPTR'] = '1' then DefRet := '?'
     else if Kind = kFUNCTION then DefRet := UpperFast(RetTypeName)
@@ -6410,6 +6461,8 @@ var
   PrevIdx: Integer;
 begin
   Token := Context.CurrentToken;
+  if GLangMode = lmFbLite then
+    HandleError(FbLiteRefusal('SCOPE', 'error 146: Only valid in -lang fb or deprecated, found ' + #39 + 'Scope' + #39), Token);
   Context.Advance;                                   // consume SCOPE
   Result := TASTNode.Create(antBlock, Token);
 
@@ -6651,8 +6704,18 @@ begin
     // pointer fbc runs Root.F and we ran Child.F, on the same source.
     else if DecoU = 'VIRTUAL' then IsVirtual := True
     // OVERRIDE and FINAL are MODERN extensions - fbc has neither. Recorded here, checked in the SSA.
-    else if DecoU = 'OVERRIDE' then IsOverride := True
-    else if DecoU = 'FINAL' then IsFinal := True
+    else if DecoU = 'OVERRIDE' then
+    begin
+      if LangStrictFb then
+        HandleError(StrictFbRefusal('OVERRIDE', 'error 17: Syntax error, found ' + #39 + 'Override' + #39), Context.CurrentToken);
+      IsOverride := True;
+    end
+    else if DecoU = 'FINAL' then
+    begin
+      if LangStrictFb then
+        HandleError(StrictFbRefusal('FINAL', 'error 17: Syntax error, found ' + #39 + 'Final' + #39), Context.CurrentToken);
+      IsFinal := True;
+    end
     else if DecoU <> 'CONST' then Break;
     Context.Advance;
   end;
@@ -7095,6 +7158,8 @@ begin
   Token := Context.CurrentToken;
   Context.Advance;                                  // consume TYPE / UNION
   Result := nil;
+  if LangStrictFb and SameText(VarToStr(Token.Value), 'CLASS') then
+    HandleError(StrictFbRefusal('CLASS', 'error 3: Expected End-of-Line, found ' + #39 + 'Class' + #39), Token);
   // The type name must be a plain identifier; a reserved word (e.g. the graphics keyword
   // CIRCLE/BOX/LINE) is not a valid type name — report it cleanly instead of silently bailing
   // and leaving the stream misaligned (which can derail later parsing).
@@ -7258,6 +7323,9 @@ begin
   // position uses; EXTENDS was one more that had never been told about it.
   if Context.Check(ttExtends) then
   begin
+    if GLangMode = lmFbLite then
+      HandleError(FbLiteRefusal('EXTENDS', 'error 146: Only valid in -lang fb, found ' + #39 + 'Extends' + #39),
+        Context.CurrentToken);
     Context.Advance;                                // consume EXTENDS
     if Context.Check(ttIdentifier) or Context.Check(ttOpDot) then
       Result.Attributes.Values['EXTENDS'] := UpperFast(ParseDottedName);
@@ -7296,6 +7364,8 @@ begin
   // The names are recorded on the type node as IMPLEMENTS = 'I1,I2'; the SSA resolves them.
   if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'IMPLEMENTS')) then
   begin
+    if LangStrictFb then
+      HandleError(StrictFbRefusal('IMPLEMENTS', 'error 17: Syntax error, found ' + #39 + 'Implements' + #39), Context.CurrentToken);
     Context.Advance;                                // consume IMPLEMENTS
     ImplList := '';
     repeat
@@ -7496,6 +7566,9 @@ begin
     // Everything else on the line (parameters, calling convention, OVERRIDE, ALIAS) is still skipped.
     if TokU = 'DECLARE' then
     begin
+      if GLangMode = lmFbLite then
+        HandleError(FbLiteRefusal('A member procedure (DECLARE inside a TYPE)',
+          'error 146: Only valid in -lang fb, found ' + #39 + 'Declare' + #39), Context.CurrentToken);
       Context.Advance;                              // consume DECLARE
       ParseInTypeMethodDecl(Result, CurAccess, IsInterface);
       Continue;
@@ -11973,6 +12046,10 @@ begin
   end
   else if Command = 'RESUME' then
   begin
+    // -lang fb: RESUME is a SedaiBasic extension there ("only valid in -lang deprecated or fblite or qb").
+    if LangStrictFb then
+      HandleError(StrictFbRefusal('RESUME', 'error 146: Only valid in -lang deprecated or fblite or qb, found ' + #39 + 'Resume' + #39),
+        Context.CurrentToken);
     Context.Advance; // Consume RESUME
 
     // Check for NEXT keyword
@@ -12208,6 +12285,9 @@ begin
        ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
        (SameText(Context.CurrentToken.Value, 'BASE')) then
     begin
+      if LangStrictFb then
+        HandleError(StrictFbRefusal('OPTION BASE', 'error 146: Only valid in -lang deprecated or fblite or qb, found ' + #39 + 'Option' + #39),
+          Context.CurrentToken);
       Context.Advance;                                 // consume BASE
       if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
       begin
@@ -12226,6 +12306,9 @@ begin
             ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
             (SameText(Context.CurrentToken.Value, 'DIGITS')) then
     begin
+      if LangStrictFb then
+        HandleError(StrictFbRefusal('OPTION DIGITS', 'error 146: Only valid in -lang deprecated or fblite or qb, found ' + #39 + 'Option' + #39),
+          Context.CurrentToken);
       Context.Advance;                                 // consume DIGITS
       if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
       begin
@@ -12283,6 +12366,11 @@ begin
       // OPTION NOKEYWORD <word> takes a second one: the keyword being removed from the symbol table.
       // Consumed so the statement parses; the word itself stays reserved (un-reserving it would have to
       // reach back into the LEXER, which has already classified every later occurrence).
+      if SameText(Context.CurrentToken.Value, 'BYVAL') then
+        FOptionByVal := True;   // fblite: parameters default to BYVAL from here on (see the parameter parser)
+      // fblite: "Option Dynamic" is the statement form of '$DYNAMIC - arrays declared below it are dynamic.
+      if SameText(Context.CurrentToken.Value, 'DYNAMIC') or SameText(Context.CurrentToken.Value, 'STATIC') then
+        PPNoteDynamicMeta(Context.CurrentToken.Line, SameText(Context.CurrentToken.Value, 'DYNAMIC'));
       if SameText(Context.CurrentToken.Value, 'NOKEYWORD') then
       begin
         Context.Advance;
@@ -13927,6 +14015,47 @@ procedure TPackratParser.RejectUndeclaredHeaderRoutines(Root: TASTNode);
   end;
 begin
   if (FHeaderRoutines = nil) or (FGatedDeclared = nil) then Exit;
+  Walk(Root);
+end;
+
+procedure TPackratParser.RejectStrictFbBuiltins(Root: TASTNode);
+// -lang fb: a builtin SedaiBasic adds to FreeBASIC is an undeclared name there, refused as fbc refuses it
+// ("error 42: Variable not declared") - unless the program declares the name itself (crt/math.bi declares
+// SINH & co.; a variable may be called MAX), which then is its own. The same two tree shapes the header
+// routines take: a call parsed as an array access, and a call node. The list was measured against fbc
+// 1.10.1, one probe per name.
+const
+  EXT_BUILTINS = ' ATAN LOG10 LOG2 LOGN FLOOR CEIL CSTR REGEXCOUNT REGEXREPLACE ARRAYLEN ARRAYSIZE ' +
+    'ARRAYDESCRIPTORPTR ARRAYCONSTDESCRIPTORPTR PROCESSORCOUNT CORECOUNT CPUCOUNT COUNTLEADINGZEROS ' +
+    'COUNTLEADINGZEROS32 COUNTTRAILINGZEROS COUNTTRAILINGZEROS32 COUNTONEBITS COUNTONEBITS32 ROTATELEFT ' +
+    'ROTATELEFT32 ROTATERIGHT ROTATERIGHT32 MIN MAX ROUND COPYSIGN SINGLEBITS BITSTOSINGLE SINH COSH TANH ' +
+    'ASINH ACOSH ATANH ERR$ ';
+  procedure Walk(N: TASTNode);
+  var
+    i: Integer;
+    W: string;
+  begin
+    if N = nil then Exit;
+    W := '';
+    case N.NodeType of
+      antArrayAccess:
+        if (N.ChildCount >= 1) and (N.GetChild(0) <> nil) and (N.GetChild(0).NodeType = antIdentifier) then
+          W := N.GetChild(0).ValueUpper;
+      antFunctionCall, antIdentifier:
+        begin
+          W := N.ValueUpper;
+          if (W = '') and (N.Token <> nil) then W := UpperFast(VarToStr(N.Token.Value));
+        end;
+    end;
+    if (W <> '') and (Pos(' ' + W + ' ', EXT_BUILTINS) > 0) and
+       ((FGatedDeclared = nil) or (FGatedDeclared.IndexOf(W) < 0)) then
+    begin
+      HandleError(StrictFbRefusal(W, 'error 42: Variable not declared, ' + W), N.Token);
+      Exit;
+    end;
+    for i := 0 to N.ChildCount - 1 do Walk(N.GetChild(i));
+  end;
+begin
   Walk(Root);
 end;
 
@@ -17197,6 +17326,8 @@ var
   VarIsByref, VarIsShared, DeclIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
+  if GLangMode = lmFbLite then
+    HandleError(FbLiteRefusal('VAR', 'error 150: Auto variables are only valid in -lang fb, found ' + #39 + 'Var' + #39), Token);
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume VAR
   // "Var ByRef r = target": the reference spelling, which the manual writes beside "Dim ByRef As T r".
@@ -18003,6 +18134,8 @@ begin
   end;
   if Context.Check(ttAsType) then
   begin
+    if LangStrictFb then
+      HandleError(StrictFbRefusal('ENUM ... AS <type>', 'error 17: Syntax error, found ' + #39 + 'As' + #39), Context.CurrentToken);
     Context.Advance;                            // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile]) then

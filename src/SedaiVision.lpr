@@ -53,6 +53,8 @@ program SedaiVision;
 
 // Include shared optimization flags
 {$I OptimizationFlags.inc}
+// JIT feature flags (the shared file runner, SbCli.inc, reads them)
+{$I JitFlags.inc}
 // Include debug flags (compile-time control of debug code)
 {$I DebugFlags.inc}
 // Include profiler flags
@@ -95,58 +97,31 @@ uses
   // Interactive console
   SedaiGraphicsModes, SedaiNewConsole,
   // Memory mapper for PEEK/POKE
-  SedaiMemoryMapper, SedaiC128MemoryMapper;
+  SedaiMemoryMapper, SedaiC128MemoryMapper,
+  // ⭐ What the shared file runner (SbCli.inc, `sbv --headless`) needs beyond the above - the same units sb
+  // names. Listed LAST so that, where a name exists twice, the runner reads it as sb does.
+  SedaiConfig, SedaiFFI, SedaiMemoryMode, SedaiLangMode, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiFileIO,
+  SedaiExecutorErrors, SedaiTerminalIO, SedaiTermConsole, SedaiPreprocessor, SedaiFused;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}
 
-{ Get system architecture string }
-function GetSystemArchitecture: string;
-begin
-  {$IFDEF CPUX86_64}
-    {$IFDEF WINDOWS}
-    Result := 'x86_64-win64';
-    {$ENDIF}
-    {$IFDEF LINUX}
-    Result := 'x86_64-linux';
-    {$ENDIF}
-    {$IFDEF DARWIN}
-    Result := 'x86_64-darwin';
-    {$ENDIF}
-  {$ELSE}
-    {$IFDEF CPUI386}
-      {$IFDEF WINDOWS}
-      Result := 'i386-win32';
-      {$ENDIF}
-      {$IFDEF LINUX}
-      Result := 'i386-linux';
-      {$ENDIF}
-    {$ELSE}
-      {$IFDEF CPUAARCH64}
-      Result := 'aarch64';
-      {$ELSE}
-      Result := 'unknown';
-      {$ENDIF}
-    {$ENDIF}
-  {$ENDIF}
-end;
+// The file runner sb uses, shared: `sbv --headless` runs a CLASSIC program through it, with no window and
+// the same engine options as sb (owner, 23 Oct 2026). It also brings GetSystemArchitecture and OptTrueValue.
+{$I SbCli.inc}
 
 { Print version banner }
-procedure PrintVersion;
+procedure VisionPrintVersion;
 begin
   WriteLn('SedaiBasic Vision (sbv) ver. ', SEDAIBASIC_VERSION, ' [', SEDAIBASIC_RELEASE_DATE, '] for ', GetSystemArchitecture);
   WriteLn(SEDAIBASIC_COPYRIGHT);
   WriteLn('SDL2 Graphical Console');
 end;
 
-var
-  // Global option for TRUE value in comparisons (-1 = Commodore BASIC, 1 = modern BASIC)
-  OptTrueValue: Int64 = -1;
-
 { Print help information }
-procedure PrintHelp;
+procedure VisionPrintHelp;
 begin
-  PrintVersion;
+  VisionPrintVersion;
   WriteLn;
   WriteLn('Usage: sbv [source.bas|program.basc] [options]');
   WriteLn;
@@ -170,6 +145,9 @@ begin
   WriteLn;
   WriteLn('Options:');
   WriteLn('  --help               Show this help message');
+  WriteLn('  --headless           Run the program with no window, its output on stdout, and the');
+  WriteLn('                         engine options of sb (--jit, --aot, --no-opt, ...):');
+  WriteLn('                         see sbv --headless --help');
   WriteLn('  --autorun            Auto-run program after loading (interactive mode)');
   WriteLn('  --verbose            Show loading, lexing, parsing, and VM execution info');
   WriteLn('  --dump-ast           Show AST structure after parsing');
@@ -219,7 +197,7 @@ begin
   if ShowBanners then
   begin
     WriteLn('========================================');
-    PrintVersion;
+    VisionPrintVersion;
     WriteLn('========================================');
     WriteLn;
   end;
@@ -530,6 +508,17 @@ begin
     DefaultSystemCodePage := CP_UTF8;
     {$ENDIF}
 
+    // ⭐ `sbv --headless`: the program runs with no window, through the file runner sb uses (SbCli.inc), so
+    // the same command line, output and engine options as sb, for CLASSIC programs. Decided before any
+    // other option is read: from here on the command line is the runner's.
+    for i := 1 to ParamCount do
+      if LowerCase(ParamStr(i)) = '--headless' then
+      begin
+        GCliClassic := True;
+        SbCliMain;
+        Exit;
+      end;
+
     // Initialize random number generator
     Randomize;
 
@@ -637,8 +626,15 @@ begin
         else
           WriteLn('WARNING: --history-file requires a path argument');
       end
-      else if (Pos('--', Param) <> 1) and (TestFile = '') then
-        TestFile := Param;  // Use original case for filename
+      else if (Pos('-', Param) <> 1) and (TestFile = '') then
+        TestFile := Param  // Use original case for filename
+      else if (Pos('-', Param) = 1) and not ApplyDebugFlag(LowerCase(Param)) then
+      begin
+        // ⛔ Refused, as fbc refuses an unknown option: it used to be dropped in silence.
+        WriteLn(ErrOutput, 'ERROR: unknown option "', Param, '" (sbv --help lists the options)');
+        ExitCode := 1;
+        Exit;
+      end;
 
       Inc(i);
     end;
@@ -646,7 +642,7 @@ begin
     // Show help if requested
     if OptHelp then
     begin
-      PrintHelp;
+      VisionPrintHelp;
       Exit;
     end;
 

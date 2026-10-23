@@ -52,15 +52,13 @@ Also in [`bas/demo/`](bas/demo/): `bubble_universe.bas`, `voxel_landscape.bas`, 
 > **Note:** This README provides an overview. For detailed information, see:
 > - [INSTALL.md](INSTALL.md) - **Everything the build needs, per platform, and how to get it**
 > - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
-> - [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed compilation pipeline and VM architecture
 > - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
-> - [BENCHMARK.md](BENCHMARK.md) - Benchmark results against the reference implementations
 > - [WEB_BASIC.md](WEB_BASIC.md) - Web BASIC (`sbw`), the stand-alone HTTP server
-> - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
 
 ## What is SedaiBasic?
 
-SedaiBasic began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
+SedaiBasic began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing. Each has its own
+front end: `sb` runs MODERN programs, `sbv` runs CLASSIC ones (`sbv --headless` without a window).
 
 - **CLASSIC**: line-numbered, from Commodore BASIC v7 (**202 / 210** core commands, 96%). It keeps
   v7's *language*, not v7's machine: this does not run on a C64/C128 and has none of its peripherals,
@@ -394,7 +392,9 @@ SedaiBasic provides four applications for different use cases:
 
 ### SedaiBasic VM (Command Line Interpreter)
 
-The main interpreter for running BASIC programs from the command line.
+The main interpreter for running MODERN programs from the command line. A CLASSIC (line-numbered)
+program is refused with a message: run it with `sbv`, or with `sbv --headless` for output on the
+terminal and the same engine options (`--jit`, `--aot`, `--no-opt`, ...).
 
 ```bash
 sb [options] <program.bas>
@@ -428,7 +428,7 @@ sb program.bas arg1 arg2
 **Examples:**
 ```bash
 # Run a program
-sb bas\SIEVE.BAS
+sb bas\rosetta\100_doors.bas
 
 # Show disassembly without executing
 sb --disasm --no-exec program.bas
@@ -495,7 +495,11 @@ Options:
   --help              Show this help message
   --fullscreen        Start in fullscreen mode
   --mode <n>          Set initial graphics mode (0-11)
+  --headless          Run the program with no window, its output on the terminal, with the
+                      engine options of sb (--jit, --aot, --no-opt, ...)
 ```
+
+`sbv` runs CLASSIC programs only; a MODERN one is refused with a message pointing to `sb`.
 
 **Features:**
 - C64/C128 compatible text modes (40x25, 80x25, 80x50)
@@ -531,6 +535,9 @@ sbv
 # Run a program in graphical mode
 sbv program.bas
 
+# Run a program with no window, output on the terminal
+sbv --headless bas/07_benchmarks/sieve.bas
+
 # Start fullscreen
 sbv --fullscreen
 ```
@@ -540,10 +547,10 @@ sbv --fullscreen
 After setup, run a BASIC program with:
 
 ```bash
-# Windows (command line)
+# Windows (command line, MODERN)
 .\bin\x86_64-win64\sb program.bas
 
-# Windows (graphical)
+# Windows (graphical, CLASSIC)
 .\bin\x86_64-win64\sbv program.bas
 
 # Linux
@@ -553,7 +560,8 @@ After setup, run a BASIC program with:
 ### Example
 
 ```bash
-.\bin\x86_64-win64\sb bas\SIEVE.BAS
+.\bin\x86_64-win64\sb bas\rosetta\100_doors.bas
+.\bin\x86_64-win64\sbv --headless bas\07_benchmarks\sieve.bas
 ```
 
 ## Benchmarking
@@ -604,8 +612,7 @@ The suite is the whole of [The Computer Language Benchmarks Game](https://benchm
 | reverse-complement | Read DNA sequences and write their reverse-complement | 25,000,000 (stdin) |
 | spectral-norm | Eigenvalue using the power method | 5,500 |
 
-Measured results are in [BENCHMARK.md](BENCHMARK.md). Two of these have no runnable reference on a
-stock Windows box, and `k-nucleotide`'s Python version needs a working `multiprocessing` fork, so Lua
+Two of these have no runnable reference on a stock Windows box, and `k-nucleotide`'s Python version needs a working `multiprocessing` fork, so Lua
 answers for it instead: the runner says which reference it used rather than quietly dropping one.
 
 #### Cumulative Statistics

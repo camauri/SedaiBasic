@@ -39,6 +39,7 @@ uses
   SedaiExecutorErrors,   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
   SedaiFbReserved,       // the names fbc keeps for itself, MEASURED (DIVERGENZE 590)
   SedaiPreprocessor,     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
+  SedaiLangMode,         // LangStrictFb: -lang fb refuses SedaiBasic's extensions (owner, 23 Oct 2026)
   SedaiForeignDecl,      // the format of a foreign DECLARE, and nothing about libffi (DIVERGENZE 183)
   Contnrs;               // TFPStringHashTable: a map whose DELETE is constant time
 
@@ -887,6 +888,7 @@ type
     function PrintKindOfBranch(Node: TASTNode): Integer;            // print kind of one IIf branch (707)
     function NameIsStringHere(const Name: string): Boolean;    // ...and is it a STRING in this scope?    // the innermost OPEN block that declared this @-taken SCALAR, or ''
     procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
+    function DimIsDynamicByMeta(Decl: TASTNode): Boolean;   // fblite/qb: declared under '$DYNAMIC
     function ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
     function RedimTargetSameScope(const ArrName: string; ArrayIdx: Integer): Boolean;  // was it declared at THIS level?
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
@@ -2597,7 +2599,7 @@ begin
   LastChar := VarName[Length(VarName)];
   if LastChar = '$' then
     Result := srtString
-  else if LastChar = '%' then
+  else if (LastChar = '%') or (LastChar = '&') then   // '&' = LONG, glued by the lexer in fblite only
     Result := srtInt
   else
   begin
@@ -2806,6 +2808,9 @@ begin
   // MODERN: route through the scope-aware resolver (a use / implicit first-use).
   if FModernMode then
   begin
+    // fblite: an implicit "l&" is a LONG - 32 bits, so a store wraps there (the lexer glues '&' only in fblite).
+    if (Length(VarName) > 1) and (VarName[Length(VarName)] = '&') and (FVarWidthCode.IndexOf(UpperFast(VarName)) < 0) then
+      RecordVarWidth(VarName, 'LONG');
     Result := BindOrResolve(VarName, False, False, srtInt, ModuleOnly);
     Exit;
   end;
@@ -16915,7 +16920,8 @@ begin
     // moment a SECOND reader appeared - the "ReDim x(...) As T over a fixed array is a declaration"
     // rule below - which then declared a fresh array on every ReDim of such a slot and cost 66 failing
     // assertions across six tests. A registry that nothing reads is not right; it is unobserved.
-    NoteArrayShape(DeclArrName, (ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim);
+    NoteArrayShape(DeclArrName, (ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim or
+                                DimIsDynamicByMeta(ArrayDeclNode));
     // Subscripts of any kind - "(2 To 11)", "(Any, Any)", "(n)" - STATE how many dimensions there
     // are, which the bare "Dim a()" above does not. See TSSAArrayInfo.RankStated.
     FProgram.SetArrayRankStated(ArrayIdx);
@@ -33286,6 +33292,13 @@ begin
     if FindUDT(Nm2) >= 0 then Exit(-1);   // a UDT parameter is handled above, by ObjectTypeName
     if TypeSizeBytes(Nm2) > 0 then Exit(TypeSizeBytes(Nm2));
   end;
+  // ⭐ fblite/qb: an IMPLICIT variable is legal there and its suffix is its declaration - Len(i%) is SizeOf
+  // Integer, Len(l&) SizeOf Long (fbc: 8 and 4), not the length of the number printed as text.
+  if SourceDeclaresNonFbDialect and (not IsDeclaredVariable(Nm)) and (ArrayIndexOf(Nm) < 0) and (Length(Nm) > 1) then
+    case Nm[Length(Nm)] of
+      '%', '#': Exit(8);
+      '&', '!': Exit(4);
+    end;
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   // ⛔ WHERE A BLOCK DECLARED THE NAME, EVERY REGISTRY BELOW IS ASKED UNDER *ITS* KEY AND NOTHING FALLS
   // BACK TO THE FLAT ENTRY - that absence means "this declaration is not one of those", not "go and
@@ -43488,6 +43501,10 @@ var
   Idx: Integer;
 begin
   if VarName = '' then Exit;
+  // -lang fb: BigInt, Int32 and UInt32 are SedaiBasic's types; fbc knows none of them (error 14).
+  if LangStrictFb and (SameText(TypeName, 'BIGINT') or SameText(TypeName, 'INT32') or SameText(TypeName, 'UINT32')) then
+    raise Exception.Create(UpperFast(TypeName) + ' is a SedaiBasic extension, refused under -lang fb ' +
+      '(fbc: error 14: Expected identifier, found ' + UpperFast(TypeName) + ')');
   // ...and the same fact in the LEXICAL stack, if the pre-scan is walking. Appended, never merged: the
   // reader takes the last match, so a second declaration of the name shadows the first from here on.
   if (TypeName <> '') and (Length(FLexVarFrames) > 0) then
@@ -53898,7 +53915,7 @@ begin
       // A REDIM target is always dynamic. A DIM is dynamic only when declared empty (no subscripts).
       if Node.NodeType = antDim then
       begin
-        if Decl.Attributes.Values['VARLEN'] <> '1' then
+        if (Decl.Attributes.Values['VARLEN'] <> '1') and not DimIsDynamicByMeta(Decl) then
         begin
           if Decl.ChildCount < 2 then Continue;
           Dims := Decl.GetChild(1);
@@ -63371,7 +63388,14 @@ begin
      TryForeignCall(Node.ValueUpper, ArgList, PtrVal) then Exit;
   if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
      (FProcedureNames.IndexOf(Node.ValueUpper) < 0) then
+  begin
+    // -lang fb: a stray name is what fbc says it is, "error 42: Variable not declared" - not a statement that
+    // does nothing (Tron, Begin, Bend and the C128 words reach MODERN as plain names, and pass that way).
+    if LangStrictFb then
+      raise Exception.Create('Variable not declared: ' + Node.ValueUpper + ' - a name alone is not a statement ' +
+        '(-lang fb; fbc: error 42: Variable not declared, ' + Node.ValueUpper + ')');
     Exit;
+  end;
   EmitProcedureCall(Node.ValueUpper, ArgList);
 end;
 
@@ -63686,6 +63710,14 @@ begin
     if FArrShapeDyn.IndexOf(SlotName) >= 0 then Exit;      // already known dynamic: it stays so
     if FArrShapeFixed.IndexOf(SlotName) < 0 then FArrShapeFixed.Add(SlotName);
   end;
+end;
+
+function TSSAGenerator.DimIsDynamicByMeta(Decl: TASTNode): Boolean;
+// fblite / qb: a '$DYNAMIC above the declaration makes "Dim a(5)" dynamic, so a later ReDim of it is legal
+// (fbc). In -lang fb the metacommand is not that, and nothing changes.
+begin
+  Result := (Decl <> nil) and SourceDeclaresNonFbDialect and (Length(GPPDynMetaLine) > 0) and
+            PPDynamicMetaAt(Decl.SourceLine);
 end;
 
 function TSSAGenerator.ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
@@ -66188,6 +66220,11 @@ begin
   // corpus programs - other passes between the two depend on the order - so only the one fact this
   // needs is gathered here.
   PreMarkStart; PreCollectFuncRetTypes(AST); PreMarkEnd('PreCollectFuncRetTypes');
+  // ...and the DEFxxx letters for the same reason: RegisterRecordVars gives "Dim n" (no AS, fblite) the bank of its
+  // initial, and asked before CollectDefTypes below had run it got the float default - "DefInt A-Z : Dim n :
+  // n = 7.6" printed 7.6 where fbc prints 8. Collected again below, unchanged.
+  for DefCh := 'A' to 'Z' do begin FDefTypeBank[DefCh] := -1; FDefTypeName[DefCh] := ''; end;
+  CollectDefTypes(AST);
   PreMarkStart; RegisterRecordVars(AST); PreMarkEnd('RegisterRecordVars');
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type

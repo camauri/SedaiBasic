@@ -116,6 +116,9 @@ EXE_SUFFIX=""
 [[ "$PLATFORM_DIR" == *win* ]] && EXE_SUFFIX=".exe"
 
 SB_EXE="$PROJECT_ROOT/bin/$PLATFORM_DIR/sb$EXE_SUFFIX"
+# CLASSIC runs only in sbv (owner, 23 Oct 2026): a CLASSIC benchmark is timed on `sbv --headless`, chosen per
+# file by asking sb (`--dialect`) - outside the timed command, so the choice costs the measurement nothing.
+SBV_EXE="$PROJECT_ROOT/bin/$PLATFORM_DIR/sbv$EXE_SUFFIX"
 THERMO_EXE="$PROJECT_ROOT/job/tests/bench/nbody_fbc_o2$EXE_SUFFIX"
 # Fall back to the Windows-named thermometer only when it is actually runnable here.
 [[ -x "$THERMO_EXE" ]] || THERMO_EXE="$PROJECT_ROOT/job/tests/bench/nbody_fbc_o2"
@@ -508,12 +511,13 @@ invoke_benchmark() {
 
     # --- SedaiBasic, four profiles ----------------------------------------
     if [[ "$RUN_SEDAI" == "true" ]]; then
-        local src="$BAS_DIR/$bas" p
+        local src="$BAS_DIR/$bas" p exe="$SB_EXE" lead=()
+        if [[ "$("$SB_EXE" --dialect "$src" 2>/dev/null)" == classic ]]; then exe="$SBV_EXE"; lead=(--headless); fi
         for p in "${PROFILE_KEYS[@]}"; do
             if [[ -n "$PROFILE_FILTER" && ",$PROFILE_FILTER," != *",$p,"* ]]; then continue; fi
             # shellcheck disable=SC2086
-            invoke_arm "$name" "$p" "${PROFILE_LABEL[$p]}" "$SB_EXE" "$TEMP_DIR/$name.$p.out" "$stdinfile" \
-                "$runcount" "$cooldown" false "$src" ${sizeargs[@]+"${sizeargs[@]}"} ${PROFILE_FLAGS[$p]}
+            invoke_arm "$name" "$p" "${PROFILE_LABEL[$p]}" "$exe" "$TEMP_DIR/$name.$p.out" "$stdinfile" \
+                "$runcount" "$cooldown" false ${lead[@]+"${lead[@]}"} "$src" ${sizeargs[@]+"${sizeargs[@]}"} ${PROFILE_FLAGS[$p]}
             armlist="$armlist $p"
         done
     fi

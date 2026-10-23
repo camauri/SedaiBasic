@@ -1037,6 +1037,15 @@ if (Load-BuildConfig) {
 # Find FPC
 $fpc = Find-FPC -Platform (Get-PlatformDir -cpu $CPU -os $OS)
 if (-not $fpc) { exit 1 }
+
+# The version the banners print (src/Version.inc reads it with {$I %SEDAI_VERSION%}). The release workflow
+# sets it from the tag; a local build takes `git describe`, so a binary says which commit it came from.
+if (-not $env:SEDAI_VERSION) {
+    $desc = ''
+    try { $desc = (& git -C $Script:ProjectRoot describe --tags --always --dirty 2>$null) } catch { $desc = '' }
+    if (-not $desc) { $desc = 'dev' }
+    $env:SEDAI_VERSION = "$desc".Trim()
+}
 Write-Host "Compiler: FPC $(& $fpc -iV 2>$null)" -ForegroundColor Gray
 Write-Host "Platform: $(Get-PlatformDir -cpu $CPU -os $OS)" -ForegroundColor Gray
 Write-Host "Mode: $(if ($Debug) { 'Debug' } else { 'Release' })" -ForegroundColor Gray

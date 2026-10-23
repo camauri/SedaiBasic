@@ -176,6 +176,15 @@ var
     whoever reports a POSITION (the uncaught-error abort message). A global for the same reason
     GUniqueIdStacks is one: the preprocessor hands back text, and this is about that text. }
   GPPLineDirectives: array of TPPLineDirective;
+  { fblite/qb '$DYNAMIC / '$STATIC (D4): the preprocessed line each one takes effect on, in order. Read through
+    PPDynamicMetaAt by the SSA, which marks a "Dim a(5)" under '$DYNAMIC dynamic, as fbc does there. }
+  GPPDynMetaLine: array of Integer;
+  GPPDynMetaOn: array of Boolean;
+
+{ Is an array declared on preprocessed line ALine (1-based) dynamic because a '$DYNAMIC above it says so? }
+function PPDynamicMetaAt(ALine: Integer): Boolean;
+{ ...and the statement form, "Option Dynamic" / "Option Static", which the PARSER meets: same list, kept in order. }
+procedure PPNoteDynamicMeta(ALine: Integer; AOn: Boolean);
 
 { The line number to REPORT for a physical source line, and the module to report it in. Answers the
   physical line and the unchanged module when no #line covers it. }
@@ -193,6 +202,9 @@ function DetectQBLang(const Src: string): Boolean;
 // through before lexing; read through SourceDeclaresNonFbDialect.
 function DetectNonFbLang(const Src: string): Boolean;
 function SourceDeclaresNonFbDialect: Boolean;
+{ The language the source's own #lang "x" / '$lang: "x" names, lower case: 'fb', 'fblite', 'qb',
+  'deprecated', or '' when it names none. Line-anchored like DetectQBLang. }
+function DetectSourceLang(const Src: string): string;
 
 { ⛔⛔ EVERY TABLE BELOW IS PER-PROGRAM STATE HELD IN A UNIT GLOBAL, AND NOTHING USED TO CLEAR IT.
   That was invisible while a process compiled exactly one program, which is every use this compiler has
@@ -223,7 +235,7 @@ function IncludeSearchPathCount: Integer;
 
 implementation
 
-uses SedaiFbReserved,
+uses SedaiFbReserved, SedaiLangMode,
   SedaiLexerTypes,    // cVirtualEOL: the separator a multi-line #macro body is joined with
   SedaiConfig;        // where things are: sedai.conf, the environment, the command line
 
@@ -399,6 +411,62 @@ end;
 function SourceDeclaresNonFbDialect: Boolean;
 begin
   Result := GDeclaredNonFbDialect;
+end;
+
+procedure PPNoteDynamicMeta(ALine: Integer; AOn: Boolean);
+var
+  i, k: Integer;
+begin
+  k := Length(GPPDynMetaLine);
+  while (k > 0) and (GPPDynMetaLine[k - 1] > ALine) do Dec(k);
+  SetLength(GPPDynMetaLine, Length(GPPDynMetaLine) + 1);
+  SetLength(GPPDynMetaOn, Length(GPPDynMetaOn) + 1);
+  for i := High(GPPDynMetaLine) downto k + 1 do
+  begin
+    GPPDynMetaLine[i] := GPPDynMetaLine[i - 1];
+    GPPDynMetaOn[i] := GPPDynMetaOn[i - 1];
+  end;
+  GPPDynMetaLine[k] := ALine;
+  GPPDynMetaOn[k] := AOn;
+end;
+
+function PPDynamicMetaAt(ALine: Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(GPPDynMetaLine) do
+    if GPPDynMetaLine[i] <= ALine then Result := GPPDynMetaOn[i] else Break;
+end;
+
+function DetectSourceLang(const Src: string): string;
+var
+  L: TStringList;
+  i, q1, q2: Integer;
+  T: string;
+begin
+  Result := '';
+  if Pos('LANG', UpperFast(Src)) = 0 then Exit;   // the common case: no directive at all, no line split
+  L := TStringList.Create;
+  try
+    L.Text := Src;
+    for i := 0 to L.Count - 1 do
+    begin
+      T := UpperFast(TrimLeft(L[i]));
+      if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));   // '$lang metacommand
+      T := StringReplace(T, ' ', '', [rfReplaceAll]);
+      if (Copy(T, 1, 5) = '#LANG') or (Copy(T, 1, 6) = '$LANG:') then
+      begin
+        q1 := Pos('"', T);
+        if q1 = 0 then Continue;
+        q2 := Pos('"', Copy(T, q1 + 1, MaxInt));
+        if q2 = 0 then Continue;
+        Exit(LowerCase(Copy(T, q1 + 1, q2 - 1)));
+      end;
+    end;
+  finally
+    L.Free;
+  end;
 end;
 
 function IsIdentChar(C: Char): Boolean; inline;
@@ -5215,6 +5283,10 @@ var
         // the lexer; intercept it here and splice the file, like #include).
         if (Length(Trimmed) >= 9) and (UpperFast(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
         begin
+          // -lang fb: the QuickBASIC metacommand is a SedaiBasic extension there (fbc: error 146).
+          if LangStrictFb then
+            raise EPreprocessorError.Create('the $INCLUDE metacommand is a SedaiBasic extension, refused under ' +
+              '-lang fb (fbc: error 146: Only valid in -lang deprecated or fblite or qb) - use #include');
           q := Pos('''', Copy(Trimmed, 2, MaxInt));   // first quote after the leading apostrophe
           if q > 0 then
           begin
@@ -5294,6 +5366,18 @@ var
             (SameText(Copy(Trimmed, 3, 6), 'STATIC')) or
             (SameText(Copy(Trimmed, 3, 4), 'LANG'))) then
         begin
+          // ...except that in fblite '$DYNAMIC makes every array declared below it dynamic (and '$STATIC
+          // undoes it): the line it takes effect on is recorded for the SSA (PPDynamicMetaAt).
+          if LangStrictFb and not SameText(Copy(Trimmed, 3, 4), 'LANG') then
+            raise EPreprocessorError.Create('the $DYNAMIC and $STATIC metacommands are a SedaiBasic extension, ' +
+              'refused under -lang fb (fbc: error 146: Only valid in -lang deprecated or fblite or qb)');
+          if not SameText(Copy(Trimmed, 3, 4), 'LANG') then
+          begin
+            SetLength(GPPDynMetaLine, Length(GPPDynMetaLine) + 1);
+            SetLength(GPPDynMetaOn, Length(GPPDynMetaOn) + 1);
+            GPPDynMetaLine[High(GPPDynMetaLine)] := Output.Count + 1;
+            GPPDynMetaOn[High(GPPDynMetaOn)] := SameText(Copy(Trimmed, 3, 7), 'DYNAMIC');
+          end;
           Output.Add('');
           Inc(li);
           Continue;
@@ -6073,7 +6157,13 @@ begin
   // through before lexing, so a rule that must only apply to -lang fb can read the answer without
   // seven callers each having to remember to pass it. Set BEFORE the fast path below, so a file with
   // no directives at all clears a previous file's answer instead of inheriting it.
-  GDeclaredNonFbDialect := DetectNonFbLang(Src);
+  // ⭐ ...and the LANGUAGE the program is compiled as (SedaiLangMode, owner 23 Oct 2026): the source's #lang
+  // wins, then -lang on the command line, then MODERN. `-lang fblite` with no directive in the file asks
+  // for the same permissions a #lang "fblite" gives.
+  GLangMode := ResolveLangMode(GLangFlag, DetectSourceLang(Src));
+  GDeclaredNonFbDialect := DetectNonFbLang(Src) or (GLangMode = lmFbLite);
+  SetLength(GPPDynMetaLine, 0);
+  SetLength(GPPDynMetaOn, 0);
   // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
   // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic
   // macros; '$ covers the QuickBASIC '$INCLUDE metacommand; 'scape'/'SCAPE' covers OPTION

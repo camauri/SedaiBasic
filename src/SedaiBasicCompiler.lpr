@@ -51,6 +51,7 @@ uses
   SedaiPreprocessor,
   // Where headers and libraries live (sedai.conf / SEDAI_* / fbc on the PATH) - see LoadConfig below
   SedaiConfig, SedaiMemoryMode,
+  SedaiLangMode,     // -lang fb|fblite: the language a MODERN program is compiled as (D3, D4)
   // --fuse: sb + .basc + trailer, a program that IS an executable (DIVERGENZE 573)
   SedaiFused,
   // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
@@ -122,17 +123,26 @@ procedure PrintHelp;
 begin
   PrintVersion;
   WriteLn;
-  WriteLn('Usage: sbc <source.bas> [output.basc] [options]');
+  WriteLn('Usage: sbc [options] <source.bas> [more.bas ...] [output.basc]');
   WriteLn;
   WriteLn('Arguments:');
-  WriteLn('  source.bas      Input BASIC source file');
+  WriteLn('  source.bas      Input BASIC source file (the main module)');
+  WriteLn('  more.bas        Further modules, compiled into the same program (as fbc a.bas b.bas)');
   WriteLn('  output.basc     Output compiled bytecode file (optional)');
   WriteLn('                  If not specified, saves to current directory');
   WriteLn;
-  WriteLn('Options:');
+  WriteLn('Options (an unknown option is an error):');
   WriteLn('  --help, -h      Show this help message');
   WriteLn('  --verbose, -v   Show compilation progress');
   WriteLn('  --quiet, -q     Suppress all output except errors');
+  WriteLn('  -o FILE         Output file name (as fbc -o)');
+  WriteLn('  --memory=fb|strict  Memory mode carried in the .basc (default fb)');
+  WriteLn('  -lang fb        Adhere to fbc exactly: SedaiBasic''s extensions are refused (also: #lang "fb")');
+  WriteLn('  -lang fblite    fbc''s fblite dialect (also: #lang "fblite")');
+  WriteLn('  --target wasm   Emit a WebAssembly module (.wasm) instead of bytecode');
+  WriteLn('                  An opcode the backend does not cover is REFUSED with a');
+  WriteLn('                  message: in the browser there is no interpreter to fall');
+  WriteLn('                  back into, so it must never emit code that runs and lies.');
   WriteLn('  --fuse          Build a stand-alone EXECUTABLE: the sb runtime with the');
   WriteLn('                  program inside (default name: the source without extension).');
   WriteLn('                  C libraries that look next to "the executable" find the');
@@ -144,14 +154,10 @@ begin
   WriteLn('                  directory, as sb --jit / sb --home would');
   WriteLn;
   WriteLn('Examples:');
-  WriteLn('  --target wasm   Emit a WebAssembly module (.wasm) instead of bytecode');
-  WriteLn('                  An opcode the backend does not cover is REFUSED with a');
-  WriteLn('                  message: in the browser there is no interpreter to fall');
-  WriteLn('                  back into, so it must never emit code that runs and lies.');
-  WriteLn;
   WriteLn('  sbc program.bas                 Compile to ./program.basc');
   WriteLn('  sbc program.bas --target wasm   Compile to ./program.wasm');
   WriteLn('  sbc program.bas out.basc        Compile to out.basc');
+  WriteLn('  sbc program.bas -o out.basc     The same, spelt as fbc spells it');
   WriteLn('  sbc program.bas -v              Compile with verbose output');
   WriteLn('  sbc --fuse program.bas          Build ./program, a stand-alone executable');
 end;
@@ -693,7 +699,12 @@ var
   FuseRuntime, FuseBasc, FuseTmp, Head: string;
   FuseSkipNext: Boolean;
   FuseSecond: string;
+  BadOption: string;    // the first option sbc does not know
+  DashOutput: string;   // -o FILE
   HeadStream: TFileStream;
+  FuseSerializer: TBytecodeSerializer;
+  FuseProg: TBytecodeProgram;
+  FuseIsModern: Boolean;
 
 begin
     // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
@@ -723,6 +734,8 @@ begin
     FuseRuntime := '';
     FuseSkipNext := False;
     FuseSecond := '';
+    BadOption := '';
+    DashOutput := '';
 
     for i := 1 to ParamCount do
     begin
@@ -748,10 +761,23 @@ begin
         OptQuiet := True
       else if Pos(MEMORY_MODE_FLAG, LowerCase(Param)) = 1 then
         GMemoryModeFlag := Copy(Param, Length(MEMORY_MODE_FLAG) + 1, MaxInt)   // fb | strict (SedaiMemoryMode)
+      else if (Param = '-lang') and (i < ParamCount) then
+      begin
+        GLangFlag := ParamStr(i + 1);   // fb | fblite (SedaiLangMode); checked after the loop
+        FuseSkipNext := True;
+      end
       else if (Param = '--target=wasm') or (Param = '--target-wasm') then
         OptTargetWasm := True
+      else if (Param = '-o') and (i < ParamCount) then
+      begin
+        // fbc's spelling of the output name. It used to be dropped, and worked only because the word after
+        // it then landed in the positional slot.
+        DashOutput := ParamStr(i + 1);   // applied after the positionals are sorted out (see --fuse below)
+        FuseSkipNext := True;
+      end
       else if (Param = '--target') and (i < ParamCount) then
       begin
+        FuseSkipNext := True;   // the value is consumed here: "bytecode" used to become the output name
         if SameText(ParamStr(i + 1), 'wasm') then OptTargetWasm := True
         else if not SameText(ParamStr(i + 1), 'bytecode') then
         begin
@@ -760,8 +786,6 @@ begin
           Exit;
         end;
       end
-      else if SameText(Param, 'wasm') and (i > 1) and (ParamStr(i - 1) = '--target') then
-        // consumed by the branch above
       else if (Pos('-', Param) <> 1) then
       begin
         // ⭐ A POSITIONAL ENDING IN .bas IS A MODULE, and the first of them is the MAIN module
@@ -778,7 +802,22 @@ begin
           OutputFile := Param
         else if FuseSecond = '' then
           FuseSecond := Param;   // "sbc --fuse prog.basc out": the first is the INPUT, this is the output
-      end;
+      end
+      else if BadOption = '' then
+        BadOption := Param;   // ⛔ refused below, as fbc refuses it: it used to be dropped in silence
+    end;
+
+    if BadOption <> '' then
+    begin
+      WriteLn(ErrOutput, 'ERROR: unknown option "', BadOption, '" (sbc --help lists the options)');
+      ExitCode := 1;
+      Exit;
+    end;
+    if (GLangFlag <> '') and not CheckLangFlag(GLangFlag, Head) then
+    begin
+      WriteLn(ErrOutput, 'ERROR: ', Head);
+      ExitCode := 1;
+      Exit;
     end;
 
     // ⭐ --fuse from an existing .basc: the positional that would be the output name is the INPUT.
@@ -788,6 +827,7 @@ begin
       FuseBasc := OutputFile;
       OutputFile := FuseSecond;
     end;
+    if DashOutput <> '' then OutputFile := DashOutput;
 
     if (FuseSecond <> '') and (FuseBasc = '') then
     begin
@@ -897,6 +937,23 @@ begin
         FuseBasc := FuseTmp;
       end;
       try
+        // ⛔ A fused executable carries sb, and sb runs MODERN programs only (owner, 23 Oct 2026): a CLASSIC
+        // program would be refused the moment it started. Said here, at fusion time, instead.
+        FuseSerializer := TBytecodeSerializer.Create;
+        try
+          FuseProg := FuseSerializer.LoadFromFile(FuseBasc);
+          FuseIsModern := FuseProg.ModernMode;
+          FuseProg.Free;
+        finally
+          FuseSerializer.Free;
+        end;
+        if not FuseIsModern then
+        begin
+          WriteLn(ErrOutput, 'ERROR: --fuse makes an executable that carries sb, which runs MODERN programs only: "',
+                  ExtractFileName(FuseBasc), '" is CLASSIC - run it with sbv');
+          ExitCode := 1;
+          Exit;
+        end;
         WriteFusedExecutable(FuseRuntime, FuseBasc, OutputFile, FuseFlags);
       finally
         if FuseTmp <> '' then DeleteFile(FuseTmp);

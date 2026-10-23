@@ -261,7 +261,15 @@ begin
       else if Pos(MEMORY_MODE_FLAG, ParamLower) = 1 then
         GMemoryModeFlag := Copy(ParamLower, Length(MEMORY_MODE_FLAG) + 1, MaxInt)
       else if ParamLower = '--no-dir-listing' then
-        AllowDirListing := False;
+        AllowDirListing := False
+      else if not ApplyDebugFlag(ParamLower) then
+      begin
+        // ⛔ Refused, as fbc refuses an unknown option: it used to be dropped, so "--root DIR" (for
+        // --basedir) said only that --basedir was missing, and "--prot 9000" served on 8080.
+        WriteLn(ErrOutput, 'ERROR: unknown option "', Param, '" (sbw --help lists the options)');
+        ExitCode := 1;
+        Exit;
+      end;
 
       Inc(i);
     end;

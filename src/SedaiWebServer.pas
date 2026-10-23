@@ -410,6 +410,10 @@ begin
     // Access Violation. Auto-selection mirrors sb (SedaiBasicVM.lpr) and sbc (SedaiBasicCompiler.lpr)
     // exactly: line numbers => CLASSIC, otherwise FreeBASIC/MODERN.
     ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+    // ⛔ sbw serves MODERN programs only (owner, 23 Oct 2026): CLASSIC lives in sbv. The refusal reaches the
+    // client as the 500 page, with this reason, through the handler's exception path.
+    if not ProgIsModern then
+      raise Exception.CreateFmt(WEB_MODERN_ONLY_REFUSAL, [ExtractFileName(ScriptPath)]);
 
     // Text -> text, BEFORE lexing and before the dialect is used, exactly as sb and sbc do it.
     // ⚠️ -lang qb is detected on the RAW text: the preprocessor strips both directive forms.
