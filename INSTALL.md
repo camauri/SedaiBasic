@@ -1,7 +1,16 @@
 # Building SedaiBasic
 
-There are no binary releases yet, so building is the only way in. This assumes you have already
-cloned the repository; everything below happens inside it.
+**Prebuilt binaries** for Linux x86_64 and Windows x64 are on the
+[Releases page](https://github.com/camauri/SedaiBasic/releases). On Windows unzip and run: the SDL2 DLLs
+are in the archive. On Linux run `sh install-deps.sh` from the unpacked folder first: it installs SDL2,
+SDL2_ttf and libX11 with the distribution's package manager (apt, dnf, yum, zypper, pacman, xbps, emerge,
+eopkg). The Linux binaries need glibc 2.34 or newer, which leaves out musl systems such as Alpine. `sb`,
+`sbc`, `sbd` and `sbw` run without SDL2: `sb` then draws off screen. `sbv` needs it to start. FreeBASIC
+headers are not included: `sb` uses those of a FreeBASIC installation whose `fbc` is on the PATH, or the
+folders named by `SEDAI_INCLUDE`.
+
+The rest of this file is about building from source. It assumes you have already cloned the repository;
+everything below happens inside it.
 
 **There are two ways to do it.**
 

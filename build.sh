@@ -571,11 +571,41 @@ build_target() {
         opts+=("-dWITH_SEDAI_AUDIO")
     fi
 
+    # ⛔ `sb --window` ON LINUX LOADS SDL2 AT RUN TIME, AND THE LINK MUST NOT SAY OTHERWISE. Every SDL call
+    # goes through SedaiSDL2Dyn (LoadLibrary), but the SDL2 / SDL2_ttf / X11 Pascal bindings still put
+    # their libraries in the link, so the binary carried NEEDED libSDL2 / libX11 / libSDL2_ttf: it would not
+    # START on a machine without SDL2, and a program that loads its own SDL through its .bi found ours
+    # already mapped (DIVERGENZE 585). `--as-needed` does not cure it: the bindings' inline functions name
+    # SDL symbols in sdl2.o, and ld decides before --gc-sections drops them.
+    # ⇒ FPC writes the link script (-s), the three libraries come out of it, and ld links. If anything still
+    # calls SDL statically the link FAILS naming the symbol - checked by putting back a binding that lacked
+    # SDL_SetWindowFullscreen: "undefined reference to `SDL_SetWindowFullscreen'".
+    local relink_window=false
+    if [[ "$WINDOW" == "true" && "$output_name" == sb* && "$target_os" == "linux" ]]; then
+        relink_window=true
+        opts+=("-s")
+    fi
+
     echo -e "${CYAN}Building $output_name...${NC}"
     echo -e "${GRAY}  units: lib/$lib_sub_dir${NC}"
     echo -e "${GRAY}  $fpc ${opts[*]} $src_path${NC}"
 
     if "$fpc" "${opts[@]}" "$src_path"; then
+        if [[ "$relink_window" == "true" ]]; then
+            local link_dir="bin/$platform_dir" link_res
+            link_res="$(ls -t "$link_dir"/link*.res 2>/dev/null | head -n1)"
+            if [[ ! -f "$link_dir/ppas.sh" || -z "$link_res" ]]; then
+                echo -e "${RED}  FAILED: fpc -s wrote no link script in $link_dir${NC}"
+                return 1
+            fi
+            sed -i -E '/^-l(SDL2|SDL2_ttf|X11)$/d' "$link_res"
+            if ! sh "$link_dir/ppas.sh"; then
+                echo -e "${RED}  FAILED: a unit still calls SDL statically (the symbol is named above)${NC}"
+                return 1
+            fi
+            rm -f "$link_dir/ppas.sh" "$link_res"
+            echo -e "${GRAY}    linked without libSDL2/libX11/libSDL2_ttf: SDL2 is loaded when a program opens graphics${NC}"
+        fi
         echo -e "${GREEN}  OK: bin/$platform_dir/$output_name${NC}"
         verify_instruction_set "bin/$platform_dir/$output_name" "$is_debug" "$target_cpu" "$target_os"
         return 0

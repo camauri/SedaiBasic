@@ -91,6 +91,11 @@ begin
   GKeyQHead := (GKeyQHead + 1) mod Length(GKeyQ);
 end;
 
+function WindowKeyPending: Boolean;
+begin
+  Result := GKeyQHead <> GKeyQTail;
+end;
+
 procedure PushKey(C: Char);
 var NextTail: Integer;
 begin
@@ -202,10 +207,10 @@ end;
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
 begin
   inherited Create;
-  // Runtime SDL2 binding (see SedaiSDL2Dyn): --window explicitly asks for a window, so a
-  // missing SDL2 library is a hard error here, not a polite degrade.
+  // Runtime SDL2 binding (see SedaiSDL2Dyn). The caller decides what a missing library means: a hard
+  // error under an explicit --window, a note and a headless run when the window was opened on its own.
   if not EnsureSDL2Bound then
-    raise Exception.Create('--window requires ' + SDL_LibName + ', which was not found');
+    raise Exception.Create('the graphics window requires the SDL2 library, which was not found');
   FBackend := ABackend;
   FClosed := False;
   FTexW := 0; FTexH := 0;
@@ -214,10 +219,17 @@ begin
   // (e.g. divide-by-zero) and expect them masked — otherwise SDL_CreateRenderer raises EZeroDivide.
   // Safe here: the VM detects BASIC division-by-zero with explicit value checks, not the FPU trap.
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  // ⛔ A failure here used to be SILENT: the program ran, drew, and no window ever appeared. SDL's X11 driver
+  // loads libXext and friends at run time, and a minimal Rocky / Fedora / openSUSE has libX11 without them
+  // (measured in containers): video init fails, CreateWindow answers nil, and nothing said so. SDL's own
+  // message is the diagnosis, so it is passed on.
   if SDL_WasInit(SDL_INIT_VIDEO) = 0 then
-    SDL_InitSubSystem(SDL_INIT_VIDEO);
+    if SDL_InitSubSystem(SDL_INIT_VIDEO) < 0 then
+      raise Exception.Create('SDL could not start its video: ' + string(SDL_GetError()));
   FWindow := SDL_CreateWindow(PChar(Title), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               640, 480, SDL_WINDOW_SHOWN);
+  if not Assigned(FWindow) then
+    raise Exception.Create('SDL could not open a window: ' + string(SDL_GetError()));
   if Assigned(FWindow) then
     FRenderer := SDL_CreateRenderer(FWindow, -1, SDL_RENDERER_ACCELERATED)
   else
@@ -225,6 +237,7 @@ begin
   GActiveWindow := FWindow;
   GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
   GWindowCharProvider := @WindowNextChar;  // ...and INKEY reads the keys typed into the window
+  GWindowKeyPendingProvider := @WindowKeyPending;  // ...and a bare SLEEP wakes on one
   SDL_StartTextInput;                      // without this SDL sends no SDL_TEXTINPUT at all
   GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
   SedaiInstallMouseWheelWatch;           // ...and its wheel field, which only an event can fill
@@ -238,6 +251,7 @@ var
 begin
   GKeyDownProvider := nil;
   GWindowCharProvider := nil;
+  GWindowKeyPendingProvider := nil;
   GGetMouseProvider := nil;
   SedaiRemoveMouseWheelWatch;
   GSetMouseProvider := nil;

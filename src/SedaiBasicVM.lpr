@@ -590,6 +590,10 @@ begin
   WriteLn('                        Default is deterministic: English names, ISO-ish dates, same everywhere.');
   WriteLn('                        Also settable with SB_DATE_LOCALE=1; the flag wins over it.');
   WriteLn('  --stats             Show execution statistics');
+  {$IFDEF WITH_WINDOW}
+  WriteLn('  --window            Open the graphics window at launch (by default it opens at the first SCREENRES/SCREEN)');
+  WriteLn('  --headless          Never open a graphics window: draw off screen only (also: SB_HEADLESS=1)');
+  {$ENDIF}
   WriteLn('  --true-value=N      Set TRUE value for comparisons (-1 or 1, default: -1)');
   WriteLn('                        -1 = Commodore BASIC style (default)');
   WriteLn('                         1 = Modern BASIC style');
@@ -651,6 +655,7 @@ end;
 
 var
   OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
+  OptHeadless: Boolean = False; // sb --headless: never open a window, even on a build that has one
   GTermCtrl: TTerminalController = nil;   // concrete terminal output device (for graphics attach under --window)
   GProgramArgs: array of string;   // COMMAND$: everything on the command line after the script file
   GExtraModules: TStringList = nil; // --module: the non-main modules of a multi-module program (162)
@@ -660,8 +665,68 @@ var
   // directory - which is what a C library asking the kernel for "the executable" now gets too.
   GFusedPayload: TMemoryStream = nil;
 {$IFDEF WITH_WINDOW}
+type
+  // ⭐ THE WINDOW OPENS WHEN THE PROGRAM ASKS FOR GRAPHICS, as fbc's does (owner, 23 Oct 2026). A build
+  // with the presenter used to need --window on the command line, so a FreeBASIC program run the normal
+  // way drew into a framebuffer nobody could see. Now the first SCREENRES / SCREEN that sets a graphics
+  // mode opens it; a text program never gets one. Only one thing is done at launch - installing this
+  // callback - so a text program pays nothing: the poll callback, which keeps the C hot loop out, is
+  // wired only once the window exists.
+  TAutoWindow = class
+    VM: TBytecodeVM;
+    SW: TSoftwareGraphicsBackend;
+    function Open: Boolean;
+  end;
+
 var
   GPresenter: TWindowPresenter = nil;
+  GAutoWindow: TAutoWindow = nil;
+
+// Wire an existing presenter to the VM: shared by --window (at launch) and the automatic window.
+procedure WirePresenter(AVM: TBytecodeVM);
+begin
+  // ⛔ THE SPLIT: the POLL drains events (cheap, on an instruction counter), the PRESENT shows the
+  // picture (expensive, at a frame boundary). Wiring Pump to the poll made the instruction counter
+  // decide the frame rate - 158 presents per frame on a compute-heavy program.
+  AVM.EventPollCallback := @GPresenter.PollEvents;
+  AVM.PresentCallback := @GPresenter.Pump;
+  // ...but the dispatch loop only reaches that callback at blocking points, so a graphics
+  // program with no SLEEP in its loop would never present. Ask the VM for a wall-clock cadence
+  // from the graphics opcodes as well. 16 ms = about 60 presents a second. This property is
+  // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
+  // from interfering with SedaiVision's own rendering.
+  AVM.PresentCadenceMs := 16;
+  if GetEnvironmentVariable('SB_POLL_EVERY') <> '' then
+    AVM.EventPollInterval := StrToIntDef(GetEnvironmentVariable('SB_POLL_EVERY'), 10000);
+end;
+
+function TAutoWindow.Open: Boolean;
+begin
+  Result := False;
+  VM.ScreenModeCallback := nil;   // asked once: a later SCREENRES resizes the window that exists
+  try
+    GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
+  except
+    on E: Exception do
+    begin
+      // Not an error: the program asked for graphics, not for a window, and it still gets the graphics.
+      WriteLn(ErrOutput, '?no graphics window (', E.Message, '): drawing off screen');
+      Exit;
+    end;
+  end;
+  WirePresenter(VM);
+end;
+
+// Is there a screen to open a window on? On Unix the answer is in the environment; a session with
+// neither variable (ssh, a service, a CI runner) is headless, and opening a window there would fail.
+function DisplayAvailable: Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := (GetEnvironmentVariable('DISPLAY') <> '') or (GetEnvironmentVariable('WAYLAND_DISPLAY') <> '');
+  {$ELSE}
+  Result := True;
+  {$ENDIF}
+end;
 {$ENDIF}
 
 // Graphics setup shared by both run paths: a window presenter (sb --window, WITH_WINDOW build) or the
@@ -683,19 +748,19 @@ begin
     // ...and the backend itself, so PRINT inside a FreeBASIC graphics mode lands on that same surface.
     if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
-    // ⛔ THE SPLIT: the POLL drains events (cheap, on an instruction counter), the PRESENT shows the
-    // picture (expensive, at a frame boundary). Wiring Pump to the poll made the instruction counter
-    // decide the frame rate - 158 presents per frame on a compute-heavy program.
-    AVM.EventPollCallback := @GPresenter.PollEvents;
-    AVM.PresentCallback := @GPresenter.Pump;
-    // ...but the dispatch loop only reaches that callback at blocking points, so a graphics
-    // program with no SLEEP in its loop would never present. Ask the VM for a wall-clock cadence
-    // from the graphics opcodes as well. 16 ms = about 60 presents a second. This property is
-    // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
-    // from interfering with SedaiVision's own rendering.
-    AVM.PresentCadenceMs := 16;
-    if GetEnvironmentVariable('SB_POLL_EVERY') <> '' then
-      AVM.EventPollInterval := StrToIntDef(GetEnvironmentVariable('SB_POLL_EVERY'), 10000);
+    WirePresenter(AVM);
+    Exit;
+  end;
+  if not OptHeadless and (GetEnvironmentVariable('SB_HEADLESS') <> '1') and DisplayAvailable then
+  begin
+    // The headless wiring, with a backend this unit holds so the window can mirror it later.
+    SW := TSoftwareGraphicsBackend.Create;
+    AVM.SetGraphicsBackend(SW, SW);
+    if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
+    GAutoWindow := TAutoWindow.Create;
+    GAutoWindow.VM := AVM;
+    GAutoWindow.SW := SW;
+    AVM.ScreenModeCallback := @GAutoWindow.Open;
     Exit;
   end;
   {$ENDIF}
@@ -720,6 +785,11 @@ begin
     // window visible after drawing, the program waits (SLEEP / a GETKEY loop) — those keep the event
     // pump alive and presenting. We do NOT block here, so `END` actually ends the program.
     FreeAndNil(GPresenter);
+  end;
+  if Assigned(GAutoWindow) then
+  begin
+    AVM.ScreenModeCallback := nil;
+    FreeAndNil(GAutoWindow);
   end;
   {$ENDIF}
 end;
@@ -2897,6 +2967,8 @@ begin
       else if (Param = '--jit-profile') or (Param = '--jitprofile') then
         OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run
       {$ENDIF}
+      else if Param = '--headless' then
+        OptHeadless := True   // accepted on every build: a build with no window is headless already
       else if Param = '--window' then
       begin
         OptWindow := True;   // present graphics in an SDL2 window

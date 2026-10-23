@@ -685,6 +685,10 @@ type
     // callback meant the instruction counter decided how often the screen was shown - 158 times per
     // frame on a compute-heavy program, at about 0.7 ms each.
     FPresentCallback: TEventPollCallback;
+    // Called after every SCREENRES / SCREEN that sets a graphics mode (nil = nobody asked). It is how a
+    // windowed sb opens its window when the program first asks for graphics, as fbc does, instead of at
+    // launch: a text program never gets a window, and pays nothing for the possibility.
+    FScreenModeCallback: TEventPollCallback;
     // Present cadence for a windowed run (0 = off, which is every target except `sb --window`)
     FPresentCadenceMs: LongWord;
     FLastPresentTick: QWord;
@@ -1203,6 +1207,7 @@ type
     property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
     property PresentCallback: TEventPollCallback read FPresentCallback write FPresentCallback;
+    property ScreenModeCallback: TEventPollCallback read FScreenModeCallback write FScreenModeCallback;
     // Minimum milliseconds between presents driven from the graphics opcodes. 0 disables the
     // mechanism entirely, which is the default and what every target other than `sb --window`
     // leaves it at, so nothing else changes behaviour or pays more than one integer compare.
@@ -2107,6 +2112,7 @@ begin
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   FPresentCallback := nil;
+  FScreenModeCallback := nil;
   // Initialize error state for EL, ER, ERR$
   FCtx.LastErrorLine := 0;
   FCtx.LastErrorCode := 0;
@@ -13424,6 +13430,23 @@ begin
           TcSleep(SleepMs, SleepWake);
           SleepMs := 0;
         end;
+        // ⭐ A WINDOW IS OPEN: SLEEP is fbc's there too. A bare SLEEP waits for a key typed into the window
+        // (and leaves it for INKEY), 100 ms or more wakes on one, and the picture is shown first - the
+        // idiom "ScreenRes ... : draw : Sleep" is how every FreeBASIC example keeps its result on screen,
+        // and with the 1 ms below the window opened and closed before anyone could see it.
+        if (SleepMs <> 0) and Assigned(FEventPollCallback) and Assigned(GWindowKeyPendingProvider) then
+        begin
+          if PresentNow then Ctx.Running := False;
+          NowTick := GetTickCount64;      // when the wait began
+          while Ctx.Running do
+          begin
+            if (SleepMs > 0) and (GetTickCount64 - NowTick >= QWord(SleepMs)) then Break;
+            if SleepWake and ((SleepMs < 0) or (SleepMs >= 100)) and GWindowKeyPendingProvider() then Break;
+            if FEventPollCallback() then begin Ctx.Running := False; Break; end;
+            Sleep(10);
+          end;
+          SleepMs := 0;
+        end;
         if SleepMs = -1 then SleepMs := 1;   // ...and with no terminal there is no key to wait for
         if SleepMs < 0 then SleepMs := 0;
         if SleepMs > 65535000 then SleepMs := 65535000;
@@ -21672,6 +21695,7 @@ begin
   FGfxViewActive := False;                      // a new mode has no viewport, as in FreeBASIC
   FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;
   RecomputeGfxWindow;                           // the surface changed size under any live WINDOW
+  if Assigned(FScreenModeCallback) then FScreenModeCallback();
 end;
 
 function TBytecodeVM.DrawSurface: Integer;

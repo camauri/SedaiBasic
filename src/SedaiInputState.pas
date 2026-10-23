@@ -42,10 +42,14 @@ type
   // was collecting them. A demo whose keys are all documented and none of them work is what that
   // looked like from outside.
   TWindowCharFn = function: Char;
+  // Whether a key typed into the window is waiting, WITHOUT taking it: a bare SLEEP wakes on a key and
+  // leaves it for INKEY to read, as fbc's does.
+  TWindowKeyPendingFn = function: Boolean;
 
 var
   GKeyDownProvider: TKeyDownFn = nil;
   GWindowCharProvider: TWindowCharFn = nil;
+  GWindowKeyPendingProvider: TWindowKeyPendingFn = nil;
   GGetMouseProvider: TGetMouseFn = nil;
   GSetMouseProvider: TSetMouseFn = nil;
   GGetJoystickProvider: TGetJoystickFn = nil;

@@ -310,10 +310,11 @@ Binaries are written to `bin/<cpu>-<os>/`, and carry the `.exe` extension on Win
 same target is `bin/x86_64-win64/sb.exe` there and `bin/x86_64-linux/sb` here. Compiled units live
 alongside in `lib/<cpu>-<os>/`.
 
-`build.ps1 -Target sb -Window` (`./build.sh sb --window`) adds an opt-in SDL2 window to the
-command-line VM, so FreeBASIC/C128 graphics are visible without `sbv`. Note that a later build of
-`sb` **without** that switch overwrites it with the headless build, where `--window` is accepted and
-silently ignored.
+`build.ps1 -Target sb -Window` (`./build.sh sb --window`) gives the command-line VM a graphics window,
+as the release binaries have. It opens at the program's first `SCREENRES` / `SCREEN`, as with `fbc`,
+and loads SDL2 only then: a text program never gets a window, and `sb` starts on a machine without SDL2.
+`--headless` (or `SB_HEADLESS=1`) keeps it closed, and a session with no display never opens it. Note
+that a later build of `sb` **without** that switch overwrites it with the headless build.
 
 #### Windows (PowerShell)
 
@@ -414,7 +415,8 @@ Options:
   --true-value=N      TRUE for comparisons: -1 (Commodore, default) or 1
   --date-locale       Month/day names and date parsing follow the system locale, as fbc does
                       (the default is deterministic: English names, the same on every machine)
-  --window            Show FreeBASIC/C128 graphics in an SDL2 window (needs a -Window build)
+  --window            Open the graphics window at launch (it opens by itself at the first SCREENRES)
+  --headless          Never open a graphics window: draw off screen only (also: SB_HEADLESS=1)
 ```
 
 A program can also be given arguments, which reach it through `COMMAND$`:

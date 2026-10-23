@@ -78,6 +78,7 @@ var
   SDL_DestroyWindow: procedure(window: PSDL_Window); cdecl;
   SDL_GetWindowSize: procedure(window: PSDL_Window; w: pcint; h: pcint); cdecl;
   SDL_SetWindowSize: procedure(window: PSDL_Window; w: cint; h: cint); cdecl;
+  SDL_SetWindowFullscreen: function(window: PSDL_Window; flags: TSDL_WindowFlags): cint; cdecl;
   SDL_CreateRenderer: function(window: PSDL_Window; index: cint32; flags: cuint32): PSDL_Renderer; cdecl;
   SDL_DestroyRenderer: procedure(renderer: PSDL_Renderer); cdecl;
   SDL_GetRendererOutputSize: function(renderer: PSDL_Renderer; w: pcint; h: pcint): cint32; cdecl;
@@ -89,6 +90,7 @@ var
   SDL_RenderPresent: procedure(renderer: PSDL_Renderer); cdecl;
   SDL_RenderGetClipRect: procedure(renderer: PSDL_Renderer; rect: PSDL_Rect); cdecl;
   SDL_RenderSetClipRect: function(renderer: PSDL_Renderer; rect: PSDL_Rect): cint32; cdecl;
+  SDL_RenderSetLogicalSize: function(renderer: PSDL_Renderer; w: cint32; h: cint32): cint32; cdecl;
   SDL_RenderIsClipEnabled: function(renderer: PSDL_Renderer): TSDL_Bool; cdecl;
   SDL_SetRenderDrawBlendMode: function(renderer: PSDL_Renderer; blendMode: TSDL_BlendMode): cint32; cdecl;
   SDL_SetRenderDrawColor: function(renderer: PSDL_Renderer; r: cuint8; g: cuint8; b: cuint8; a: cuint8): cint32; cdecl;
@@ -180,12 +182,33 @@ var
   GTTF: TLibHandle = NilHandle;
   GTried: Boolean = False;
 
+// ⛔ ON LINUX THE BINDING'S NAME IS THE DEVELOPMENT ONE. SDL_LibName / TTF_LibName say 'libSDL2.so', which only
+// the -dev / -devel package installs; a machine with the runtime package alone (what an end user has, and what
+// install-deps.sh installs) has libSDL2-2.0.so.0 and nothing else - measured in a Debian 13 container: sb drew
+// off screen with "requires libSDL2.so, which was not found". So the SONAME is tried first, and the binding's
+// name stays as the fallback (a build tree, macOS, Windows).
+function LoadFirst(const Names: array of string): TLibHandle;
+var
+  i: Integer;
+begin
+  Result := NilHandle;
+  for i := Low(Names) to High(Names) do
+  begin
+    Result := LoadLibrary(Names[i]);
+    if Result <> NilHandle then Exit;
+  end;
+end;
+
 function EnsureSDL2Bound: Boolean;
 begin
   if GTried then Exit(GSDL2 <> NilHandle);
   GTried := True;
 
+  {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+  GSDL2 := LoadFirst(['libSDL2-2.0.so.0', SDL_LibName]);
+  {$ELSE}
   GSDL2 := LoadLibrary(SDL_LibName);
+  {$ENDIF}
   if GSDL2 = NilHandle then Exit(False);
 
   Pointer(SDL_Init) := GetProcedureAddress(GSDL2, 'SDL_Init');
@@ -200,6 +223,7 @@ begin
   Pointer(SDL_DestroyWindow) := GetProcedureAddress(GSDL2, 'SDL_DestroyWindow');
   Pointer(SDL_GetWindowSize) := GetProcedureAddress(GSDL2, 'SDL_GetWindowSize');
   Pointer(SDL_SetWindowSize) := GetProcedureAddress(GSDL2, 'SDL_SetWindowSize');
+  Pointer(SDL_SetWindowFullscreen) := GetProcedureAddress(GSDL2, 'SDL_SetWindowFullscreen');
   Pointer(SDL_CreateRenderer) := GetProcedureAddress(GSDL2, 'SDL_CreateRenderer');
   Pointer(SDL_DestroyRenderer) := GetProcedureAddress(GSDL2, 'SDL_DestroyRenderer');
   Pointer(SDL_GetRendererOutputSize) := GetProcedureAddress(GSDL2, 'SDL_GetRendererOutputSize');
@@ -211,6 +235,7 @@ begin
   Pointer(SDL_RenderPresent) := GetProcedureAddress(GSDL2, 'SDL_RenderPresent');
   Pointer(SDL_RenderGetClipRect) := GetProcedureAddress(GSDL2, 'SDL_RenderGetClipRect');
   Pointer(SDL_RenderSetClipRect) := GetProcedureAddress(GSDL2, 'SDL_RenderSetClipRect');
+  Pointer(SDL_RenderSetLogicalSize) := GetProcedureAddress(GSDL2, 'SDL_RenderSetLogicalSize');
   Pointer(SDL_RenderIsClipEnabled) := GetProcedureAddress(GSDL2, 'SDL_RenderIsClipEnabled');
   Pointer(SDL_SetRenderDrawBlendMode) := GetProcedureAddress(GSDL2, 'SDL_SetRenderDrawBlendMode');
   Pointer(SDL_SetRenderDrawColor) := GetProcedureAddress(GSDL2, 'SDL_SetRenderDrawColor');
@@ -251,7 +276,11 @@ begin
   Pointer(SDL_JoystickClose) := GetProcedureAddress(GSDL2, 'SDL_JoystickClose');
 
   // TTF is optional: the console degrades to its non-TTF paths when absent.
+  {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+  GTTF := LoadFirst(['libSDL2_ttf-2.0.so.0', TTF_LibName]);
+  {$ELSE}
   GTTF := LoadLibrary(TTF_LibName);
+  {$ENDIF}
   if GTTF <> NilHandle then
   begin
     Pointer(TTF_Init) := GetProcedureAddress(GTTF, 'TTF_Init');
