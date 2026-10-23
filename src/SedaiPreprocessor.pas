@@ -1007,16 +1007,29 @@ function LineContinuationCut(const S: string): Integer;
 // with it.
 // A '_' inside a string literal, or after a "'" comment, is text. An identifier may hold '_' at
 // either end ("MAX_", "__FB_ARG__"), so the token has to stand alone on both sides.
+// ⛔ ...and a BLOCK comment "/' ... '/" is skipped whole: its apostrophe is not a line comment. Read as one, the
+// line "{  /' b(0) '/ _" did not continue, the join stopped half way and left a '_' over a blank line - which
+// broke the statement in fbc's structs/field-init (23 Oct 2026).
 var
-  i: Integer;
+  i, Depth: Integer;
   InStr: Boolean;
 begin
   Result := 0;
   InStr := False;
-  for i := 1 to Length(S) do
+  Depth := 0;
+  i := 0;
+  while i < Length(S) do
   begin
+    Inc(i);
+    if Depth > 0 then
+    begin
+      if (S[i] = '''') and (i < Length(S)) and (S[i + 1] = '/') then begin Dec(Depth); Inc(i); end
+      else if (S[i] = '/') and (i < Length(S)) and (S[i + 1] = '''') then begin Inc(Depth); Inc(i); end;
+      Continue;
+    end;
     if S[i] = '"' then InStr := not InStr
     else if InStr then Continue
+    else if (S[i] = '/') and (i < Length(S)) and (S[i + 1] = '''') then begin Inc(Depth); Inc(i); end
     else if S[i] = '''' then Break                     // a line comment: the rest is not code
     else if (S[i] = '_') and
             ((i = 1) or not IsIdentChar(S[i - 1])) and

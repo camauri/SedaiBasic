@@ -53,6 +53,9 @@ begin
     end;
     // ...as the runner's gate does: line numbers under fblite / qb / deprecated are labels, not CLASSIC.
     IsModern := (not TSedaiRunner.SourceHasLineNumbers(Text)) or SourceDeclaresNonFbDialect;
+    // DIALECT_DIAG=1: the preprocessed text the answer was read from, on stderr - a dialect read wrong is
+    // almost always a line the PREPROCESSOR produced, which no source file shows.
+    if GetEnvironmentVariable('DIALECT_DIAG') = '1' then WriteLn(ErrOutput, Text);
   end;
   if IsModern then WriteLn('modern') else WriteLn('classic');
 end;

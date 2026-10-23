@@ -364,7 +364,7 @@ begin
       begin Inc(Depth); Inc(i, 2); Continue; end;
       if (Ch = '''') and (i < n) and (Source[i + 1] = '/') then
       begin Dec(Depth); Inc(i, 2); Continue; end;
-      if Ch = #10 then                                  // a comment line starts no statement
+      if (Ch = #10) and (LastSig <> #0) then           // a comment line starts no statement
       begin
         AtLineStart := LastSig <> '_';
         LastSig := #0;
@@ -376,8 +376,14 @@ begin
     if Ch = #10 then
     begin
       // A line ending in '_' continues into the next one, which therefore begins no statement.
-      AtLineStart := LastSig <> '_';
-      LastSig := #0;
+      // ⛔ ...and an EMPTY line does not end the continuation: the preprocessor joins a continued line and leaves a
+      // blank in its place to keep the line numbers, so "( /' pad '/ _", a blank, then "111, { ..." is ONE
+      // statement - read as two, the "111" made fbc's structs/field-init CLASSIC (23 Oct 2026).
+      if LastSig <> #0 then
+      begin
+        AtLineStart := LastSig <> '_';
+        LastSig := #0;
+      end;
       Inc(i);
       Continue;
     end;

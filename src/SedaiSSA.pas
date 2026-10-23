@@ -2735,7 +2735,10 @@ begin
   // of it must create the MODULE-level one and never a scope-frame binding.
   if ModuleOnly then
     targetIdx := -1
-  else if IsExplicitDecl and (Length(FScopeStack) > 0) then
+  // ⭐ fblite / qb have no BLOCK scope (fbc: a Dim inside an If, and the counter of "For i As Integer", are seen by
+  // the whole procedure - "Only valid in -lang fb" is what Scope answers there). An explicit DIM therefore binds
+  // where an implicit variable would: the nearest proc-root, else the module (D4).
+  else if IsExplicitDecl and (Length(FScopeStack) > 0) and not SourceDeclaresNonFbDialect then
     targetIdx := High(FScopeStack)
   else
   begin
@@ -22319,7 +22322,10 @@ begin
     pending. That is dynamic state deciding a keyword's semantics.
     ⚠️ CLASSIC keeps it, and must: Commodore BASIC is built on it (38 programs in
     this tree). The refusal is MODERN-only for that reason. }
-  if FModernMode then
+  // ...except under fblite / qb "Option Gosub", which fbc honours (D4): the CLASSIC lowering below serves it.
+  if FModernMode and (Node.Attributes.Values['OPTGOSUB'] <> '1') and SourceDeclaresNonFbDialect then
+    raise Exception.Create('GOSUB is disabled: use OPTION GOSUB to enable it (fbc: error 278)');
+  if FModernMode and (Node.Attributes.Values['OPTGOSUB'] <> '1') then
     raise Exception.Create('GOSUB is not available in the MODERN (FreeBASIC) dialect: ' +
                            'RETURN already means "return from a procedure" there. ' +
                            'Use a SUB, or the CLASSIC dialect.');
@@ -22474,7 +22480,7 @@ begin
     // Call subroutine
     { ON ... GOSUB is the computed form of the same statement, and out of MODERN
       for the same reason - see the note at the plain GOSUB. }
-    if FModernMode then
+    if FModernMode and (Node.Attributes.Values['OPTGOSUB'] <> '1') then   // fblite "Option Gosub": legal (D4)
       raise Exception.Create('ON ... GOSUB is not available in the MODERN (FreeBASIC) dialect: ' +
                              'RETURN already means "return from a procedure" there. ' +
                              'Use a SUB, or the CLASSIC dialect.');
@@ -63389,11 +63395,12 @@ begin
   if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
      (FProcedureNames.IndexOf(Node.ValueUpper) < 0) then
   begin
-    // -lang fb: a stray name is what fbc says it is, "error 42: Variable not declared" - not a statement that
-    // does nothing (Tron, Begin, Bend and the C128 words reach MODERN as plain names, and pass that way).
-    if LangStrictFb then
+    // ⛔ A stray name is what fbc says it is, "error 42: Variable not declared" - never a statement that does
+    // nothing (owner, 23 Oct 2026: no undefined behaviour). Tron, Begin, Bend and the C128 words reach MODERN as
+    // plain names, and used to pass that way. CLASSIC keeps its own rule.
+    if FModernMode then
       raise Exception.Create('Variable not declared: ' + Node.ValueUpper + ' - a name alone is not a statement ' +
-        '(-lang fb; fbc: error 42: Variable not declared, ' + Node.ValueUpper + ')');
+        '(fbc: error 42: Variable not declared, ' + Node.ValueUpper + ')');
     Exit;
   end;
   EmitProcedureCall(Node.ValueUpper, ArgList);
@@ -65391,6 +65398,13 @@ begin
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           FCurrentBlock := nil;
         end;
+      end
+      else if Node.Attributes.Values['OPTGOSUB'] = '1' then
+      begin
+        // fblite / qb "Option Gosub": a bare RETURN returns from the GOSUB, inside a procedure too (fbc).
+        EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        FCurrentBlock := nil;
       end
       else if FInProcedure then
       begin

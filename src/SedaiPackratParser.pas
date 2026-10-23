@@ -83,6 +83,9 @@ type
     FOptionDigits: Integer;
     // fblite: an "Option ByVal" was seen, so a parameter with no BYVAL/BYREF is BYVAL again (D4).
     FOptionByVal: Boolean;
+    // fblite/qb: "Option Gosub" was seen (and no "Option NoGosub" since): GOSUB exists, and a bare RETURN
+    // returns from it rather than from the procedure (D4).
+    FOptionGosub: Boolean;
     // Constant capacity of the last "As String * n" TYPE-field type parsed (0 = none). Set by
     // ParseRecordFieldType, consumed when that field's node is built.
     FLastFieldFixedLen: Integer;
@@ -289,6 +292,7 @@ type
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
     procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
+    procedure JoinFbLiteDottedNames;                     // fblite/qb: "Dim my.var" is ONE name (D4)
     procedure SynthesizeHeaderThunks;                    // MODERN: "@Year" of a header routine gets a procedure (508)
     procedure RejectUndeclaredHeaderRoutines(Root: TASTNode);  // MODERN: file.bi & co. routines need their header (504)
     procedure RejectStrictFbBuiltins(Root: TASTNode);           // -lang fb: SedaiBasic's own builtins are not names (D3)
@@ -1664,6 +1668,7 @@ begin
     FOptionBase := 0;      // reset per parse; set by an "OPTION BASE 1" directive as it is encountered
     FOptionDigits := 0;    // 0 = not specified: the dialect default (16 / 7) stands
     FOptionByVal := False;
+    FOptionGosub := False;
 
     DoParsingStarted;
 
@@ -1795,6 +1800,8 @@ begin
  RejectEmptyAliasNames;
  // ⭐ A name the program declares wins over a builtin FreeBASIC lets it shadow (DIVERGENZE 267). Done
  // on the TOKENS, before any statement is parsed, because the builtins are dispatched by token type.
+ // fblite / qb: a period may be part of a variable name ("Dim my.var As Integer"). Joined on the tokens first.
+ if FModernMode and SourceDeclaresNonFbDialect then JoinFbLiteDottedNames;
  if FModernMode then ShadowDeclaredBuiltins;
  // ...and the ADDRESS of a routine fbc's own headers declare gets a real procedure to point at (DIVERGENZE 508).
  if FModernMode then SynthesizeHeaderThunks;
@@ -8369,6 +8376,7 @@ var
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antGosub, Token);
+  if FOptionGosub then Result.Attributes.Values['OPTGOSUB'] := '1';   // fblite "Option Gosub": legal here
   Context.Advance; // Consume GOSUB
 
   // *** PUSH ONTO GOSUB STACK ***
@@ -8424,6 +8432,10 @@ begin
   IsExit := Kw = kEXIT;
   IsContinue := Kw = kCONTINUE;
   Result := TASTNode.Create(antReturn, Token);
+  // fblite "Option Gosub": a RETURN with no value returns from the GOSUB (fbc), marked for the SSA
+  if FOptionGosub and (Kw = 'RETURN') and
+     ((Context.PeekNext = nil) or (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
+    Result.Attributes.Values['OPTGOSUB'] := '1';
   Context.Advance; // consume EXIT / CONTINUE / RETURN
 
   if IsExit or IsContinue then
@@ -9044,6 +9056,7 @@ begin
     Result := TASTNode.Create(antOnGosub, Token)
   else
     Result := TASTNode.Create(antOnGoto, Token);
+  if IsGosub and FOptionGosub then Result.Attributes.Values['OPTGOSUB'] := '1';   // fblite "Option Gosub" (D4)
 
   Result.AddChild(Expression);
 
@@ -12367,7 +12380,9 @@ begin
       // Consumed so the statement parses; the word itself stays reserved (un-reserving it would have to
       // reach back into the LEXER, which has already classified every later occurrence).
       if SameText(Context.CurrentToken.Value, 'BYVAL') then
-        FOptionByVal := True;   // fblite: parameters default to BYVAL from here on (see the parameter parser)
+        FOptionByVal := True;
+      if SameText(Context.CurrentToken.Value, 'GOSUB') then FOptionGosub := True
+      else if SameText(Context.CurrentToken.Value, 'NOGOSUB') then FOptionGosub := False;   // fblite: parameters default to BYVAL from here on (see the parameter parser)
       // fblite: "Option Dynamic" is the statement form of '$DYNAMIC - arrays declared below it are dynamic.
       if SameText(Context.CurrentToken.Value, 'DYNAMIC') or SameText(Context.CurrentToken.Value, 'STATIC') then
         PPNoteDynamicMeta(Context.CurrentToken.Line, SameText(Context.CurrentToken.Value, 'DYNAMIC'));
@@ -14057,6 +14072,76 @@ const
   end;
 begin
   Walk(Root);
+end;
+
+procedure TPackratParser.JoinFbLiteDottedNames;
+// fblite and qb allow a period inside a variable name, as QuickBASIC did: "Dim my.var As Integer : my.var = 42"
+// is ONE variable called "my.var" (fbc fblite prints 42). The parser would read "my.var" as the member VAR of a
+// variable MY, so the name is joined on the TOKENS before any statement is parsed: every "A . B" where "A.B" is
+// declared by a DIM and A is not a TYPE / UNION / ENUM / NAMESPACE becomes the single identifier "A.B".
+// ⚠️ Only names a DIM declares: an implicit dotted variable (no Dim) is not joined - A may be a UDT variable
+// whose type this pass does not know.
+var
+  TL: TTokenList;
+  N, i: Integer;
+  Owners, Dotted: TStringList;
+  T: TLexerToken;
+
+  function Up(Idx: Integer): string;
+  begin
+    Result := '';
+    if (Idx < 0) or (Idx >= N) then Exit;
+    T := TL.GetTokenDirect(Idx);
+    if (T <> nil) and (T.TokenType <> ttStringLiteral) then Result := UpperFast(VarToStr(T.Value));
+  end;
+
+  function IsName(Idx: Integer): Boolean;
+  var
+    W: string;
+  begin
+    W := Up(Idx);
+    Result := (W <> '') and (W[1] in ['A'..'Z', '_']);
+  end;
+
+begin
+  TL := Context.TokenList;
+  if TL = nil then Exit;
+  N := TL.Count;
+  Owners := TStringList.Create;
+  Dotted := TStringList.Create;
+  try
+    Owners.Sorted := True; Owners.Duplicates := dupIgnore;
+    Dotted.Sorted := True; Dotted.Duplicates := dupIgnore;
+    // the names that own members: a "A.B" with one of these in front is a member, never a dotted name
+    for i := 0 to N - 2 do
+      if ((Up(i) = 'TYPE') or (Up(i) = 'UNION') or (Up(i) = 'ENUM') or (Up(i) = 'NAMESPACE')) and IsName(i + 1) then
+        Owners.Add(Up(i + 1));
+    // "DIM [SHARED] A.B ..." (the first name of the statement)
+    for i := 0 to N - 4 do
+      if ((Up(i) = 'DIM') or (Up(i) = 'SHARED')) and IsName(i + 1) and (Up(i + 2) = '.') and IsName(i + 3) and
+         (Owners.IndexOf(Up(i + 1)) < 0) then
+        Dotted.Add(Up(i + 1) + '.' + Up(i + 3));
+    if Dotted.Count = 0 then Exit;
+    // join every "A . B" that names a declared dotted variable (not the tail of a longer member chain)
+    i := 0;
+    while i < TL.Count - 2 do
+    begin
+      N := TL.Count;
+      if IsName(i) and (Up(i + 1) = '.') and IsName(i + 2) and (Up(i - 1) <> '.') and
+         (Dotted.IndexOf(Up(i) + '.' + Up(i + 2)) >= 0) then
+      begin
+        T := TL.GetTokenDirect(i);
+        T.Value := VarToStr(T.Value) + '.' + VarToStr(TL.GetTokenDirect(i + 2).Value);
+        T.TokenType := ttIdentifier;
+        TL.ExtractTokenAt(i + 2);
+        TL.ExtractTokenAt(i + 1);
+      end;
+      Inc(i);
+    end;
+  finally
+    Owners.Free;
+    Dotted.Free;
+  end;
 end;
 
 procedure TPackratParser.ShadowDeclaredBuiltins;
