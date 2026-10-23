@@ -2170,6 +2170,10 @@ end;
 function PPWordFilterOn: Boolean; forward;
 function PPConstWordPresent(const W: string): Boolean; forward;
 
+var
+  GPPConstChainDepth: Integer = 0;   // SourceConstValue following "const A = B" to B: how deep it is
+  GPPConstWasUnsigned: Boolean = False;   // ...and whether the value it answered is an unsigned 64-bit literal
+
 function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // The VALUE of a module-level "Const <Nm> = <integer literal>" written in the source, for a #if / #assert
 // that names it. fbc's preprocessor can read a Const because its symbol table is being built as it goes;
@@ -2196,10 +2200,12 @@ var
   i, p, q, d, DeclN: Integer;
   U, W, Rest, MemU, Dcl: string;
   EnumNext: Int64;
+  UV: QWord;
   InEnum, EnumLost: Boolean;
 begin
   Result := False;
   V := 0;
+  if GPPConstChainDepth = 0 then GPPConstWasUnsigned := False;
   if Nm = '' then Exit;
   // ⭐ The word is not there ⇒ no Const and no enum member can carry it, and the join-and-scan below
   // does not have to happen. Same A/B knob as the other filter: SB_PP_NO_WORDFILTER=1 skips it.
@@ -2289,7 +2295,26 @@ begin
           // note this replaces is right that answering an expression wrongly is worse than not
           // answering, and "&h0502" is not an expression, it is how C headers spell a number.
           if TryStrToInt64(Dcl, V) then Exit(True);
+          // an unsigned 64-bit literal ("MAX_VALUE_ULONGINT = 18446744073709551615") keeps its bits
+          if TryStrToQWord(Dcl, UV) then begin V := Int64(UV); GPPConstWasUnsigned := True; Exit(True); end;
           if PPBasedLiteralValue(Dcl, V) then Exit(True);
+          // ⭐ ...or ANOTHER CONSTANT by name ("const as integer MIN_VALUE_INTEGER = MIN_VALUE_LONGINT", how
+          // fblimits.bi writes it): fbc's #if reads it through, so this asks the same question of that name.
+          // A depth bound keeps "const A = B : const B = A" from recursing forever (23 Oct 2026).
+          if (Dcl <> '') and (Dcl[1] in ['A'..'Z', '_']) and (GPPConstChainDepth < 8) then
+          begin
+            q := 1;
+            while (q <= Length(Dcl)) and IsIdentChar(Dcl[q]) do Inc(q);
+            if q > Length(Dcl) then
+            begin
+              Inc(GPPConstChainDepth);
+              try
+                if SourceConstValue(Dcl, V) then Exit(True);
+              finally
+                Dec(GPPConstChainDepth);
+              end;
+            end;
+          end;
         end;
       finally
         Decls.Free;
@@ -3112,6 +3137,8 @@ var
     Body, Suffix: string;
     n: Integer;
     U: Boolean;
+    n64: Int64;
+    q64: QWord;
   begin
     Body := S;
     n := Length(Body);
@@ -3139,6 +3166,9 @@ var
                                                   'D', 'E', [rfReplaceAll]), 0, PPFloatFmt))
     else if U then
       Result := PPUInt(Int64(StrToQWordDef(Body, 0)), True)
+    // a decimal past High(Int64) with no suffix is an unsigned 64-bit literal (18446744073709551615), not 0
+    else if (not TryStrToInt64(Body, n64)) and TryStrToQWord(Body, q64) then
+      Result := PPUInt(Int64(q64), True)
     else
       Result := PPInt(StrToInt64Def(Body, 0));
   end;
@@ -3391,7 +3421,9 @@ var
         // with '-') and ParsePrimary read it as 0 - so a "Const K = -1" compared EQUAL to 0 in a #if.
         else if SourceConstValue(id, ConstV) then
         begin
-          if ConstV < 0 then
+          if GPPConstWasUnsigned then
+            Toks.Add(UIntToStr(QWord(ConstV)))   // an unsigned 64-bit Const keeps its magnitude
+          else if ConstV < 0 then
           begin
             Toks.Add('-');
             Toks.Add(IntToStr(QWord(-(ConstV + 1)) + 1));
@@ -4118,10 +4150,13 @@ begin
   Defs.Values['__FB_SIGNATURE__'] := '"SedaiBasic (FreeBASIC-compatible)"';
   // --- Language / compile mode, mapped to SedaiBasic's actual state ---
   Defs.Values['__FB_LANG__']    := '"fb"';
+  // -lang fblite (D4): fbc says "fblite" here, and implicit variables are legal there (measured: both).
+  if GLangMode = lmFbLite then Defs.Values['__FB_LANG__'] := '"fblite"';
   // OPTION EXPLICIT is IMPLIED by -lang fb: every variable must be declared, and fbc answers -1 here
   // (measured). MODERN is that dialect, so the answer is the same - a module guarding itself with
   // "#if __FB_OPTION_EXPLICIT__ = 0 : #error ..." must compile, not refuse.
   Defs.Values['__FB_OPTION_EXPLICIT__'] := '-1';
+  if GLangMode = lmFbLite then Defs.Values['__FB_OPTION_EXPLICIT__'] := '0';
   Defs.Values['__FB_MT__']      := '-1';   // multithreading runtime is available
   Defs.Values['__FB_OUT_EXE__'] := '-1';   // programs are run (executable-like target)
   // fbc defines this while compiling the module that holds the program's entry point. There is exactly

@@ -14075,22 +14075,25 @@ begin
 end;
 
 procedure TPackratParser.JoinFbLiteDottedNames;
-// fblite and qb allow a period inside a variable name, as QuickBASIC did: "Dim my.var As Integer : my.var = 42"
-// is ONE variable called "my.var" (fbc fblite prints 42). The parser would read "my.var" as the member VAR of a
-// variable MY, so the name is joined on the TOKENS before any statement is parsed: every "A . B" where "A.B" is
-// declared by a DIM and A is not a TYPE / UNION / ENUM / NAMESPACE becomes the single identifier "A.B".
-// ⚠️ Only names a DIM declares: an implicit dotted variable (no Dim) is not joined - A may be a UDT variable
-// whose type this pass does not know.
+// fblite and qb allow periods inside a variable name, as QuickBASIC did: "my.var = 42 : Print my.var" is ONE
+// variable called "my.var", declared or implicit, at any depth ("a.b.c" and "a.b" are two variables), with a
+// suffix too ("my.name$"). fbc's rule, measured on fbc -lang fblite: "A.B..." is ONE name unless A is a UDT
+// VARIABLE (then it is a field access, and an unknown field is "error 18: Element not defined"), a TYPE, a
+// UNION, an ENUM or a NAMESPACE. The parser would read every "A.B" as the member B of A, so the name is joined
+// on the TOKENS before any statement is parsed. In fblite a UDT variable is always declared explicitly
+// ("Dim pt As P", a parameter "pt As P"), so the tokens are enough to know one.
+// ⛔ "Dim pt.z" when pt is a UDT variable is refused, as fbc refuses it ("error 3: Expected End-of-Line").
 var
   TL: TTokenList;
-  N, i: Integer;
-  Owners, Dotted: TStringList;
+  N, i, j: Integer;
+  Owners, UdtVars: TStringList;
   T: TLexerToken;
+  Head: string;
 
   function Up(Idx: Integer): string;
   begin
     Result := '';
-    if (Idx < 0) or (Idx >= N) then Exit;
+    if (Idx < 0) or (Idx >= TL.Count) then Exit;
     T := TL.GetTokenDirect(Idx);
     if (T <> nil) and (T.TokenType <> ttStringLiteral) then Result := UpperFast(VarToStr(T.Value));
   end;
@@ -14100,7 +14103,15 @@ var
     W: string;
   begin
     W := Up(Idx);
-    Result := (W <> '') and (W[1] in ['A'..'Z', '_']);
+    Result := (W <> '') and (W[1] in ['A'..'Z', '_']) and (T <> nil) and (T.TokenType <> ttStringLiteral);
+  end;
+
+  function IsStmtEnd(Idx: Integer): Boolean;
+  begin
+    Result := (Idx >= TL.Count);
+    if Result then Exit;
+    T := TL.GetTokenDirect(Idx);
+    Result := (T = nil) or (T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]);
   end;
 
 begin
@@ -14108,39 +14119,60 @@ begin
   if TL = nil then Exit;
   N := TL.Count;
   Owners := TStringList.Create;
-  Dotted := TStringList.Create;
+  UdtVars := TStringList.Create;
   try
     Owners.Sorted := True; Owners.Duplicates := dupIgnore;
-    Dotted.Sorted := True; Dotted.Duplicates := dupIgnore;
-    // the names that own members: a "A.B" with one of these in front is a member, never a dotted name
+    UdtVars.Sorted := True; UdtVars.Duplicates := dupIgnore;
+    // the names that own members: TYPE / UNION / ENUM / NAMESPACE
     for i := 0 to N - 2 do
       if ((Up(i) = 'TYPE') or (Up(i) = 'UNION') or (Up(i) = 'ENUM') or (Up(i) = 'NAMESPACE')) and IsName(i + 1) then
         Owners.Add(Up(i + 1));
-    // "DIM [SHARED] A.B ..." (the first name of the statement)
-    for i := 0 to N - 4 do
-      if ((Up(i) = 'DIM') or (Up(i) = 'SHARED')) and IsName(i + 1) and (Up(i + 2) = '.') and IsName(i + 3) and
-         (Owners.IndexOf(Up(i + 1)) < 0) then
-        Dotted.Add(Up(i + 1) + '.' + Up(i + 3));
-    if Dotted.Count = 0 then Exit;
-    // join every "A . B" that names a declared dotted variable (not the tail of a longer member chain)
+    // the UDT variables: "name As T" (a Dim, a parameter, a field) and "Dim As T a, b"
+    for i := 0 to N - 3 do
+      if (Up(i + 1) = 'AS') and IsName(i) and (Owners.IndexOf(Up(i + 2)) >= 0) then
+        UdtVars.Add(Up(i))
+      else if (Up(i) = 'AS') and (Owners.IndexOf(Up(i + 1)) >= 0) and
+              ((Up(i - 1) = 'DIM') or (Up(i - 1) = 'SHARED') or (Up(i - 1) = 'STATIC') or (Up(i - 1) = 'REDIM')) then
+      begin
+        j := i + 2;
+        while not IsStmtEnd(j) do
+        begin
+          if IsName(j) and ((Up(j - 1) = ',') or (j = i + 2)) then UdtVars.Add(Up(j));
+          Inc(j);
+        end;
+      end;
+    // join every "A . B [. C ...]" whose head owns no members; not the tail of a longer chain (". A . B")
     i := 0;
     while i < TL.Count - 2 do
     begin
-      N := TL.Count;
-      if IsName(i) and (Up(i + 1) = '.') and IsName(i + 2) and (Up(i - 1) <> '.') and
-         (Dotted.IndexOf(Up(i) + '.' + Up(i + 2)) >= 0) then
+      if IsName(i) and (Up(i + 1) = '.') and IsName(i + 2) and (Up(i - 1) <> '.') then
       begin
-        T := TL.GetTokenDirect(i);
-        T.Value := VarToStr(T.Value) + '.' + VarToStr(TL.GetTokenDirect(i + 2).Value);
-        T.TokenType := ttIdentifier;
-        TL.ExtractTokenAt(i + 2);
-        TL.ExtractTokenAt(i + 1);
+        Head := Up(i);
+        if UdtVars.IndexOf(Head) >= 0 then
+        begin
+          // a field access - and "Dim pt.z" over a UDT variable is fbc's error 3
+          if (Up(i - 1) = 'DIM') or (Up(i - 1) = 'SHARED') then
+            HandleError('Expected End-of-Line, found ''.'': ' + Head + ' is a UDT variable, so "' + Head + '.' +
+              Up(i + 2) + '" is one of its fields, not a variable to declare (fbc: error 3)', TL.GetTokenDirect(i + 1));
+        end
+        else if Owners.IndexOf(Head) < 0 then
+        begin
+          T := TL.GetTokenDirect(i);
+          while (Up(i + 1) = '.') and IsName(i + 2) do
+          begin
+            T := TL.GetTokenDirect(i);
+            T.Value := VarToStr(T.Value) + '.' + VarToStr(TL.GetTokenDirect(i + 2).Value);
+            T.TokenType := ttIdentifier;
+            TL.ExtractTokenAt(i + 2);
+            TL.ExtractTokenAt(i + 1);
+          end;
+        end;
       end;
       Inc(i);
     end;
   finally
     Owners.Free;
-    Dotted.Free;
+    UdtVars.Free;
   end;
 end;
 

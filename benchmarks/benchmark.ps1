@@ -199,11 +199,11 @@ function Show-Banner {
     $border = "=" * 78
     Write-Host ""
     Write-Host $border -ForegroundColor Cyan
-    Write-Host "   ____           _       _ ____            _      ____  " -ForegroundColor White
-    Write-Host "  / ___|  ___  __| | __ _(_) __ )  __ _ ___(_) ___|___ \ " -ForegroundColor White
-    Write-Host "  \___ \ / _ \/ _`` |/ _`` | |  _ \ / _`` / __| |/ __| __) |" -ForegroundColor White
-    Write-Host "   ___) |  __/ (_| | (_| | | |_) | (_| \__ \ | (__ / __/ " -ForegroundColor White
-    Write-Host "  |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|_____|" -ForegroundColor White
+    Write-Host "   ____           _       _ ____            _       " -ForegroundColor White
+    Write-Host "  / ___|  ___  __| | __ _(_) __ )  __ _ ___(_) ___    " -ForegroundColor White
+    Write-Host "  \___ \ / _ \/ _`` |/ _`` | |  _ \ / _`` / __| |/ __|      " -ForegroundColor White
+    Write-Host "   ___) |  __/ (_| | (_| | | |_) | (_| \__ \ | (__       " -ForegroundColor White
+    Write-Host "  |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|      " -ForegroundColor White
     Write-Host ""
     Write-Host "                   BENCHMARK SUITE" -ForegroundColor Yellow
     Write-Host $border -ForegroundColor Cyan
