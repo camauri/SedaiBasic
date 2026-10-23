@@ -1127,6 +1127,10 @@ if ($DebugFlags -and $DebugFlags -ne '') {
 # Optional SDL2 window presenter for the CLI VM (sb --window)
 if ($Window) {
     $debugDefines += 'WITH_WINDOW'
+    # The window presenter names the SDL2 binding's types, and sb has no other road to deps\sdl2 since it
+    # carries no audio (DIVERGENZE 585): without this, "Can't find unit SDL2" (build.sh has had it since).
+    # Every SDL CALL goes through SedaiSDL2Dyn, so sb.exe still imports no SDL2.dll at load.
+    $targets['sb'].ExtraPaths = @($sdl2PathForTargets)
     Write-Host "Window presenter: ENABLED (sb --window available)" -ForegroundColor Magenta
 }
 

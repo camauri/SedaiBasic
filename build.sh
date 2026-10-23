@@ -547,7 +547,9 @@ build_target() {
     # `sb --window` (opt-in) presents through SDL2 and needs the binding. It used to find it only because the AUDIO block
     # added deps/sdl2 - and sb has no audio since DIVERGENZE 585. ⚠️ Such an sb carries libSDL2 again: it is a developer
     # build, and the 585 interposition applies to it; the plain sb, which the nets and the decks run, does not.
-    if [[ "$WINDOW" == "true" && "$output_name" == sb* ]]; then
+    # ⛔ "sb" EXACTLY: a glob sb* also matches sbc, sbd, sbv and sbw (it put sbv through the SDL-free link
+    # below, which sbv - linked against SDL2 by design - rightly failed, on the first release run).
+    if [[ "$WINDOW" == "true" && "$output_name" == "sb" ]]; then
         opts+=("-Fu${SDL2_FOR_TARGETS:-./deps/sdl2}")
     fi
 
@@ -581,7 +583,7 @@ build_target() {
     # calls SDL statically the link FAILS naming the symbol - checked by putting back a binding that lacked
     # SDL_SetWindowFullscreen: "undefined reference to `SDL_SetWindowFullscreen'".
     local relink_window=false
-    if [[ "$WINDOW" == "true" && "$output_name" == sb* && "$target_os" == "linux" ]]; then
+    if [[ "$WINDOW" == "true" && "$output_name" == "sb" && "$target_os" == "linux" ]]; then
         relink_window=true
         opts+=("-s")
     fi
