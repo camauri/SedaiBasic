@@ -52,7 +52,7 @@ begin
       on E: Exception do ;   // a source the preprocessor refuses: the runner will say so; judge the raw text
     end;
     // ...as the runner's gate does: line numbers under fblite / qb / deprecated are labels, not CLASSIC.
-    IsModern := (not TSedaiRunner.SourceHasLineNumbers(Text)) or SourceDeclaresNonFbDialect;
+    IsModern := TSedaiRunner.SourceIsModern(Text);
     // DIALECT_DIAG=1: the preprocessed text the answer was read from, on stderr - a dialect read wrong is
     // almost always a line the PREPROCESSOR produced, which no source file shows.
     if GetEnvironmentVariable('DIALECT_DIAG') = '1' then WriteLn(ErrOutput, Text);
@@ -590,10 +590,13 @@ begin
   WriteLn('  --memory=fb|strict  Memory mode: fb = FreeBASIC pointers (default), strict = isolated from the VM');
   if not GCliClassic then
   begin
+    WriteLn('  -lang modern        FreeBASIC with SedaiBasic''s extensions: the default');
     WriteLn('  -lang fb            Adhere to fbc exactly: SedaiBasic''s extensions are refused (also: #lang "fb")');
-    WriteLn('  -lang fblite        fbc''s fblite dialect (also: #lang "fblite")');
-    WriteLn('                        Without -lang: MODERN, FreeBASIC with SedaiBasic''s extensions');
-  end;
+    WriteLn('  -lang fblite        fbc''s fblite dialect (also: #lang "fblite"); line numbers are labels');
+    WriteLn('                        -lang classic is refused: CLASSIC programs run in sbv');
+  end
+  else
+    WriteLn('  -lang classic       Commodore BASIC v7, the only language sbv runs (the default)');
   WriteLn('  --home              Run the program as if from its own directory (chdir before it starts).');
   WriteLn('                        Without it the current directory is the shell''s, as it is for fbc,');
   WriteLn('                        and only a READ-ONLY relative path falls back beside the program.');
@@ -1009,7 +1012,7 @@ begin
     // read their dialect from below, so the refusal and the compilation cannot disagree.
     // ⚠️ A file that declares fblite / qb / deprecated (or runs with -lang fblite) is not CLASSIC even with line
     // numbers: there fbc reads them as LABELS ("10 Print ... : GoTo 10"), and sb takes the file.
-    Refusal := CliDialectRefusal((not TSedaiRunner.SourceHasLineNumbers(Source.Text)) or SourceDeclaresNonFbDialect,
+    Refusal := CliDialectRefusal(TSedaiRunner.SourceIsModern(Source.Text),
                                  SourceFile);
     if Refusal <> '' then
     begin
@@ -1120,7 +1123,7 @@ begin
     try
       // Dialect gate for FB lexical scope: MODERN when the source has no line numbers (mirrors the
       // lexer config above), CLASSIC otherwise. CLASSIC keeps BASIC v7 global-by-name semantics.
-      ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+      ProgIsModern := TSedaiRunner.SourceIsModern(Source.Text);   // fblite's line numbers are labels (734)
       SSAGen.ModernMode := ProgIsModern;
       SSAGen.NativeMemory := GMemoryMode = mmFB;   // resolved before this compile (SedaiMemoryMode)
       try
@@ -1912,7 +1915,8 @@ begin
         end;
         // Record the source dialect on the program so the VM can pick dialect-aware behaviour
         // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
-        BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+        BytecodeProgram.ModernMode := ProgIsModern;
+        BytecodeProgram.SourceLang := Ord(GLangMode);          // the language, read by a .basc's loader
         BytecodeProgram.NativeMemory := GMemoryMode = mmFB;   // ...and travels with the program
         // "OPTION DIGITS n" rides out on the PARSE RESULT (the parser itself is
         // long gone) and the VM applies it to the console behavior before running.
@@ -2540,6 +2544,13 @@ begin
       // build locked to STRICT meeting an fb file, is refused here through the error path below.
       // ⛔ One environment, one dialect: the .basc says which it was compiled from.
       Refusal := CliDialectRefusal(BytecodeProgram.ModernMode, BytecodeFile);
+      // ...and the language it was compiled as is the header's: a -lang that names another one is refused
+      // rather than ignored (a .basc cannot be recompiled at load).
+      if (Refusal = '') and (GLangFlag <> '') and
+         (LowerCase(GLangFlag) <> ProgramLangName(BytecodeProgram.ModernMode, BytecodeProgram.SourceLang)) then
+        Refusal := Format('%s was compiled as %s: -lang %s does not apply to it',
+          [ExtractFileName(BytecodeFile),
+           ProgramLangName(BytecodeProgram.ModernMode, BytecodeProgram.SourceLang), LowerCase(GLangFlag)]);
       if Refusal <> '' then
       begin
         FreeAndNil(BytecodeProgram);
@@ -2987,7 +2998,7 @@ begin
       end
       else if (Param = '-lang') and (i < ParamCount) then
       begin
-        GLangFlag := ParamStr(i + 1);   // fb | fblite (SedaiLangMode); checked after the loop
+        GLangFlag := ParamStr(i + 1);   // classic | modern | fb | fblite (SedaiLangMode); checked after the loop
         GSkipNextArg := True;
       end
       else if Pos(MEMORY_MODE_FLAG, Param) = 1 then
@@ -3097,12 +3108,17 @@ begin
       ExitCode := 1;
       Exit;
     end;
+    // -lang classic|modern|fb|fblite (SedaiLangMode). sb runs the three MODERN languages and refuses classic by
+    // name; sbv --headless runs classic and refuses the other three. Neither accepts a value it would ignore.
     if GLangFlag <> '' then
     begin
-      if GCliClassic then
-        VerifyMsg := '-lang applies to MODERN programs, which run in sb; sbv runs CLASSIC'
-      else
-        CheckLangFlag(GLangFlag, VerifyMsg);   // '' when the value is fb or fblite
+      if not CheckLangFlag(GLangFlag, VerifyMsg) then
+        // VerifyMsg says why
+      else if GCliClassic and not LangFlagIsClassic then
+        VerifyMsg := '-lang ' + LowerCase(GLangFlag) + ' is a MODERN language, and MODERN programs run in sb; ' +
+                     'sbv runs CLASSIC (-lang classic)'
+      else if (not GCliClassic) and LangFlagIsClassic then
+        VerifyMsg := '-lang classic: CLASSIC programs run in sbv (sbv --headless FILE runs one without a window)';
       if VerifyMsg <> '' then
       begin
         WriteLn(ErrOutput, 'ERROR: ', VerifyMsg);

@@ -1214,6 +1214,10 @@ type
     // Name of the source file this program was compiled from (ERMN). Set by the host.
     FModuleName: string;
     FQBLang: Boolean;      // source declared -lang qb ('#lang "qb"' / '$lang: "qb"): QB PRINT spacing
+    // THE LANGUAGE of a MODERN program (owner, 24 Oct 2026): 0 = modern, 1 = fb, 2 = fblite - the ordinal of
+    // SedaiLangMode.TLangMode. Meaningless when ModernMode is False (the language is then classic). There is ONE
+    // bytecode format and ONE extension: the language travels in the header, not in the file name.
+    FSourceLang: Byte;
     // The MEMORY MODE it was compiled for (SedaiMemoryMode): True = fb (a pointer is a machine address),
     // False = strict (a pointer is a name of the VM). False by default, so a front end that never sets it
     // (sbv, TSedaiRunner) builds STRICT programs. Travels in the .basc header (v6).
@@ -1263,6 +1267,7 @@ type
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
     property QBLang: Boolean read FQBLang write FQBLang;
+    property SourceLang: Byte read FSourceLang write FSourceLang;
     property NativeMemory: Boolean read FNativeMemory write FNativeMemory;
     property OptionDigits: Integer read FOptionDigits write FOptionDigits;
     constructor Create;
@@ -1415,6 +1420,7 @@ begin
   FProcMapCount := 0;
   FModuleName := '';
   FQBLang := False;
+  FSourceLang := 0;
   FOptionDigits := 0;    // 0 = the dialect default stands
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!

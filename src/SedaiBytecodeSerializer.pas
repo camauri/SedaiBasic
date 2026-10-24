@@ -113,6 +113,11 @@ const
   BASC_FLAG_MODERN     = $0002;  // Program compiled from a Modern/FreeBASIC source (no line numbers)
   BASC_FLAG_QBLANG     = $0004;  // Source declared -lang qb: QB PRINT number spacing (trailing space)
   BASC_FLAG_NATIVE_MEMORY = $0008;  // Compiled for memory mode fb (SedaiMemoryMode); clear = strict
+  // THE LANGUAGE of a MODERN program, two bits (24 Oct 2026): 0 = modern, 1 = fb, 2 = fblite (3 is refused).
+  // With BASC_FLAG_MODERN clear the language is classic and these bits are 0. No version bump: a file written
+  // before them has them clear and reads as modern or classic, which is what it was compiled as.
+  BASC_FLAG_LANG_MASK  = $0030;
+  BASC_FLAG_LANG_SHIFT = 4;
 
 type
   { TBascHeader - File header structure }
@@ -258,6 +263,8 @@ begin
     Header.Flags := Header.Flags or BASC_FLAG_QBLANG;
   if Program_.NativeMemory then
     Header.Flags := Header.Flags or BASC_FLAG_NATIVE_MEMORY;
+  if Program_.ModernMode then
+    Header.Flags := Header.Flags or ((Word(Program_.SourceLang) shl BASC_FLAG_LANG_SHIFT) and BASC_FLAG_LANG_MASK);
 
   Header.InstructionCount := Program_.GetInstructionCount;
   if Assigned(Program_.StringConstants) then
@@ -472,6 +479,9 @@ begin
     Result.OptionDigits := Integer(Header.Reserved1);   // see the note where it is written
     Result.QBLang := (Header.Flags and BASC_FLAG_QBLANG) <> 0;
     Result.NativeMemory := (Header.Flags and BASC_FLAG_NATIVE_MEMORY) <> 0;   // v5 and older: strict
+    Result.SourceLang := (Header.Flags and BASC_FLAG_LANG_MASK) shr BASC_FLAG_LANG_SHIFT;
+    if (Result.SourceLang > 2) or ((Result.SourceLang <> 0) and not Result.ModernMode) then
+      raise EBytecodeSerializerError.CreateFmt('Invalid .basc file: language field %d', [Result.SourceLang]);
 
     // Read string constants
     for i := 0 to Header.StringConstCount - 1 do

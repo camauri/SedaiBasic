@@ -137,8 +137,10 @@ begin
   WriteLn('  --quiet, -q     Suppress all output except errors');
   WriteLn('  -o FILE         Output file name (as fbc -o)');
   WriteLn('  --memory=fb|strict  Memory mode carried in the .basc (default fb)');
+  WriteLn('  -lang classic   Commodore BASIC v7 (runs in sbv); a numbered source needs it');
+  WriteLn('  -lang modern    FreeBASIC with SedaiBasic''s extensions: the default');
   WriteLn('  -lang fb        Adhere to fbc exactly: SedaiBasic''s extensions are refused (also: #lang "fb")');
-  WriteLn('  -lang fblite    fbc''s fblite dialect (also: #lang "fblite")');
+  WriteLn('  -lang fblite    fbc''s fblite dialect (also: #lang "fblite"); line numbers are labels');
   WriteLn('  --target wasm   Emit a WebAssembly module (.wasm) instead of bytecode');
   WriteLn('                  An opcode the backend does not cover is REFUSED with a');
   WriteLn('                  message: in the browser there is no interpreter to fall');
@@ -272,6 +274,30 @@ begin
     // Dialect auto-selected by content: a program that uses line numbers is classic;
     // otherwise FreeBASIC/Modern (mirrors sb's inline pipeline and TSedaiRunner).
     HasLineNums := TSedaiRunner.SourceHasLineNumbers(Source.Text);
+    // ⛔ THE LANGUAGE IS SAID, NOT GUESSED (owner, 24 Oct 2026). Without -lang a program is MODERN, so a source
+    // with line numbers is refused instead of being compiled as CLASSIC behind the user's back: -lang classic
+    // asks for Commodore BASIC v7. Line numbers are labels only under fblite (and qb/deprecated), as in the gate
+    // sb applies. And -lang classic on a source that is not CLASSIC is refused too: nothing is left undefined.
+    if LangFlagIsClassic then
+    begin
+      if (GLangMode <> lmModern) or SourceDeclaresNonFbDialect then
+      begin
+        WriteLn('ERROR: -lang classic: ', ExtractFileName(SourceFile), ' declares its own #lang, which is MODERN');
+        Exit;
+      end;
+      if not HasLineNums then
+      begin
+        WriteLn('ERROR: -lang classic: ', ExtractFileName(SourceFile),
+                ' has no line numbers, and a CLASSIC program is numbered');
+        Exit;
+      end;
+    end
+    else if not TSedaiRunner.SourceIsModern(Source.Text) then
+    begin
+      WriteLn('ERROR: ', ExtractFileName(SourceFile), ' has line numbers, so it is CLASSIC: compile it with ',
+              '-lang classic (line numbers are labels only under -lang fblite)');
+      Exit;
+    end;
 
     // === LEXING ===
     if Verbose then
@@ -335,7 +361,7 @@ begin
       try
         // Dialect gate for FB lexical scope: MODERN when the source has no line numbers
         // (mirrors the lexer config above), CLASSIC otherwise.
-        SSAGen.ModernMode := not HasLineNums;
+        SSAGen.ModernMode := TSedaiRunner.SourceIsModern(Source.Text);   // fblite's numbers are labels (734)
         SSAGen.NativeMemory := GMemoryMode = mmFB;
         try
           SSAProgram := SSAGen.Generate(ParserResult.AST);
@@ -511,7 +537,7 @@ begin
         // === WASM BACKEND (--target wasm) ===
         if OptTargetWasm then
         begin
-          WasmBackend := TWasmBackend.Create(SSAProgram, not HasLineNums);
+          WasmBackend := TWasmBackend.Create(SSAProgram, TSedaiRunner.SourceIsModern(Source.Text));
           // "OPTION DIGITS n" reaches the backend the same way it reaches the
           // VM. Without it the module would print a different number of digits
           // than the interpreter for the very same source, and the differential
@@ -554,7 +580,8 @@ begin
             end;
             // Record the source dialect so the VM can pick dialect-aware behaviour when
             // running the .basc (mirrors SSAGen.ModernMode above; persisted by the serializer).
-            BytecodeProgram.ModernMode := not HasLineNums;
+            BytecodeProgram.ModernMode := TSedaiRunner.SourceIsModern(Source.Text);
+            BytecodeProgram.SourceLang := Ord(GLangMode);   // the language, in the header (SedaiLangMode)
             BytecodeProgram.NativeMemory := GMemoryMode = mmFB;   // the memory mode travels in the .basc header
             // "OPTION DIGITS n", same channel as the dialect above.
             // ⚠️ NOT persisted by the serializer yet: a .basc loses it.
@@ -763,7 +790,7 @@ begin
         GMemoryModeFlag := Copy(Param, Length(MEMORY_MODE_FLAG) + 1, MaxInt)   // fb | strict (SedaiMemoryMode)
       else if (Param = '-lang') and (i < ParamCount) then
       begin
-        GLangFlag := ParamStr(i + 1);   // fb | fblite (SedaiLangMode); checked after the loop
+        GLangFlag := ParamStr(i + 1);   // classic | modern | fb | fblite (SedaiLangMode); checked after the loop
         FuseSkipNext := True;
       end
       else if (Param = '--target=wasm') or (Param = '--target-wasm') then
@@ -826,6 +853,14 @@ begin
     begin
       FuseBasc := OutputFile;
       OutputFile := FuseSecond;
+      // A .basc was compiled already, in the language its header says: a -lang here would do nothing.
+      if GLangFlag <> '' then
+      begin
+        WriteLn(ErrOutput, 'ERROR: -lang does not apply to a .basc: ', ExtractFileName(FuseBasc),
+                ' was compiled already (sbd shows its language)');
+        ExitCode := 1;
+        Exit;
+      end;
     end;
     if DashOutput <> '' then OutputFile := DashOutput;
 

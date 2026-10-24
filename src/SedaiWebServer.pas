@@ -393,6 +393,7 @@ var
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
   ProgIsModern: Boolean;
+  HasLineNums: Boolean;
   QBLangDetected: Boolean;
 begin
   Result := nil;
@@ -409,11 +410,8 @@ begin
     // a local of the same name as a module variable - sb and fbc both answer x=100, sbw died with an
     // Access Violation. Auto-selection mirrors sb (SedaiBasicVM.lpr) and sbc (SedaiBasicCompiler.lpr)
     // exactly: line numbers => CLASSIC, otherwise FreeBASIC/MODERN.
-    ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
-    // ⛔ sbw serves MODERN programs only (owner, 23 Oct 2026): CLASSIC lives in sbv. The refusal reaches the
-    // client as the 500 page, with this reason, through the handler's exception path.
-    if not ProgIsModern then
-      raise Exception.CreateFmt(WEB_MODERN_ONLY_REFUSAL, [ExtractFileName(ScriptPath)]);
+    // ⚠️ Asked AFTER the preprocessor (below), on the text the lexer reads, as sb and sbc ask it: the answer
+    // reads the source's #lang, and fblite's line numbers are labels of a MODERN program (DIVERGENZE 734).
 
     // Text -> text, BEFORE lexing and before the dialect is used, exactly as sb and sbc do it.
     // ⚠️ -lang qb is detected on the RAW text: the preprocessor strips both directive forms.
@@ -432,12 +430,18 @@ begin
         Exit;
       end;
     end;
+    HasLineNums := TSedaiRunner.SourceHasLineNumbers(Source.Text);
+    ProgIsModern := TSedaiRunner.SourceIsModern(Source.Text);
+    // ⛔ sbw serves MODERN programs only (owner, 23 Oct 2026): CLASSIC lives in sbv. The refusal reaches the
+    // client as the 500 page, with this reason, through the handler's exception path.
+    if not ProgIsModern then
+      raise Exception.CreateFmt(WEB_MODERN_ONLY_REFUSAL, [ExtractFileName(ScriptPath)]);
 
     WebStage('lex');
     // Lexing
     Lexer := TLexerFSM.Create;
     try
-      Lexer.SetHasLineNumbers(not ProgIsModern);
+      Lexer.SetHasLineNumbers(HasLineNums);   // a leading integer is a token of its own: CLASSIC or fblite label
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;

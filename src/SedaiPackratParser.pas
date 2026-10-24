@@ -1490,7 +1490,7 @@ begin
     pdClassic: FModernMode := False;
   else
     if Assigned(Context) and Assigned(Context.TokenList) then
-      FModernMode := not Context.TokenList.HasTokenType(ttLineNumber);
+      FModernMode := (not Context.TokenList.HasTokenType(ttLineNumber)) or SourceDeclaresNonFbDialect;
   end;
   ApplyDialectProfile;   // keep the installed handlers in sync with the forced/redetected dialect
 end;
@@ -1662,7 +1662,10 @@ begin
       pdModern:  FModernMode := True;
       pdClassic: FModernMode := False;
     else
-      FModernMode := Assigned(TokenList) and not TokenList.HasTokenType(ttLineNumber);
+      // ...and under fblite (qb, deprecated) line numbers are LABELS of a MODERN program, as the front ends'
+      // TSedaiRunner.SourceIsModern says (DIVERGENZE 734): the token stream alone would call it CLASSIC.
+      FModernMode := Assigned(TokenList) and
+                     ((not TokenList.HasTokenType(ttLineNumber)) or SourceDeclaresNonFbDialect);
     end;
     ApplyDialectProfile;   // install the dialect's statement handlers for this parse
     FOptionBase := 0;      // reset per parse; set by an "OPTION BASE 1" directive as it is encountered

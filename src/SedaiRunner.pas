@@ -87,6 +87,11 @@ type
       integer). Used to auto-select the dialect at LOAD: line numbers => classic,
       otherwise FreeBASIC/Modern. }
     class function SourceHasLineNumbers(const Source: string): Boolean;
+    { ⭐ THE ONE QUESTION "is this program MODERN?" (DIVERGENZE 734), asked of the PREPROCESSED text: no line
+      numbers, or a source that declares fblite / qb / deprecated (or runs under -lang fblite), where line
+      numbers are LABELS. Every front end, the parser, the SSA and the program's ModernMode read this answer;
+      SourceHasLineNumbers alone only says how the LEXER must read a leading integer. }
+    class function SourceIsModern(const Source: string): Boolean;
     // The ONE place that knows how several modules become one compilation (DIVERGENZE 162).
     class procedure LoadProgramModules(Dest: TStringList; const MainFile: string;
                                        ExtraModules: TStrings);
@@ -318,6 +323,11 @@ begin
   finally
     Part.Free;
   end;
+end;
+
+class function TSedaiRunner.SourceIsModern(const Source: string): Boolean;
+begin
+  Result := (not SourceHasLineNumbers(Source)) or SourceDeclaresNonFbDialect;
 end;
 
 class function TSedaiRunner.SourceHasLineNumbers(const Source: string): Boolean;
@@ -557,7 +567,7 @@ begin
     // Dialect auto-selected at LOAD by content: a program with line numbers is
     // classic; otherwise FreeBASIC/Modern (no line numbers). FreeBasicMode forces
     // Modern. Spaces-between-tokens and case-insensitivity hold in both dialects.
-    UseFreeBasic := FFreeBasicMode or (not SourceHasLineNumbers(Source.Text));
+    UseFreeBasic := FFreeBasicMode or SourceIsModern(Source.Text);   // fblite's numbers are labels (734)
     if FClassicOnly and UseFreeBasic then
     begin
       FLastError := Format(CLASSIC_ONLY_REFUSAL, [ExtractFileName(SourceFile)]);

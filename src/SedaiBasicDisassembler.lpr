@@ -54,6 +54,7 @@ uses
   SedaiConsoleState,
   Classes, SysUtils, fgl,
   SedaiBytecodeTypes, SedaiBytecodeSerializer, SedaiSSATypes,
+  SedaiLangMode,               // ProgramLangName: the language the header carries
   SedaiBytecodeDisassembler;   // shared instruction formatter (single source of truth, shared with sb --disasm)
 
 // Include version information
@@ -229,6 +230,8 @@ begin
           Output(Format('Variables:         %d', [BytecodeProgram.GetVariableCount]));
           Output(Format('String Constants:  %d', [BytecodeProgram.StringConstants.Count]));
           Output(Format('Arrays:            %d', [BytecodeProgram.GetArrayCount]));
+          // The language it was compiled as: classic, modern, fb or fblite (one format, one extension).
+          Output('Language:          ' + ProgramLangName(BytecodeProgram.ModernMode, BytecodeProgram.SourceLang));
           // The pointer model the program was compiled for (SedaiMemoryMode, .basc v6).
           if BytecodeProgram.NativeMemory then
             Output('Memory mode:       fb')
