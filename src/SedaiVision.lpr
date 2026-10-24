@@ -108,6 +108,9 @@ uses
 
 // The file runner sb uses, shared: `sbv --headless` runs a CLASSIC program through it, with no window and
 // the same engine options as sb (owner, 23 Oct 2026). It also brings GetSystemArchitecture and OptTrueValue.
+// ⛔ Its WITH_WINDOW code is sb's window presenter, whose units sbv does not name: the release builds every
+// target with -dWITH_WINDOW, and sbv stopped compiling there. sbv has its own window; the runner never opens one.
+{$UNDEF WITH_WINDOW}
 {$I SbCli.inc}
 
 { Print version banner }
