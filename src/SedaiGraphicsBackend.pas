@@ -84,6 +84,7 @@ type
     function  SurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
     procedure SetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
     procedure SyncSurfaceToRGB(Surface: TGfxSurface);   // low-depth bytes -> the 32bpp buffer
+    procedure SyncSurfaceToNative(Surface: TGfxSurface);   // ...and back (DIVERGENZE 726)
     // SCREENPTR: hand out the surface's pixel bytes so the VM can expose them as a raw-pointer region.
     // 32 bits per pixel, Width*Height*4 bytes, row pitch = Width*4. False when there is no such surface.
     function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
@@ -127,8 +128,9 @@ type
       means right now: a backend with no plain buffer, or one whose state makes PSET do more than
       store (a palette search, an active clip), answers False and the arm is refused wholesale.
       ⭐ Answering False is always safe - it costs speed, never correctness. }
+    // Mask: what the arm ANDs the colour with before storing it ($FFFFFFFF, or $FF on a screen of a byte per pixel)
     function PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
-                              out W, H: Integer): Boolean;
+                              out W, H: Integer; out Mask: Int64): Boolean;
   end;
 
   { Software reference backend: TGraphicsMemory + the *ToMemory primitives. No SDL, headless, fully
@@ -147,7 +149,7 @@ type
     destructor Destroy; override;
     function  SetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
     function  ResizeScreen(W, H, Depth: Integer): Boolean;
-    function  PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer): Boolean;
+    function  PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer; out Mask: Int64): Boolean;
     function  GetMode: TGraphicMode;
     function  InGraphics: Boolean;
     procedure ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
@@ -177,6 +179,7 @@ type
     function  SurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
     procedure SetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
     procedure SyncSurfaceToRGB(Surface: TGfxSurface);   // low-depth bytes -> the 32bpp buffer
+    procedure SyncSurfaceToNative(Surface: TGfxSurface);   // ...and back (DIVERGENZE 726)
     function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
@@ -234,13 +237,13 @@ begin
 end;
 
 function TSoftwareGraphicsBackend.PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
-                                                   out W, H: Integer): Boolean;
+                                                   out W, H: Integer; out Mask: Int64): Boolean;
 // Every condition under which PSET is MORE than one store is refused here, because the C arm tests
 // none of them: it tests the base it is handed and trusts this answer.
 var
   M: TGraphicsMemory;
 begin
-  Base := nil; W := 0; H := 0; Result := False;
+  Base := nil; W := 0; H := 0; Mask := $FFFFFFFF; Result := False;
   M := MemoryOf(Surface);
   if not Assigned(M) then Exit;
   if not Assigned(M.GraphicsBuffer) then Exit;
@@ -249,6 +252,15 @@ begin
                                                                 // second buffer to write
   if M.RowPixels <> M.State.Width then Exit;                    // a padded image row: the arm steps by the width
   if (Surface <> GFX_SCREEN_SURFACE) and (M.ImgBpp in [1, 2]) then Exit;   // 1/2-byte image: its bytes follow (677)
+  // ✅ DIVERGENZE 726: a low-depth screen reduces the colour as it stores it. At 1..8 bits that is still ONE store - the
+  // low byte, which the arms take with Mask - so the fast path stays (without it 8-bit PSET ran 3-6x slower, and the
+  // compiled code slower than the interpreter). At 16 it is a conversion, and with SCREENPTR's bytes exposed it is a
+  // second buffer to mark: refused.
+  if M.LowScreen then
+  begin
+    if (M.Depth > 8) or M.NativeExposed then Exit;
+    Mask := $FF;
+  end;
   Base := M.GraphicsBuffer; W := M.State.Width; H := M.State.Height;
   Result := (W > 0) and (H > 0);
 end;
@@ -433,7 +445,13 @@ procedure TSoftwareGraphicsBackend.SetSurfaceDepth(Surface: TGfxSurface; ADepth:
 var M: TGraphicsMemory;
 begin
   M := MemoryOf(Surface);
-  if Assigned(M) then M.SetDepth(ADepth);
+  if Assigned(M) then
+  begin
+    // DIVERGENZE 726: only a SCREEN page reduces its colours - and only screen pages are given a depth here (the VM
+    // calls this for page 0 and for the pages SCREENRES opens beside it; an image's format is SetSurfaceImageFormat)
+    M.IsScreen := True;
+    M.SetDepth(ADepth);
+  end;
 end;
 
 procedure TSoftwareGraphicsBackend.SyncSurfaceToRGB(Surface: TGfxSurface);
@@ -441,6 +459,13 @@ var M: TGraphicsMemory;
 begin
   M := MemoryOf(Surface);
   if Assigned(M) then M.SyncNativeToRGB;
+end;
+
+procedure TSoftwareGraphicsBackend.SyncSurfaceToNative(Surface: TGfxSurface);
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.SyncRGBToNative;
 end;
 
 function TSoftwareGraphicsBackend.SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
@@ -618,6 +643,8 @@ begin
   if not Assigned(M) then Exit;
   W := M.State.Width; H := M.State.Height;
   if (X < 0) or (Y < 0) or (X >= W) or (Y >= H) then Exit;
+  // DIVERGENZE 726: compared as the screen STORES it - unreduced, a fill colour never equals its own pixels
+  Color := M.DepthColor(Color);
   Target := M.GetPixel(X, Y);
   if Target = Color then Exit;
   Top := 0;
@@ -658,6 +685,8 @@ begin
   if not Assigned(M) then Exit;
   W := M.State.Width; H := M.State.Height;
   if (X < 0) or (Y < 0) or (X >= W) or (Y >= H) then Exit;
+  Color := M.DepthColor(Color);               // DIVERGENZE 726: compared as the screen stores them
+  BorderColor := M.DepthColor(BorderColor);
   if M.GetPixel(X, Y) = BorderColor then Exit;   // seed already on the border
   Top := 0;
   SetLength(Stack, 64);

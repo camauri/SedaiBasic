@@ -46,7 +46,7 @@ uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
-  Classes, SysUtils,
+  Classes, SysUtils, Math,
   // Preprocessor (runs before lexing)
   SedaiPreprocessor,
   // Where headers and libraries live (sedai.conf / SEDAI_* / fbc on the PATH) - see LoadConfig below
@@ -743,6 +743,11 @@ begin
     // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
     // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
     SetMultiByteConversionCodePage(CP_UTF8);
+  // ⛔ DIVERGENZE 738: the FP exceptions are MASKED, as sb and sbv do. The compiler FOLDS constant expressions,
+  // and with FPC's default - unmasked - `X = 1E300 * 1E300` stopped the compile with "Invalid floating point
+  // operation". The folded infinity is what CLASSIC's explicit overflow check then raises at run time, exactly
+  // as sbv does from the source; in MODERN it is the IEEE answer fbc gives.
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
   try
     // Set console code page to UTF-8
     {$IFDEF WINDOWS}

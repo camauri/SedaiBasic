@@ -208,7 +208,8 @@ double tan(double);
   X(0x033A, ArrayStoreSingle      ) \
   X(0x0081, NarrowInt             ) \
   X(0x0082, NarrowSingle          ) \
-  X(0x033B, PtrFromInt            )
+  X(0x033B, PtrFromInt            ) \
+  X(0x00AF, FloatOverflowCheck    )
 
 
 
@@ -550,6 +551,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         [0] framebuffer base of the draw surface, 0 = not ours
         [1] width in pixels   [2] height in pixels
         [3] address of FDrawPenX   [4] address of FDrawPenY
+        [5] colour mask: 0xFFFFFFFF, or 0xFF on a screen of a byte per pixel (DIVERGENZE 726)
      ⚠️ The pen is set even when the point falls OUTSIDE the surface, because the interpreter sets it
      after SetPixel unconditionally and POINTCOORD reads it. Clipping the store but not the pen is
      what the Pascal arm does, so it is what this one does. */
@@ -557,7 +559,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       if (!gfxdesc || !gfxdesc[0]) return pc;
       { int64_t x_ = ireg[I->s1], y_ = ireg[I->s2];
         if (x_ >= 0 && x_ < gfxdesc[1] && y_ >= 0 && y_ < gfxdesc[2])
-          ((uint32_t *)(intptr_t)gfxdesc[0])[y_ * gfxdesc[1] + x_] = (uint32_t)ireg[I->imm];
+          ((uint32_t *)(intptr_t)gfxdesc[0])[y_ * gfxdesc[1] + x_] = (uint32_t)(ireg[I->imm] & gfxdesc[5]);
         *(int32_t *)(intptr_t)gfxdesc[3] = (int32_t)x_;
         *(int32_t *)(intptr_t)gfxdesc[4] = (int32_t)y_; }
       pc++; NEXT;
@@ -877,6 +879,11 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         } else if (!(flags & HF_MODERN_ARRAYS) || !dd[0]) return pc; }
       pc++; NEXT;
 
+  L_FloatOverflowCheck:   /* bcFloatOverflowCheck (DIVERGENZE 738): CLASSIC's ?OVERFLOW ERROR. An all-ones exponent
+                             (infinity, or NaN) goes back to the interpreter, which raises; anything else passes. */
+      { uint64_t b_; __builtin_memcpy(&b_, &freg[I->s1], 8);
+        if (((b_ >> 52) & 0x7FF) == 0x7FF) return pc; }
+      pc++; NEXT;
 #undef NEXT
 #undef HOT_OP_LIST
 }

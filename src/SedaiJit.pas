@@ -76,7 +76,7 @@ type
 // value the route needs is the context object, and that is already in the frame slot the Xfer/record
 // accessors read. Pass nil for either and the route is off: every routable opcode bails the loop
 // again, which is the pre-J14 behaviour.
-// GfxDescOff is the byte offset of TExecutionContext.GfxDesc - the five Int64 the compiled PSET
+// GfxDescOff is the byte offset of TExecutionContext.GfxDesc - the six Int64 the compiled PSET
 // fast path reads (base, width, height, &penX, &penY). An OFFSET and not an address, for the same
 // reason as the banks below: the block is per-CONTEXT, so a worker running this same code reads its
 // own. Pass a negative value and PSET stays on the helper route.
@@ -1438,6 +1438,7 @@ var
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
+        bcFloatOverflowCheck: T(J^.Src1);            // DIVERGENZE 738: reads the float it guards, writes nothing
         bcFloatRound: T(J^.Src1);                    // CINT: float input, int Dest (-> ScanI)
         bcNegFloat, bcNarrowSingle, bcMathInt, bcMathAbs, bcMathSgn, bcMathFix:
           begin T(J^.Dest); T(J^.Src1); end;
@@ -2030,6 +2031,7 @@ var
     E.EmitBytes([$48, $8B, $08]);                                            // mov  rcx, [rax]
     E.EmitBytes([$48, $8D, $0C, $91]);                                       // lea  rcx, [rcx+rdx*4]
     ILoad(RDX, I^.Immediate);                                                // rdx = colour
+    E.EmitBytes([$23, $50, $28]);                                            // and  edx, [rax+40] (mask, 726)
     E.EmitBytes([$89, $11]);                                                 // mov  [rcx], edx
 
     E.Patch32(pNoStore1, LongWord(E.Len - (pNoStore1 + 4)));                 // @nostore
@@ -2949,6 +2951,21 @@ var
           FLoad(XMM0, I^.Src1);                                // xmm0 = dividend
           E.EmitBytes([$F2, $0F, $5E, $C1]);                   // divsd xmm0, xmm1
           FStore(I^.Dest, XMM0);
+        end;
+      // DIVERGENZE 738: CLASSIC's ?OVERFLOW ERROR. An all-ones exponent (infinity, or NaN) deopts and the
+      // interpreter raises; anything else falls through. Only CLASSIC emits the opcode. Callee -> bail, as above.
+      bcFloatOverflowCheck:
+        if InCallee then Exit
+        else
+        begin
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$66, $48, $0F, $7E, $C0]);              // movq rax, xmm0
+          E.EmitBytes([$48, $C1, $E8, $34]);                   // shr rax, 52
+          E.EmitBytes([$25, $FF, $07, $00, $00]);              // and eax, 7FFh
+          E.EmitBytes([$3D, $FF, $07, $00, $00]);              // cmp eax, 7FFh
+          E.EmitBytes([$75, $00]); pOk := E.Len - 1;           // jne @ok
+          DeoptTo(apc);
+          E.PatchByte(pOk, Byte(E.Len - (pOk + 1)));
         end;
       // Square root. MODERN (FreeBASIC) Sqr of a negative is NaN (no trap) -> sqrtsd unconditionally. CLASSIC
       // raises ?ILLEGAL QUANTITY on a negative operand; guard operand >= 0 and deopt otherwise (a NaN operand

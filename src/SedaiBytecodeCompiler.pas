@@ -354,6 +354,7 @@ begin
     ssaMutexUnlock: Result := bcMutexUnlock;
     ssaMutexDestroy: Result := bcMutexDestroy;
     ssaRandomize: Result := bcRandomize;
+    ssaFloatOverflowCheck: Result := bcFloatOverflowCheck;   // DIVERGENZE 738
     ssaCondCreate: Result := bcCondCreate;      // M5.4: condition variables
     ssaCondWait: Result := bcCondWait;
     ssaCondSignal: Result := bcCondSignal;

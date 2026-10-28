@@ -190,6 +190,7 @@ type
                             // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
     ArrayDefault: TASTNode; // ...and an ARRAY member's "= { a, b, ... }" (a BRACEINIT list, nil if none) (541)
     NestedDefault: TASTNode; // ...and a NESTED member's "= <expression of its type>", "one As U1 = U1("solo")" (648)
+    AnyInit: Boolean;       // "nested As T = Any": the member is NOT constructed implicitly (DIVERGENZE 737)
     FuncPtrSig: string;     // funcptr field ("fn As Function(...) As R" or "fn As <named funcptr type>"):
                             // "paramtypes|rettype" signature; the field is an int handle holding a proc
                             // entry PC. Empty if the field is not a function pointer. "obj.fn(args)" is an
@@ -4145,6 +4146,26 @@ begin
   // Always emit SourceLine for error reporting and TRON trace
   Instr.SourceLine := FCurrentLineNumber;
   FCurrentBlock.AddInstruction(Instr);
+
+  // ⛔ DIVERGENZE 738: Commodore BASIC answers ?OVERFLOW ERROR when a float result leaves the range. CLASSIC used to
+  // rely on the FP hardware trap for it, which answered 103 ("Domain error") in an sbv window and nothing at all under
+  // --headless, whose front end masks the trap as sb does. The check is now EXPLICIT and emitted HERE, in the one
+  // place every float operation passes through, so no emitter has to know: after each operation that can overflow,
+  // a check that reads its result. A constant already folded to infinity gets the same check - the fold happened
+  // before any operation was emitted. MODERN keeps IEEE (fbc lets the hardware compute), so nothing is emitted there.
+  if (not FModernMode) and (Dest.Kind = svkRegister) and (Dest.RegType = srtFloat) and
+     ((OpCode in [ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaPowFloat, ssaMathExp, ssaStrVal]) or
+      ((OpCode = ssaLoadConstFloat) and (Src1.Kind = svkConstFloat) and
+       (((PQWord(@Src1.ConstFloat)^ shr 52) and $7FF) = $7FF))) then
+  begin
+    Instr := TSSAInstruction.Create(ssaFloatOverflowCheck);
+    Instr.Dest := MakeSSAValue(svkNone);
+    Instr.Src1 := Dest;
+    Instr.Src2 := MakeSSAValue(svkNone);
+    Instr.Src3 := MakeSSAValue(svkNone);
+    Instr.SourceLine := FCurrentLineNumber;
+    FCurrentBlock.AddInstruction(Instr);
+  end;
 end;
 
 function TSSAGenerator.LastEmitted: TSSAInstruction;
@@ -36800,6 +36821,12 @@ begin
       FUDTs[Idx].Fields[n].DefaultExpr := nil;
       FUDTs[Idx].Fields[n].ArrayDefault := nil;
       FUDTs[Idx].Fields[n].NestedDefault := nil;
+      // ✅ DIVERGENZE 737 - "nested As T = Any" asks for no initialisation at all, and for a member whose type has a
+      // constructor that means the constructor is NOT called implicitly: the parent's constructor calls it itself
+      // ("nested.constructor()"), and fbc counts one call. It was called twice.
+      FUDTs[Idx].Fields[n].AnyInit := (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT <> '') and
+        (FieldNode.ChildCount >= 2) and (FieldNode.GetChild(FieldNode.ChildCount - 1).NodeType = antIdentifier) and
+        (FieldNode.GetChild(FieldNode.ChildCount - 1).ValueUpper = 'ANY');
       // ⭐ DIVERGENZE 648 - a NESTED member initialised by an EXPRESSION of its own type, "one As U1 = U1("solo")": it was
       // dropped (only the aggregate tuple below was kept), so the member came out default-constructed - empty. Kept apart
       // from DefaultExpr, whose readers decide nativity and scalar stores; EmitRecordInit copies it into the member.
@@ -44139,7 +44166,8 @@ begin
         EmitInstruction(ssaAddInt, NestedHandle, EnsureIntRegister(HandleVal),
                         EnsureIntRegister(MakeSSAConstInt(COfs[i])), MakeSSAValue(svkNone));
         EmitRecordInit(NestedHandle, NestedUDT, WithDefaults);
-        EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
+        if not FUDTs[UDTIdx].Fields[i].AnyInit then   // DIVERGENZE 737
+          EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
       end;
     // ⭐ ...and its field DEFAULTS, written on the raw path at the member's C offset (phase 3, "default" exclusion), after
     // the members' constructors and before the type's own, as the managed path orders them. Not for CAllocate.
@@ -44197,7 +44225,8 @@ begin
       begin
         NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);
         EmitRecordInit(NestedHandle, NestedUDT, WithDefaults);
-        EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
+        if not FUDTs[UDTIdx].Fields[i].AnyInit then   // DIVERGENZE 737
+          EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
         Continue;
       end;
       NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -44206,7 +44235,8 @@ begin
                       MakeSSAConstInt(0),
                       MakeSSAConstInt(FUDTs[NestedUDT].NStr or (Int64(NestedUDT) shl 32)));
       EmitRecordInit(NestedHandle, NestedUDT);   // deeper nesting
-      EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
+      if not FUDTs[UDTIdx].Fields[i].AnyInit then   // DIVERGENZE 737: "= Any" leaves it unconstructed
+        EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);  // M4.4: construct the nested member
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
     end;
@@ -45481,10 +45511,45 @@ procedure TSSAGenerator.EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDT
 // ("Dim As T v = (...)" and "v = Type(...)"), and only the first knew about the braces - the second
 // stored nothing and the member array read back zeros.
 var
-  j: Integer;
+  j, ElemU: Integer;
   ArgVal, ArrHandle, ElemH: TSSAValue;
+  ElemSlot: Int64;
 begin
   if (UDTIdx < 0) or (BraceNode = nil) then Exit;
+  // ✅ DIVERGENZE 733 - AN ELEMENT OF A RECORD-ARRAY MEMBER MAY BE A TUPLE: "b(0 To 1) As bar = { (111, { ... }), ... }"
+  // gives each element its fields, the inner braces its own array member, recursively. The element was evaluated as an
+  // EXPRESSION and its value (nothing a record can be) stored over the element, so every field read 0. Each tuple now
+  // initialises the element in place - through the element's handle when the member array is the VM's, through a view
+  // at the element's offset when it lives in the container's bytes - by the routine the top level uses.
+  ElemU := -1;
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsArray and (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType <> '') then
+    ElemU := FindUDT(UpperFast(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType));
+  if ElemU >= 0 then
+    for j := 0 to BraceNode.ChildCount - 1 do
+      if BraceNode.GetChild(j).Attributes.Values['TUPLEINIT'] = '1' then
+      begin
+        if FUDTs[UDTIdx].Fields[FieldIdx].InlineArray then
+        begin
+          ElemSlot := (((FUDTs[UDTIdx].Fields[FieldIdx].Slot shr 4) + Int64(j) * FUDTs[ElemU].LiveBytes) shl 4) or
+                      (FUDTs[UDTIdx].Fields[FieldIdx].Slot and $F);
+          if FRecNativeKnob and FNativeMemory and NativeRecordType(FUDTs[ElemU].Name) then
+            ElemSlot := ElemSlot or RECADDR_WANT;
+          ElemH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRefAddrField, ElemH, EnsureIntRegister(HandleVal), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(ElemSlot));
+        end
+        else
+        begin
+          ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+          ElemH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaArrayLoadIndInt, ElemH, ArrHandle, EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+        end;
+        EmitUDTAggregateInit(ElemH, ElemU, BraceNode.GetChild(j));
+      end;
+  if (ElemU >= 0) and (BraceNode.ChildCount > 0) and (BraceNode.GetChild(0).Attributes.Values['TUPLEINIT'] = '1') then
+    Exit;
   // ⛔ A brace list belongs to an ARRAY member and to nothing else - fbc says "Expected array" when the
   // field at that position is a scalar, and it is right: there is no meaning to give the values. Left
   // unchecked the list was evaluated as an ordinary expression and the fields came out scrambled.
@@ -53214,6 +53279,11 @@ var
            // the cast is the spelling a C API forces.
            IsRawPtrFieldExpr(Rhs.GetChild(0)) or IsRawPtrCellExpr(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) or
+           // ⛔ DIVERGENZE 727 - ...and pointer ARITHMETIC on a raw pointer: "Cast(UShort Ptr, p + 0)" left the
+           // target unmarked, so "w[1]" took the managed path and stepped ONE byte in strict (fbc steps two).
+           // The un-cast "q = p + n" has always been raw through RawPtrExprName below; this branch caught the
+           // cast first and never fell through to it.
+           (RawPtrExprName(Rhs.GetChild(0)) <> '') or
            // ⛔ DIVERGENZE 377 - ...and a UDT pointer laid over C's memory, which lives in the OTHER registry
            // (FRawUDTPtrs): "raw = Cast(Long Ptr, x)" with x from calloc read element 10 at offset 10 in strict (0;
            // fbc 7). The same two-registries shape as 249. SB_CAST_RAWUDT=0 is the A/B.

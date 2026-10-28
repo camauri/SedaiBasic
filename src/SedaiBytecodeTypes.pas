@@ -222,6 +222,9 @@ const
   // ⭐ DIVERGENZE 662: "Data @name" - FDataPool[Immediate] := IntRegs[Src1]. The item is an ADDRESS, known only once the
   // program runs (fbc knows it at link time): the pool gets a placeholder where the DATA sits and the entry code writes it.
   bcDataSetInt    = bcGroupCore + 174;
+  // ⛔ DIVERGENZE 738: CLASSIC only - FloatRegs[Src1] infinite (or NaN) raises ?OVERFLOW ERROR, as Commodore BASIC
+  // does; anything else does nothing. Emitted after every float operation that can overflow (SedaiSSA EmitInstruction).
+  bcFloatOverflowCheck = bcGroupCore + 175;
   bcRecordBlockLen  = bcGroupCore + 170; // Dest = how many CONSECUTIVE records the block starting at IntRegs[Src1] holds
                                         //   (1 when the handle is a lone record). What "Delete[] p" needs to run one
                                         //   destructor per element: fbc keeps the same number in a UInteger in front
@@ -2211,6 +2214,7 @@ begin
         172: Result := 'ForeignCallF';
         173: Result := 'ValueForC';        // DIVERGENZE 561
         174: Result := 'DataSetInt';       // DIVERGENZE 662
+        175: Result := 'FloatOverflowCheck'; // DIVERGENZE 738
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';

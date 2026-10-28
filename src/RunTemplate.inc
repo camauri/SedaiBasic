@@ -94,9 +94,10 @@ var
   HotBudgetExit: Boolean;  // this return was the budget running out, not an uncovered opcode
   // PSET's descriptor. Built HERE because this is the side that knows when a PSET is nothing but a
   // store: the C arm is handed a null base whenever it is not, and refuses itself wholesale.
-  HotGfxDesc: array[0..4] of Int64;
+  HotGfxDesc: array[0..5] of Int64;
   HotGfxBase: Pointer;
   HotGfxW, HotGfxH: Integer;
+  HotGfxMask: Int64;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
   HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
@@ -449,13 +450,14 @@ EventPollCounter := 0;
       if Assigned(FGraphics) and (not FGfxWinActive)
          and (FGfxViewOffsetX = 0) and (FGfxViewOffsetY = 0) then
       begin
-        if FGraphics.PixelStoreTarget(DrawSurface, HotGfxBase, HotGfxW, HotGfxH) then
+        if FGraphics.PixelStoreTarget(DrawSurface, HotGfxBase, HotGfxW, HotGfxH, HotGfxMask) then
         begin
           HotGfxDesc[0] := PtrUInt(HotGfxBase);
           HotGfxDesc[1] := HotGfxW;
           HotGfxDesc[2] := HotGfxH;
           HotGfxDesc[3] := PtrUInt(@FDrawPenX);
           HotGfxDesc[4] := PtrUInt(@FDrawPenY);
+          HotGfxDesc[5] := HotGfxMask;   // DIVERGENZE 726: the colour mask ($FF on a screen of a byte per pixel)
         end;
       end;
       if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
@@ -1518,6 +1520,12 @@ EventPollCounter := 0;
         bcShrUInt:  // SHR on an unsigned operand (UInteger/ULongInt): zero-filling
           begin
             IntRegs[Instr^.Dest] := LogicalShr64(IntRegs[Instr^.Src1], IntRegs[Instr^.Src2]);
+            Inc(CurPC);
+          end;
+        bcFloatOverflowCheck:  // DIVERGENZE 738: CLASSIC's ?OVERFLOW ERROR - an all-ones exponent is infinity (or NaN)
+          begin
+            if ((PQWord(@FloatRegs[Instr^.Src1])^ shr 52) and $7FF) = $7FF then
+              raise EOverflow.Create('Overflow');
             Inc(CurPC);
           end;
         bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)

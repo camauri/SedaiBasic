@@ -408,6 +408,8 @@ begin
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxCircleExF, ssaGfxDrawGML, ssaGfxDrawString,
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxPaletteUsing, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow, ssaGfxBFile,
+    // DIVERGENZE 738: it has no Dest and exists only to raise, so nothing consumes it.
+    ssaFloatOverflowCheck,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
     ssaScreenLock, ssaScreenUnlock,   // the frame boundary IS the effect: never dead
     // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must

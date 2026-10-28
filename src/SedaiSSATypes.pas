@@ -887,6 +887,9 @@ type
     // DIVERGENZE 663: BSAVE/BLOAD of fbgfx. Dest = code (int), Src1 = name (string), Src2 = pointer (int), Src3 =
     // svkConstInt 1 for BLOAD, PhiSources[0] = size (int), PhiSources[1] = palette pointer (int) -> bcGfxBFile.
     ssaGfxBFile,
+    // DIVERGENZE 738: CLASSIC only. Src1 = a float register just produced by an operation that can overflow;
+    // an infinite (or NaN) value raises ?OVERFLOW ERROR, as Commodore BASIC does -> bcFloatOverflowCheck.
+    ssaFloatOverflowCheck,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

@@ -319,6 +319,8 @@ begin
     bcVarArgPushFloat,   // staging a surplus argument: Src1 = the float value
     // RANDOMIZE: Src1 = the seed, a DOUBLE as fbc takes it (its QB algorithm reads the bits) (DIVERGENZE 542).
     bcRandomize,
+    // DIVERGENZE 738: CLASSIC's overflow check reads the float it guards.
+    bcFloatOverflowCheck,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic
     bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcNegFloat, bcPowFloat,

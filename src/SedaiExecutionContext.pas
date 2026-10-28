@@ -367,7 +367,7 @@ type
       and a width from another, and write outside the surface.
       ⚠️ Zero in element 0 means "do not take the fast path"; AotGfxRefresh is the ONE place that
       decides otherwise, and its gate has to stay the same as RunTemplate's HotGfxDesc. }
-    GfxDesc: array[0..4] of Int64;
+    GfxDesc: array[0..5] of Int64;   // [5] = the colour mask (DIVERGENZE 726)
 
     // --- Transfer slots (M2): carry args/result across a call's frame save/restore ---
     XferInt: array of Int64;

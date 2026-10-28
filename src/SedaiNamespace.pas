@@ -292,6 +292,61 @@ begin
   end;
 end;
 
+procedure CollectQualifiedDefinitions(AST: TASTNode; Ctx: TNsContext);
+// ✅ DIVERGENZE 736 - "Dim o.dv As o.dt" at module level DEFINES the variable namespace o declared Extern (the parser
+// emits it as a Dim of the dotted name only when o is a namespace). It is a member of o like one declared inside it, so
+// an unqualified "dv" in o's own procedures must reach it: without the key it fell through to a local of that name.
+// Run after CollectNamespaces, because the definition may follow the namespace anywhere in the module.
+var
+  i, j, DotPos: Integer;
+  D, Decl: TASTNode;
+  Nm: string;
+begin
+  for i := 0 to AST.ChildCount - 1 do
+  begin
+    D := AST.GetChild(i);
+    if (D = nil) or (D.NodeType <> antDim) then Continue;
+    for j := 0 to D.ChildCount - 1 do
+    begin
+      Decl := D.GetChild(j);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or (Decl.GetChild(0).NodeType <> antIdentifier) then
+        Continue;
+      Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      DotPos := LastDelimiter('.', Nm);
+      if (DotPos > 1) and (Ctx.NamespaceNames.IndexOf(Copy(Nm, 1, DotPos - 1)) >= 0) then
+        Ctx.MemberKeys.Add(Copy(Nm, 1, DotPos - 1) + '|' + Copy(Nm, DotPos + 1, MaxInt));
+    end;
+  end;
+end;
+
+function ResolveThroughNsUsing(const Dotted: string; Ctx: TNsContext): string;
+// ✅ DIVERGENZE 736 - "a.o.dt" where namespace a.o does not declare dt but IMPORTS a namespace that does ("Using t" inside
+// a.o): fbc reads the qualified name through that import, as it reads an unqualified one inside a.o. Answers the
+// declaring namespace's spelling ("A.T.DT"), or '' when the name is a member as written or nothing a.o sees declares it.
+var
+  DotPos, u: Integer;
+  Pfx, Last: string;
+  Closure: TStringList;
+begin
+  Result := '';
+  DotPos := LastDelimiter('.', Dotted);
+  if DotPos <= 1 then Exit;
+  Pfx := UpperCase(Copy(Dotted, 1, DotPos - 1));
+  Last := UpperCase(Copy(Dotted, DotPos + 1, MaxInt));
+  if (Last = '') or (Ctx.NamespaceNames.IndexOf(Pfx) < 0) or Ctx.IsMember(Pfx, Last) or
+     (Ctx.NamespaceNames.IndexOf(Pfx + '.' + Last) >= 0) then Exit;
+  Closure := TStringList.Create;
+  try
+    Closure.Sorted := True;
+    Closure.Duplicates := dupIgnore;
+    Ctx.AddUsingClosure(Pfx, Closure);
+    for u := 0 to Closure.Count - 1 do
+      if Ctx.IsMember(Closure[u], Last) then Exit(Closure[u] + '.' + Last);
+  finally
+    Closure.Free;
+  end;
+end;
+
 procedure CollectDimMembers(DimNode: TASTNode; const Prefix: string; Ctx: TNsContext);
 var
   i: Integer;
@@ -724,7 +779,7 @@ begin
       if Ctx.NamespaceNames.IndexOf(Using[u] + '.' + Base) >= 0 then Exit(Using[u] + '.' + Base);
 end;
 
-function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext; const ActivePrefix: string): string;
+function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext; const ActivePrefix: string; Using: TStringList): string;
 // The namespace a "Using N" statement names, or '' when this is not one.
 // ⛔ "USING" IS NOT PARSED AS A DIRECTIVE AT ALL: at statement level it is routed to PRINT USING (the
 // Commodore format clause), so it arrives here as antPrintUsing with the namespace name as its only
@@ -733,7 +788,7 @@ function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext; const ActivePrefix:
 // name exists the node is left exactly as it was.
 var
   Nm, P: string;
-  DotPos: Integer;
+  DotPos, u: Integer;
 begin
   Result := '';
   if (Node = nil) or (Node.NodeType <> antPrintUsing) or (Node.ChildCount <> 1) then Exit;
@@ -755,6 +810,12 @@ begin
     if DotPos = 0 then Break;
     P := Copy(P, 1, DotPos - 1);
   end;
+  // ✅ DIVERGENZE 732 - ...and relative to what an earlier "Using" has brought into scope: "Using outer" then, in a
+  // Scope, "Using inner" names outer.inner, as fbc reads it. Without this the directive matched no namespace, was left
+  // as a PRINT USING, and the procedure it imports was "Variable not declared".
+  if Using <> nil then
+    for u := 0 to Using.Count - 1 do
+      if Ctx.NamespaceNames.IndexOf(Using[u] + '.' + Nm) >= 0 then Exit(Using[u] + '.' + Nm);
 end;
 
 // PASS 2 — rewrite references (and member declaration names) bottom-up. Returns the node to use in
@@ -926,7 +987,7 @@ begin
       Ctx.CurNsPrefix := ChildPrefix;
       Ctx.CurNsIndex := i;
     end;
-    UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx, ChildPrefix);
+    UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx, ChildPrefix, UseUsing);
     if UsingNs <> '' then
     begin
       if UseUsing = Using then
@@ -1389,6 +1450,12 @@ begin
     begin
       Mangled := ResolveUnqualified('', BaseV, Ctx, Using);
       if Mangled <> '' then Node.Value := Mangled + SigV;
+    end
+    // ✅ DIVERGENZE 736 - a fully qualified name whose namespace reaches the member only through its own "Using"
+    else if (Pos('.', BaseV) > 0) and (Node.Attributes.Values['GLOBALSCOPE'] <> '1') then
+    begin
+      Mangled := ResolveThroughNsUsing(BaseV, Ctx);
+      if Mangled <> '' then Node.Value := Mangled + SigV;
     end;
   end;
 end;
@@ -1442,6 +1509,7 @@ begin
   try
     CollectNamespaces(AST, '', Ctx);
     if Ctx.NamespaceNames.Count = 0 then Exit;   // no namespaces: nothing to do
+    CollectQualifiedDefinitions(AST, Ctx);
     // The names the program declares at MODULE level, so an import cannot take one over.
     // ⭐ FIRST the FORWARD declarations, at position 0. A "Declare Function bar" emits no node, so the
     // only position BAR had was its BODY's - and a body written under the "Using" lost to the import:

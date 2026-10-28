@@ -169,6 +169,7 @@ type
     FProtoDecls: TStringList;         // "<ns>|<base>=<kind>#1<return>#1<variadic>#1<key>" per non-overloaded DECLARE
     FOvlProtos: TStringList;          // "<ns>|<base>"#2"<kind>#1<return>#1<variadic>#1<key>" per OVERLOAD DECLARE
     FNsPrefix: string;               // the namespace body being parsed ('' at module level)
+    FNsDeclared: TStringList;        // every namespace declared so far, dotted and upper case (DIVERGENZE 736)
     // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
     // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
     // check asks about the expression it is handed.
@@ -753,6 +754,9 @@ begin
   FForeignRedecls := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
   FExternNames := TStringList.Create;
+  FNsDeclared := TStringList.Create;
+  FNsDeclared.Sorted := True;
+  FNsDeclared.Duplicates := dupIgnore;
   FExternNames.Sorted := True;
   FExternNames.Duplicates := dupIgnore;
   FDeclTypeUses := TStringList.Create;
@@ -872,6 +876,7 @@ begin
   FGatedDeclared.Free;
   FForeignDataArrays.Free;
   FExternNames.Free;
+  FNsDeclared.Free;
   FDeclTypeUses.Free;
   FForwardDeclNames.Free;
   FProcSeen.Free;
@@ -6401,6 +6406,7 @@ var
   Token: TLexerToken;
   Stmt: TASTNode;
   NsName, PrevNs: string;
+  NsK: Integer;
   PrevIdx: Integer;
 begin
   Token := Context.CurrentToken;
@@ -6420,6 +6426,10 @@ begin
   PrevNs := FNsPrefix;
   if FNsPrefix = '' then FNsPrefix := UpperFast(NsName)
   else FNsPrefix := FNsPrefix + '.' + UpperFast(NsName);
+  // DIVERGENZE 736: every level of the path is a namespace ("Namespace a.b" declares a and a.b)
+  for NsK := 2 to Length(FNsPrefix) do
+    if FNsPrefix[NsK] = '.' then FNsDeclared.Add(Copy(FNsPrefix, 1, NsK - 1));
+  FNsDeclared.Add(FNsPrefix);
   try
 
   while not Context.Check(ttEndOfFile) do
@@ -12987,6 +12997,7 @@ var
   ValExpr, TupleNode, PadNode: TASTNode;
   SavedIdx, TupleDepth, StartCount, Stride, d, ItemCount: Integer;
   IsTuple: Boolean;
+  SavedLevels: array of Integer;
 begin
   if not Context.Check(ttDelimBraceOpen) then Exit;
   StartCount := InitList.ChildCount;
@@ -13021,7 +13032,25 @@ begin
           TupleNode := TASTNode.Create(antArgumentList, Context.CurrentToken);
           TupleNode.Attributes.Values['TUPLEINIT'] := '1';
           repeat
-            ValExpr := FExpressionParser.ParseExpression;
+            // ✅ DIVERGENZE 733 - an element of the tuple may itself be a brace list (an array member of the element's
+            // type, "( 111, { ( 222, { 1, 2, 3 } ), ... } )") or a tuple (a UDT member): read them as the top-level
+            // tuple reads its own elements. The expression parser stopped at the first "(" inside the braces with
+            // "Expected ')'". The level sizes belong to the OUTER array's dimensions: the nested read resets them.
+            SavedLevels := Copy(FInitLevelSizes);
+            if Context.Check(ttDelimBraceOpen) then
+            begin
+              ValExpr := TASTNode.Create(antArgumentList, Context.CurrentToken);
+              ValExpr.Attributes.Values['BRACEINIT'] := '1';
+              SetLength(FInitLevelSizes, 0);
+              ParseArrayInitBraceGroup(ValExpr, ConstDimSizes(nil), 0);
+            end
+            else
+            begin
+              ValExpr := nil;
+              if Context.Check(ttDelimParOpen) then ValExpr := TryParseAggregateTuple('', True);
+              if not Assigned(ValExpr) then ValExpr := FExpressionParser.ParseExpression;
+            end;
+            FInitLevelSizes := SavedLevels;
             if not Assigned(ValExpr) then Break;
             TupleNode.AddChild(ValExpr);
             if Context.Check(ttSeparParam) then Context.Advance else Break;
@@ -16504,6 +16533,8 @@ var
   StaticLB, StaticK: Integer;        // DIVERGENZE 94: the member array's lower bound, and the element index
   StaticSawParen: Boolean;
   StaticDotted: string;               // DIVERGENZE 93: the dotted name as written
+  StaticNsOwner: string;              // DIVERGENZE 736: the namespace a qualified definition belongs to, or ''
+  StaticNsDim, StaticNsDecl: TASTNode;
   StaticRefType: string;              // DIVERGENZE 269: the type after AS, for a static REFERENCE member
   StaticAfterAs: Boolean;
   StaticElem, StaticIdx, StaticAsg, InitList: TASTNode;
@@ -17025,6 +17056,72 @@ begin
             DoNodeCreated(Result);
             Exit;
           end;
+        end;
+        // ✅ DIVERGENZE 736 - ...BUT WHEN THE OWNER IS A NAMESPACE this is not a static member: it is the definition of a
+        // variable the namespace declared "Extern" ("Namespace o : Extern dv As dt : End Namespace" then "Dim o.dv As
+        // o.dt"), and nothing else gives it storage - the Extern is a declaration. A TYPE's static member is backed by
+        // the shared global its type declares, which is why this branch emits only the initializer; a namespace
+        // variable of a scalar type worked the same way by accident (the assignment created it), and one of a UDT
+        // type had no record at all: every field read 0. So a namespace owner gets a real (shared) Dim of the mangled
+        // name, which is what the same Dim written inside the namespace produces.
+        StaticNsOwner := '';
+        if LastDelimiter('.', StaticDotted) > 1 then
+        begin
+          StaticNsOwner := Copy(StaticDotted, 1, LastDelimiter('.', StaticDotted) - 1);
+          if FNsDeclared.IndexOf(StaticNsOwner) < 0 then
+            if (FNsPrefix <> '') and (FNsDeclared.IndexOf(UpperFast(FNsPrefix) + '.' + StaticNsOwner) >= 0) then
+            begin
+              StaticNsOwner := UpperFast(FNsPrefix) + '.' + StaticNsOwner;
+              StaticDotted := UpperFast(FNsPrefix) + '.' + StaticDotted;
+            end
+            else
+              StaticNsOwner := '';
+        end;
+        StaticRefType := StringReplace(StringReplace(StaticRefType, ' . ', '.', [rfReplaceAll]), ' .', '.', [rfReplaceAll]);
+        if (StaticNsOwner <> '') and (not StaticSawParen) and (not IsByref) and (StaticRefType <> '') and
+           (Pos(' ', StaticRefType) = 0) then
+        begin
+          StaticNsDim := TASTNode.Create(antDim, NameTok);
+          StaticNsDecl := TASTNode.Create(antArrayDecl, NameTok);
+          StaticNsDecl.Attributes.Values['SHARED'] := '1';
+          StaticNsDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticDotted, NameTok));
+          StaticNsDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticRefType, NameTok));
+          StaticNsDim.AddChild(StaticNsDecl);
+          Result.Free;
+          if Context.Check(ttOpEq) then
+          begin
+            Context.Advance;                   // '='
+            // "= ( 1234 )" / "= (a, b)": the aggregate initializer belongs on the Dim, as written inside the namespace
+            InitExpr := nil;
+            if Context.Check(ttDelimParOpen) then InitExpr := TryParseAggregateTuple(StaticRefType);
+            if Assigned(InitExpr) then
+            begin
+              StaticNsDecl.AddChild(InitExpr);
+              MemberAccess.Free;
+              Result := StaticNsDim;
+              DoNodeCreated(Result);
+              Exit;
+            end;
+            InitExpr := FExpressionParser.ParseExpression;
+            Result := TASTNode.Create(antBlock, NameTok);
+            Result.AddChild(StaticNsDim);
+            if Assigned(InitExpr) then
+            begin
+              StaticDef := TASTNode.Create(antAssignment, NameTok);
+              StaticDef.AddChild(MemberAccess);
+              StaticDef.AddChild(InitExpr);
+              Result.AddChild(StaticDef);
+            end
+            else
+              MemberAccess.Free;
+          end
+          else
+          begin
+            MemberAccess.Free;
+            Result := StaticNsDim;
+          end;
+          DoNodeCreated(Result);
+          Exit;
         end;
         if Context.Check(ttOpEq) then
         begin

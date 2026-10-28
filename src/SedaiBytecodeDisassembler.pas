@@ -665,6 +665,8 @@ begin
       Line := Format('%4d: %-20s type=%d, Imm=%d', [Index, 'DataAdd', Instr.Src1, Instr.Immediate]);
     bcDataSetInt:
       Line := Format('%4d: %-20s [%d] := R%d', [Index, 'DataSetInt', Instr.Immediate, Instr.Src1]);
+    bcFloatOverflowCheck:
+      Line := Format('%4d: %-20s F%d', [Index, 'FloatOverflowCheck', Instr.Src1]);
     bcDataReadInt:
       Line := Format('%4d: %-20s R%d', [Index, 'DataReadInt', Instr.Dest]);
     bcDataReadFloat:

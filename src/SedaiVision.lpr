@@ -501,6 +501,13 @@ begin
     // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
     // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
     SetMultiByteConversionCodePage(CP_UTF8);
+  // ⛔ The FP exceptions are MASKED for the whole process, as sb does (SbCli.inc), and for two reasons.
+  // DIVERGENZE 730: a software GL driver (Mesa llvmpipe, any machine without a GPU) divides by zero in its own
+  // threads, as C allows; with FPC's default - unmasked - sbv died of SIGFPE in `llvmpipe-4` before running a line.
+  // DIVERGENZE 738: CLASSIC no longer needs the trap - ?OVERFLOW ERROR is an explicit check the compiler emits
+  // after each float operation that can overflow, like ?DIVISION BY ZERO and ?ILLEGAL QUANTITY before it - and
+  // leaving the trap on made the window answer 103 where --headless (which already masked) answered inf.
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
   try
     // Set console code page to UTF-8 for proper character encoding
     {$IFDEF WINDOWS}

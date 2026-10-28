@@ -127,7 +127,7 @@ type
     // and therefore ends the stay first. A compiled region contains those statements, so entry is
     // not a boundary here: AotExecOne zeroes [0] on EVERY helper call instead, and the slow path
     // rebuilds it afterwards. Conservative, one store per helper call, and it cannot go stale.
-    GfxDesc: PInt64;       // offset 280: @<per-context 5-Int64 block>, nil = never take the fast path
+    GfxDesc: PInt64;       // offset 280: @<per-context 6-Int64 block ([5] = colour mask)>, nil = never take the fast path
     GfxRefresh: Pointer;   // offset 288: @AotGfxRefresh (VMSelf, CtxObj, desc) - rebuilds it
     // C9: the MATH family. One pointer to a TABLE rather than one ctx slot per function - there are
     // sixteen of them and a slot each would be sixteen offsets to keep in step for no gain. The
@@ -1261,6 +1261,7 @@ begin
     ssaAddInt, ssaSubInt, ssaMulInt, ssaDivInt, ssaModInt, ssaNegInt,
     ssaDivUInt, ssaModUInt,
     ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat, ssaNegFloat,
+    ssaFloatOverflowCheck,   // DIVERGENZE 738: CLASSIC's overflow check, a test and a deopt
     ssaIntToFloat, ssaFloatToInt, ssaFloatRound, ssaNarrowInt, ssaNarrowSingle,
     ssaCmpEqInt, ssaCmpNeInt, ssaCmpLtInt, ssaCmpGtInt, ssaCmpLeInt, ssaCmpGeInt,
     ssaCmpLtUInt, ssaCmpGtUInt, ssaCmpLeUInt, ssaCmpGeUInt,
@@ -3504,6 +3505,7 @@ var
     E.EmitBytes([$48, $8B, $08]);                          // mov  rcx, [rax]       rcx = base
     E.EmitBytes([$48, $8D, $0C, $91]);                     // lea  rcx, [rcx+rdx*4]
     ILoad(RDX, cr);                                        // rdx = colour
+    E.EmitBytes([$23, $50, $28]);                          // and  edx, [rax+40]    colour mask (DIVERGENZE 726)
     E.EmitBytes([$89, $11]);                               // mov  [rcx], edx       32-bit pixel
 
     E.Patch32(pNoStore1, LongWord(E.Len - (pNoStore1 + 4)));   // @nostore
@@ -5919,6 +5921,12 @@ var
             CountVal(Ins.Dest); CountVal(Ins.Src1);
             if Ins.OpCode = ssaDivFloat then CountVal(Ins.Src2);
           end;
+          ssaFloatOverflowCheck:     // DIVERGENZE 738 (CLASSIC only): deopts so the interpreter raises
+          begin
+            HasDeopt := True;
+            if Prog.GetSsaPc(o) < 0 then Fail('no-pc-trap');
+            CountVal(Ins.Src1);
+          end;
           ssaXferLoadInt, ssaXferLoadFloat: CountVal(Ins.Dest);
           ssaXferStoreInt, ssaXferStoreFloat: CountVal(Ins.Src1);
           ssaNarrowInt: begin CountVal(Ins.Dest); CountVal(Ins.Src1); end;
@@ -7476,6 +7484,20 @@ var
           E.EmitBytes([$F2, $0F, $5E, $C1]);           // divsd xmm0, xmm1
           FStore(FReg(Cur.Dest), XMM0);
         end;
+      end;
+      ssaFloatOverflowCheck:
+      begin
+        // DIVERGENZE 738: CLASSIC's ?OVERFLOW ERROR. An all-ones exponent (infinity, or NaN) deopts and the
+        // interpreter raises; anything else falls through. Same test as RunTemplate, hotdisp.c and the JIT.
+        apc := NeedPC; if not OK then Exit;
+        FLoad(XMM0, FReg(Cur.Src1));
+        E.EmitBytes([$66, $48, $0F, $7E, $C0]);        // movq rax, xmm0
+        E.EmitBytes([$48, $C1, $E8, $34]);             // shr rax, 52
+        E.EmitBytes([$25, $FF, $07, $00, $00]);        // and eax, 7FFh
+        E.EmitBytes([$3D, $FF, $07, $00, $00]);        // cmp eax, 7FFh
+        E.EmitBytes([$75, $00]); p1 := E.Len - 1;      // jne +ok
+        ExitTo(apc);
+        E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
       end;
       ssaNegFloat:
       begin

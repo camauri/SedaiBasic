@@ -102,6 +102,20 @@ type
     FImgPitch: Integer;
     FImgPixOwned: Boolean;
     FNativeBufferSize: Integer;
+    { ✅ DIVERGENZE 726 - THE SCREEN AT A LOW DEPTH HOLDS WHAT fbc's DOES. At 1..8 bits a pixel is a BYTE (PSET 300 reads
+      back 44, RGB(255, 0, 0) reads back 0, the untouched screen is 0), at 16 it is RGB565 read back with no alpha byte.
+      The 32bpp buffer keeps the primitives' shape, but every value is reduced to the depth as it is STORED - not when
+      it is read, or a flood fill with an unreduced colour would never see its own pixels and fill forever. Only the
+      SCREEN: an image at 1/2 bytes per pixel has its own reconciliation (ImagePull / ImagePush). FPresentBuf is the
+      ARGB picture an 8-bit screen shows, its bytes looked up in the palette. }
+    FIsScreen: Boolean;
+    { ...and FNativeShadow, the native bytes as the last SyncRGBToNative left them: SyncNativeToRGB carries over only the
+      pixels the PROGRAM changed since, so a picture drawn by a path that never reconciles (PRINT on a graphics screen)
+      is not overwritten by stale bytes. nil until SCREENPTR has exposed the bytes. }
+    FNativeShadow: PByte;
+    FRGBDirty: Boolean;   // the picture changed since the last SyncRGBToNative (one store per SetPixel)
+    FPresentBuf: PUInt32;
+    FPresentBufSize: Integer;
     // FreeBASIC VIEW clip rectangle (inclusive, physical pixels). When active, pixel writes outside it
     // are discarded. Reads (GetPixel) are unaffected.
     FClipActive: Boolean;
@@ -192,7 +206,14 @@ type
     property NativeBufferSize: Integer read FNativeBufferSize;
     function BytesPerPixel: Integer;
     procedure SetDepth(ADepth: Integer);        // (re)shape the native buffer for this depth
-    procedure SyncNativeToRGB;                  // indexed/16bpp bytes -> the 32bpp buffer the presenter reads
+    procedure SyncNativeToRGB;                  // indexed/16bpp bytes -> the 32bpp buffer the primitives draw into
+    procedure SyncRGBToNative;                  // ...and back, so SCREENPTR reads what was drawn (DIVERGENZE 726)
+    // DIVERGENZE 726: this memory is the SCREEN (set by the backend with the depth); LowScreen = a screen below 32 bits.
+    property IsScreen: Boolean read FIsScreen write FIsScreen;
+    function LowScreen: Boolean; inline;
+    function NativeExposed: Boolean; inline;    // SCREENPTR has handed out the native bytes (a shadow exists)
+    function DepthColor(C: UInt32): UInt32;     // C reduced to what a pixel of this screen can hold
+    function PresentPixels: PByte;              // the ARGB picture to show: the buffer itself, or its palette lookup
     // Read-only, and it exists so the C hot loop's PSET arm can be REFUSED while a clip is in
     // force: that arm writes the framebuffer directly and knows nothing about clipping.
     property ClipActive: Boolean read FClipActive;
@@ -236,6 +257,8 @@ var
   Mode: TGraphicMode;
 begin
   if Assigned(FNativeBuffer) then begin FreeMem(FNativeBuffer); FNativeBuffer := nil; end;
+  if Assigned(FPresentBuf) then begin FreeMem(FPresentBuf); FPresentBuf := nil; end;
+  if Assigned(FNativeShadow) then begin FreeMem(FNativeShadow); FNativeShadow := nil; end;
   if FImgPixOwned and Assigned(FImgPix) then begin FreeMem(FImgPix); FImgPix := nil; end;
   // Free text buffer (always separate)
   if Assigned(FTextBuffer) then FreeMem(FTextBuffer);
@@ -393,7 +416,7 @@ procedure TGraphicsMemory.SetDepth(ADepth: Integer);
 // 15 becomes 16 and 24 becomes 32 (measured against fbc 1.10.1, 8 Sep 2026). Doing the same here means
 // a program that asks for 15 and then reads SCREENINFO gets the same two numbers from both.
 var
-  Want: Integer;
+  Want, i: Integer;
 begin
   case ADepth of
     1, 2, 4, 8: Want := ADepth;
@@ -402,8 +425,14 @@ begin
     Want := 32;
   end;
   FDepth := Want;
+  if Assigned(FNativeShadow) then begin FreeMem(FNativeShadow); FNativeShadow := nil; end;
   if Assigned(FNativeBuffer) then begin FreeMem(FNativeBuffer); FNativeBuffer := nil; end;
   FNativeBufferSize := 0;
+  // DIVERGENZE 726: the screen was cleared before its depth was known (opaque black, &hFF000000): what it holds is
+  // reduced now, so an untouched 8-bit screen reads 0 as fbc's does.
+  if LowScreen and Assigned(FGraphicsBuffer) then
+    for i := 0 to FGraphicsBufferSize div 4 - 1 do
+      PUInt32(FGraphicsBuffer)[i] := DepthColor(PUInt32(FGraphicsBuffer)[i]);
   if (Want < 32) and (FState.Width > 0) and (FState.Height > 0) then
   begin
     FNativeBufferSize := FState.Width * FState.Height * BytesPerPixel;
@@ -412,48 +441,125 @@ begin
   end;
 end;
 
+function TGraphicsMemory.LowScreen: Boolean;
+begin
+  Result := FIsScreen and (FDepth < 32);
+end;
+
+function TGraphicsMemory.NativeExposed: Boolean;
+begin
+  Result := Assigned(FNativeShadow);
+end;
+
+function Expand565(c: Word): UInt32; inline;
+// RGB565 -> 8 bits per channel by REPEATING THE HIGH BITS, as fbc does ((r shl 3) or (r shr 2)), with no alpha byte:
+// that is what POINT answers on a 16-bit screen (measured: PSET RGB(10, 200, 30) reads back &h08CB18).
+begin
+  Result := (UInt32((((c shr 11) and $1F) shl 3) or (((c shr 11) and $1F) shr 2)) shl 16) or
+            (UInt32((((c shr 5) and $3F) shl 2) or (((c shr 5) and $3F) shr 4)) shl 8) or
+             UInt32(((c and $1F) shl 3) or ((c and $1F) shr 2));
+end;
+
+function Pack565(v: UInt32): Word; inline;
+begin
+  Result := Word((((v shr 16) and $FF) shr 3) shl 11) or Word((((v shr 8) and $FF) shr 2) shl 5) or
+            Word((v and $FF) shr 3);
+end;
+
+function TGraphicsMemory.DepthColor(C: UInt32): UInt32;
+// DIVERGENZE 726 - what one pixel of this screen can hold, as fbc stores it: the low BYTE at 1..8 bits (fbc keeps a
+// byte per pixel at every depth up to 8, and does not mask further: PSET 300 reads back 44 at depth 1 as at 8), RGB565
+// at 16. Anything else, and every surface that is not a low-depth screen, keeps the value whole.
+begin
+  if not LowScreen then Exit(C);
+  if FDepth <= 8 then Result := C and $FF
+  else Result := Expand565(Pack565(C));
+end;
+
 procedure TGraphicsMemory.SyncNativeToRGB;
-// ⛔ THE HALF THAT MAKES SCREENPTR WORK AT A LOW DEPTH. A program at 8bpp writes ONE BYTE per pixel
-// straight into the native buffer and never touches the RGBA one - which is what the presenter, POINT
-// and every blit read. So the two are reconciled here, and this is called before anything reads the
-// picture. O(w*h), which is what a real backend pays for an indexed mode too.
-// ⚠️ One direction only, on purpose: the native buffer is the TRUTH at a low depth. Copying the other
-// way would need a colour match per pixel and would undo a write the program has just made.
+// ⛔ THE HALF THAT MAKES SCREENPTR WORK AT A LOW DEPTH. A program at 8bpp writes ONE BYTE per pixel straight into the
+// native buffer and never touches the RGBA one - which is what POINT, every primitive and the presenter read.
+// ✅ DIVERGENZE 726: called before a graphics statement and before a present once SCREENPTR has exposed the bytes
+// (SyncRGBToNative goes the other way). The RGBA buffer of a low-depth screen holds the pixel's VALUE (the byte;
+// RGB565 expanded), not its palette colour - the palette is looked up only to show it (PresentPixels). Only a pixel
+// whose byte differs from the shadow is carried over: that is a write of the program's, everything else is already
+// the picture.
+var
+  n, i, bpp: Integer;
+  Dst: PUInt32;
+begin
+  if (FDepth >= 32) or not Assigned(FNativeBuffer) or not Assigned(FGraphicsBuffer) or not Assigned(FNativeShadow) then
+    Exit;
+  n := FState.Width * FState.Height;
+  if (n <= 0) or (RowPixels <> FState.Width) then Exit;
+  Dst := PUInt32(FGraphicsBuffer);
+  bpp := BytesPerPixel;
+  if CompareByte(FNativeBuffer^, FNativeShadow^, n * bpp) = 0 then Exit;   // nothing written: the common case
+  if bpp = 1 then
+  begin
+    for i := 0 to n - 1 do
+      if FNativeBuffer[i] <> FNativeShadow[i] then
+      begin
+        Dst[i] := FNativeBuffer[i];
+        FNativeShadow[i] := FNativeBuffer[i];
+      end;
+  end
+  else
+    for i := 0 to n - 1 do
+      if PWord(FNativeBuffer)[i] <> PWord(FNativeShadow)[i] then
+      begin
+        Dst[i] := Expand565(PWord(FNativeBuffer)[i]);
+        PWord(FNativeShadow)[i] := PWord(FNativeBuffer)[i];
+      end;
+end;
+
+procedure TGraphicsMemory.SyncRGBToNative;
+// DIVERGENZE 726 - the other direction: what has been drawn becomes the bytes SCREENPTR reads, and the shadow
+// remembers them.
 var
   n, i: Integer;
-  Src8: PByte;
-  Src16: PWord;
-  Dst: PUInt32;
-  c: Word;
+  Src: PUInt32;
 begin
   if (FDepth >= 32) or not Assigned(FNativeBuffer) or not Assigned(FGraphicsBuffer) then Exit;
   n := FState.Width * FState.Height;
-  if n <= 0 then Exit;
-  Dst := PUInt32(FGraphicsBuffer);
+  if (n <= 0) or (RowPixels <> FState.Width) or (FNativeBufferSize < n * BytesPerPixel) then Exit;
+  if Assigned(FNativeShadow) and not FRGBDirty then Exit;   // nothing drawn since: the bytes are already the picture
+  FRGBDirty := False;
+  Src := PUInt32(FGraphicsBuffer);
   if BytesPerPixel = 1 then
-  begin
-    Src8 := FNativeBuffer;
-    for i := 0 to n - 1 do
-    begin
-      Dst^ := FPalette[Src8^];
-      Inc(Src8); Inc(Dst);
-    end;
-  end
+    for i := 0 to n - 1 do FNativeBuffer[i] := Byte(Src[i])
   else
+    for i := 0 to n - 1 do PWord(FNativeBuffer)[i] := Pack565(Src[i]);
+  if not Assigned(FNativeShadow) then GetMem(FNativeShadow, FNativeBufferSize);
+  Move(FNativeBuffer^, FNativeShadow^, FNativeBufferSize);
+end;
+
+function TGraphicsMemory.PresentPixels: PByte;
+// DIVERGENZE 726 - the ARGB picture of this surface. At 1..8 bits the buffer holds palette INDICES, so what is shown
+// is their palette colour (the palette is ABGR, the picture ARGB); at 16 and 32 the buffer is the picture.
+var
+  n, i: Integer;
+  Src: PUInt32;
+  p: UInt32;
+begin
+  Result := FGraphicsBuffer;
+  SyncNativeToRGB;   // what the program wrote through SCREENPTR since the last statement (nothing without a shadow)
+  if not (LowScreen and (FDepth <= 8)) or not Assigned(FGraphicsBuffer) then Exit;
+  n := FGraphicsBufferSize div 4;
+  if n <= 0 then Exit;
+  if FPresentBufSize < n then
   begin
-    // 16bpp is RGB565, the layout fbc uses. Each channel is scaled back to eight bits by repeating its
-    // high bits, so full-scale in stays full-scale out (31 -> 255, not 248).
-    Src16 := PWord(FNativeBuffer);
-    for i := 0 to n - 1 do
-    begin
-      c := Src16^;
-      Dst^ := $FF000000 or
-              (UInt32(((c shr 11) and $1F) * 255 div 31) shl 16) or
-              (UInt32(((c shr 5) and $3F) * 255 div 63) shl 8) or
-              (UInt32((c and $1F) * 255 div 31));
-      Inc(Src16); Inc(Dst);
-    end;
+    if Assigned(FPresentBuf) then FreeMem(FPresentBuf);
+    GetMem(FPresentBuf, n * 4);
+    FPresentBufSize := n;
   end;
+  Src := PUInt32(FGraphicsBuffer);
+  for i := 0 to n - 1 do
+  begin
+    p := FPalette[Byte(Src[i])];
+    FPresentBuf[i] := $FF000000 or ((p and $FF) shl 16) or (p and $FF00) or ((p shr 16) and $FF);
+  end;
+  Result := PByte(FPresentBuf);
 end;
 
 function TGraphicsMemory.AllocateBuffers(Width, Height: Integer; PaletteMode: Boolean; Mode: TGraphicMode): Boolean;
@@ -629,6 +735,8 @@ begin
   else
   begin
     // Clear graphics buffer with specified color
+    ClearColor := DepthColor(ClearColor);   // DIVERGENZE 726: CLS on a low-depth screen stores the reduced colour
+    FRGBDirty := True;
     if Assigned(FGraphicsBuffer) then
     begin
       PixelCount := FGraphicsBufferSize div 4;
@@ -682,6 +790,10 @@ begin
   else
   begin
     // Non-classic mode: just clear with RGB
+    // DIVERGENZE 726: an indexed screen holds the INDEX, a 16-bit one the reduced colour
+    if LowScreen then
+      if FDepth <= 8 then RGB := PaletteIndex else RGB := DepthColor(RGB);
+    FRGBDirty := True;
     if Assigned(FGraphicsBuffer) then
     begin
       PixelCount := FGraphicsBufferSize div 4;
@@ -1123,6 +1235,11 @@ begin
 
     // Use palette color for graphics buffer
     RGB := FPalette[PaletteIndex];
+  end
+  else if FIsScreen and (FDepth < 32) then
+  begin
+    RGB := DepthColor(RGB);   // DIVERGENZE 726: a low-depth screen stores what a pixel of it can hold
+    FRGBDirty := True;
   end;
 
   // Save in RGB buffer

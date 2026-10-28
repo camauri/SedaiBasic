@@ -385,7 +385,8 @@ begin
       // framebuffer is (W*4 bytes per row, no padding) - that is why the per-row Move loop this
       // replaces was copying with a DIFFERENT destination pitch and is not needed here.
       if Assigned(FTexture) then
-        SDL_UpdateTexture(FTexture, nil, Mem.GraphicsBuffer, W * 4);
+        // DIVERGENZE 726: PresentPixels, because an 8-bit screen holds palette INDICES and shows their colour
+        SDL_UpdateTexture(FTexture, nil, Mem.PresentPixels, W * 4);
     end;
     SDL_SetRenderDrawColor(FRenderer, 0, 0, 0, 255);
     SDL_RenderClear(FRenderer);

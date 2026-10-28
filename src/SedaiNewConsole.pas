@@ -317,7 +317,7 @@ type
     // methods of different signatures. This is the live graphics device for running programs on sbv. ===
     function  GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
     function  GBResizeScreen(W, H, Depth: Integer): Boolean;
-    function  GBPixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer): Boolean;
+    function  GBPixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer; out Mask: Int64): Boolean;
     function  GBGetMode: TGraphicMode;
     function  GBInGraphics: Boolean;
     procedure GBClearSurface(Surface: TGfxSurface; Color: TGfxColor);
@@ -337,6 +337,7 @@ type
     function  GBSurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
     procedure GBSetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
     procedure GBSyncSurfaceToRGB(Surface: TGfxSurface);
+    procedure GBSyncSurfaceToNative(Surface: TGfxSurface);
     function  GBSurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
@@ -376,6 +377,7 @@ type
     function  IGraphicsBackend.SurfaceBytesPerPixel = GBSurfaceBytesPerPixel;
     procedure IGraphicsBackend.SetSurfaceDepth = GBSetSurfaceDepth;
     procedure IGraphicsBackend.SyncSurfaceToRGB = GBSyncSurfaceToRGB;
+    procedure IGraphicsBackend.SyncSurfaceToNative = GBSyncSurfaceToNative;
     function  IGraphicsBackend.SurfaceData = GBSurfaceData;
     procedure IGraphicsBackend.SetPixel = GBSetPixel;
     function  IGraphicsBackend.GetPixel = GBGetPixel;
@@ -3841,13 +3843,13 @@ end;
 // === TVideoController IGraphicsBackend implementation (delegates to the existing drawing methods) ===
 
 function TVideoController.GBPixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
-                                             out W, H: Integer): Boolean;
+                                             out W, H: Integer; out Mask: Int64): Boolean;
 // Refused, deliberately. This controller owns an SDL2 surface and makes no promise to keep the
 // pixels in a plain 32-bpp buffer of its own, so the C hot loop's PSET arm must not write one.
 // Answering False costs speed and never correctness; it can be implemented the day someone
 // measures that sbv wants it.
 begin
-  Base := nil; W := 0; H := 0; Result := False;
+  Base := nil; W := 0; H := 0; Mask := $FFFFFFFF; Result := False;
 end;
 
 function TVideoController.GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
@@ -4012,6 +4014,13 @@ var M: TGraphicsMemory;
 begin
   M := GBImageMem(Surface);
   if Assigned(M) then M.SyncNativeToRGB;
+end;
+
+procedure TVideoController.GBSyncSurfaceToNative(Surface: TGfxSurface);
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then M.SyncRGBToNative;
 end;
 
 procedure TVideoController.GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);

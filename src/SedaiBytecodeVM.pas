@@ -251,6 +251,9 @@ type
     // zero ExecuteGraphicsOp reconciles nothing.
     FImgBpp: array of Byte;
     FImgLowCount: Integer;
+    { DIVERGENZE 726: a SCREENPTR into a screen below 32 bits has been handed out, so the program may write the page's
+      own bytes: around every graphics statement they become the picture and the picture goes back into them. }
+    FGfxScreenNativeLive: Boolean;
     FImgNative: Boolean;
     FImgLastAddr: PtrUInt;
     FImgLastHandle: Integer;
@@ -11575,6 +11578,10 @@ begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
+        // DIVERGENZE 738: CLASSIC's overflow check reads one float register
+        bcFloatOverflowCheck:
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+
         // RANDOMIZE: Src1 = the seed (FLOAT, fbc takes a Double), Src2 = the algorithm (INT) - DIVERGENZE 542
         bcRandomize:
         begin
@@ -13814,6 +13821,10 @@ begin
             FDataPool[High(FDataPool)] := FProgram.StringConstants[Instr.Immediate];
         end;
       end;
+    bcFloatOverflowCheck:
+      // DIVERGENZE 738: CLASSIC's ?OVERFLOW ERROR - an all-ones exponent is infinity (or NaN). Same test as RunTemplate.
+      if ((PQWord(@Ctx.FloatRegs[Instr.Src1])^ shr 52) and $7FF) = $7FF then
+        raise EOverflow.Create('Overflow');
     bcDataSetInt:
       // DIVERGENZE 662: an ADDRESS item of a DATA statement, written by the entry code into the placeholder the pool
       // got where the DATA sits (bcDataAdd ran first, at the top of the entry block).
@@ -15164,6 +15175,7 @@ var
   D: PInt64;
   Base: Pointer;
   W, H: Integer;
+  Mask: Int64;
 begin
   D := PInt64(Desc);
   D[0] := 0;
@@ -15173,12 +15185,13 @@ begin
   if not Assigned(VM.FGraphics) then Exit;
   if VM.FGfxWinActive then Exit;
   if (VM.FGfxViewOffsetX <> 0) or (VM.FGfxViewOffsetY <> 0) then Exit;
-  if not VM.FGraphics.PixelStoreTarget(VM.DrawSurface, Base, W, H) then Exit;
+  if not VM.FGraphics.PixelStoreTarget(VM.DrawSurface, Base, W, H, Mask) then Exit;
   D[0] := PtrInt(Base);
   D[1] := W;
   D[2] := H;
   D[3] := PtrInt(@VM.FDrawPenX);
   D[4] := PtrInt(@VM.FDrawPenY);
+  D[5] := Mask;   // DIVERGENZE 726: the colour mask both compiled arms AND the colour with
   Result := D[0];
 end;
 
@@ -21681,13 +21694,31 @@ begin
   if Depth = 0 then Depth := 8;
   FGraphics.SetSurfaceDepth(FGraphics.ScreenSurface, Depth);
   FGfxScreenDepth := FGraphics.SurfaceDepth(FGraphics.ScreenSurface);
+  // ✅ DIVERGENZE 726: a new screen has the default colours of ITS depth, as fbc's - the brightest the depth can say in
+  // the default palette (1 bit 1, 2 bits 3, 4 and 8 bits 15) or white, on black. Measured with Color() and with a PSET
+  // that names no colour: at 8 bits the foreground was &hFFFFFFFF, which a byte per pixel stores as 255.
+  case FGfxScreenDepth of
+    1: FGfxForeColor := 1;
+    2: FGfxForeColor := 3;
+    4, 8: FGfxForeColor := 15;
+  else FGfxForeColor := $FFFFFFFF;
+  end;
+  if FGfxScreenDepth <= 8 then FGfxBackColor := 0 else FGfxBackColor := $FF000000;
+  FConColorFg := FGfxForeColor;
+  FConColorBg := FGfxBackColor;
+  FGraphics.SetTextColors(UInt32(FConColorFg), UInt32(FConColorBg));
   for i := 1 to High(FGfxPages) do
     if FGfxPages[i] <> GFX_SCREEN_SURFACE then FGraphics.DestroySurface(FGfxPages[i]);
   if NumPages < 1 then NumPages := 1;
   SetLength(FGfxPages, NumPages);
   FGfxPages[0] := GFX_SCREEN_SURFACE;
   for i := 1 to NumPages - 1 do
+  begin
     FGfxPages[i] := FGraphics.CreateSurface(W, H, $FF000000);   // opaque black (ARGB), as page 0
+    // DIVERGENZE 726: a page holds what page 0 holds - a byte per pixel at 8 bits, RGB565 at 16
+    if FGfxScreenDepth < 32 then FGraphics.SetSurfaceDepth(FGfxPages[i], FGfxScreenDepth);
+  end;
+  FGfxScreenNativeLive := False;   // a new screen: no SCREENPTR into it has been handed out yet
   FGfxWorkPage := 0;
   FGfxVisiblePage := 0;
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
@@ -21811,23 +21842,27 @@ procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBy
 // ✅ DIVERGENZE 677 - around a graphics statement whose target is a 1/2-byte image, the image's own bytes (which the
 // program may have written through its pointer) become the picture the primitives draw into, and after it the picture
 // goes back into the bytes. One test when no such image exists.
+// ✅ DIVERGENZE 726 - the same for the pages of a SCREEN below 32 bits once SCREENPTR has exposed their bytes: every
+// page, because PCOPY and SCREENCOPY write a page that is not the work page. Before the statement only the bytes the
+// program wrote are carried over (TGraphicsMemory.SyncNativeToRGB), so it costs one comparison when it wrote none.
 var
   T: Integer;
+  ImgLow: Boolean;
 begin
-  if FImgLowCount = 0 then
+  if (FImgLowCount = 0) and not FGfxScreenNativeLive then
   begin
     ExecuteGraphicsOpBody(Ctx, Instr);
     Exit;
   end;
+  if FGfxScreenNativeLive and Assigned(FGraphics) then
+    for T := 0 to High(FGfxPages) do FGraphics.SyncSurfaceToRGB(FGfxPages[T]);
   T := DrawSurface;
-  if (T > 0) and (ImgBppOf(T) < 4) and Assigned(FGraphics) then
-  begin
-    FGraphics.SyncImage(T, False);
-    ExecuteGraphicsOpBody(Ctx, Instr);
-    FGraphics.SyncImage(T, True);
-  end
-  else
-    ExecuteGraphicsOpBody(Ctx, Instr);
+  ImgLow := (FImgLowCount > 0) and (T > 0) and (ImgBppOf(T) < 4) and Assigned(FGraphics);
+  if ImgLow then FGraphics.SyncImage(T, False);
+  ExecuteGraphicsOpBody(Ctx, Instr);
+  if ImgLow then FGraphics.SyncImage(T, True);
+  if FGfxScreenNativeLive and Assigned(FGraphics) then
+    for T := 0 to High(FGfxPages) do FGraphics.SyncSurfaceToNative(FGfxPages[T]);
 end;
 
 procedure TBytecodeVM.ExecuteGraphicsOpBody(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -22172,6 +22207,11 @@ begin
         GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
         if PointOutsideView(GetX1, GetY1) then
           Ctx.IntRegs[Instr.Dest] := $FFFFFFFF
+        // ✅ DIVERGENZE 735: after SCREEN 0 there is no graphics screen, and fbc's POINT answers -1 (&hFFFFFFFF); this read
+        // the pixel of the screen that had been closed. An image named by the statement too: measured, fbc's
+        // "Point(1, 1, img)" answers -1 once the screen is gone, though the image still exists.
+        else if (not FGfxFBScreen) and (FGfxScreenDepth > 0) then
+          Ctx.IntRegs[Instr.Dest] := $FFFFFFFF
         else if (FImgLowCount > 0) and (DrawSurface > 0) and (ImgBppOf(DrawSurface) = 2) then
           // DIVERGENZE 677: a 16bpp image answers the colour with no alpha byte, as fbc's (RGB565 has none)
           Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GetX1, GetY1)) and $FFFFFF
@@ -22332,8 +22372,26 @@ begin
       case Instr.Immediate of
         1: Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor);
         // DIVERGENZE 668: with libfb's console not initialised Color() answers 0, whatever COLOR set
-        2: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0 else Ctx.IntRegs[Instr.Dest] := FConColorFg;
-        3: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0 else Ctx.IntRegs[Instr.Dest] := FConColorBg;
+        // ✅ DIVERGENZE 726: on a graphics screen the colours are what a pixel of it holds, as fbc keeps them: below 32
+        // bits the low byte each (Color() packs them, fg | bg shl 16), at 16 the foreground alone as RGB565 with its
+        // alpha byte, at 32 the foreground alone. Measured: 8 bits "Color 300" answers &h2002C, 32 bits &hFF010203.
+        2: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0
+           else if FGfxFBScreen and (FGfxScreenDepth > 0) and (FGfxScreenDepth <= 8) then
+             Ctx.IntRegs[Instr.Dest] := FConColorFg and $FF
+           else if FGfxFBScreen and (FGfxScreenDepth = 16) then
+             Ctx.IntRegs[Instr.Dest] := Int64($FF000000) or
+               ((((FConColorFg shr 19) and $1F) shl 3) or (((FConColorFg shr 19) and $1F) shr 2)) shl 16 or
+               ((((FConColorFg shr 10) and $3F) shl 2) or (((FConColorFg shr 10) and $3F) shr 4)) shl 8 or
+               ((((FConColorFg shr 3) and $1F) shl 3) or (((FConColorFg shr 3) and $1F) shr 2))
+           else if FGfxFBScreen and (FGfxScreenDepth > 8) then
+             Ctx.IntRegs[Instr.Dest] := UInt32(FConColorFg)
+           else Ctx.IntRegs[Instr.Dest] := FConColorFg;
+        3: if FbConsoleBare then Ctx.IntRegs[Instr.Dest] := 0
+           else if FGfxFBScreen and (FGfxScreenDepth > 0) and (FGfxScreenDepth <= 8) then
+             Ctx.IntRegs[Instr.Dest] := FConColorBg and $FF
+           else if FGfxFBScreen and (FGfxScreenDepth > 8) then
+             Ctx.IntRegs[Instr.Dest] := 0
+           else Ctx.IntRegs[Instr.Dest] := FConColorBg;
         // 4: LOCATE()'s visibility bit - the cursor is shown unless LOCATE hid it on a terminal (DIVERGENZE 415)
         4: if TcActive and not TcCursorVisible then Ctx.IntRegs[Instr.Dest] := 0
            else Ctx.IntRegs[Instr.Dest] := $10000;
@@ -22571,8 +22629,18 @@ begin
         // pointer to page 2 and one to page 1 were the same value and both read whatever SCREENSET had
         // selected last, so a scale-up that reads one page and writes another copied a page onto itself.
         if Assigned(FGraphics) and FGraphics.SurfaceData(FGfxWorkSurface, ScrData, ScrSize) and (ScrSize > 0) then
+        begin
           Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_FB
-                                     or ((Int64(FGfxWorkPage) + 1) shl RAWPTR_FB_PAGE_SHIFT)
+                                     or ((Int64(FGfxWorkPage) + 1) shl RAWPTR_FB_PAGE_SHIFT);
+          // ✅ DIVERGENZE 726: below 32 bits the pointer walks the page's OWN bytes (one per pixel, or RGB565), which
+          // until now were never filled from the picture nor read back into it. They start as what has been drawn,
+          // and from here on every graphics statement reconciles the two (ExecuteGraphicsOp).
+          if FGfxScreenDepth < 32 then
+          begin
+            for ImgHandle := 0 to High(FGfxPages) do FGraphics.SyncSurfaceToNative(FGfxPages[ImgHandle]);
+            FGfxScreenNativeLive := True;
+          end;
+        end
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
