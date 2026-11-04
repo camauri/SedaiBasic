@@ -2,7 +2,7 @@
 #
 # SedaiBasic Build Script
 # Copyright (c) 2025 Maurizio Cammalleri
-# Released under GNU GPL v3 or Commercial License
+# Released under GNU GPL v3 (GPL-3.0-only) with the GCC Runtime Library Exception 3.1 (COPYING.RUNTIME)
 #
 # The reference for this script is build.ps1, not the memory of how build.sh used to be.
 # Kept to standard bash: no distribution-specific tools.

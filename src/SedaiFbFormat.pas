@@ -2,7 +2,7 @@
   SedaiFbFormat - string.bi's Format(), as fbc's runtime answers it
 
   Copyright (C) 2026 Maurizio Cammalleri
-  Released under GNU GPL v3 (see LICENCE.md)
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see LICENSE, COPYING.RUNTIME)
 
   ⛔ WHY THIS UNIT EXISTS (17 Sep 2026, the `string` library deck). Our FORMAT was written from the manual and
   answered differently from fbc on most of a 21-mask sweep: 1e21 overflowed to -9223372036854775808, 12.345

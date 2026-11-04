@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiTermConsole;
 
@@ -88,6 +87,10 @@ procedure TcGetXY(out Col, Row: Integer);  // asks the terminal; falls back on t
 // VIEW PRINT First TO Last (1-based; <= 0 = the whole screen): the terminal's scroll region and the cursor to the
 // start of the area, as libfb's fb_ConsoleViewUpdate + LOCATE. Answers the rows it used.
 procedure TcViewPrint(var First, Last: Integer);
+// SCREEN 0 closing a graphics screen that a WINDOW showed (DIVERGENZE 729): libfb gives the console back
+// cleared, with the whole screen as the print area - measured on a pty, the bytes are "clear, full scroll
+// region, home, clear, full scroll region".
+procedure TcScreenZero;
 function TcCursorVisible: Boolean;
 function TcColorFg: Integer;
 function TcColorBg: Integer;
@@ -124,6 +127,7 @@ begin NewRow := Row; NewCol := Col; Result := 0; end;
 procedure TcClear(Mode, FirstRow, LastRow: Integer); begin end;
 procedure TcGetXY(out Col, Row: Integer); begin Col := 1; Row := 1; end;
 procedure TcViewPrint(var First, Last: Integer); begin end;
+procedure TcScreenZero; begin end;
 function TcCursorVisible: Boolean; begin Result := True; end;
 function TcColorFg: Integer; begin Result := 0; end;
 function TcColorBg: Integer; begin Result := 0; end;
@@ -478,6 +482,7 @@ procedure Emit(const S: string);
 // Through the stream PRINT uses, flushed: an escape sequence must not overtake text written before it.
 begin
   if S = '' then Exit;
+  if GfxScreenOwnsText then Exit;   // DIVERGENZE 729: a window shows a graphics screen - it is the console
   TerminalWriteRaw(StripPadding(S));
 end;
 
@@ -889,6 +894,19 @@ begin
   GScrollChanged := True;
   if Cap(CAP_CSR) <> '' then Emit(TParm(Cap(CAP_CSR), First - 1, Last - 1));
   TcLocate(First, 1, -1, R, C);
+end;
+
+procedure TcScreenZero;
+begin
+  if not GActive then Exit;
+  RecheckSize;
+  TcClear(0, 1, GRows);
+  GViewTop := 1; GViewBot := GRows;
+  if Cap(CAP_CSR) <> '' then Emit(TParm(Cap(CAP_CSR), 0, GRows - 1));
+  EmitCup(0, 0);
+  TcClear(0, 1, GRows);
+  if Cap(CAP_CSR) <> '' then Emit(TParm(Cap(CAP_CSR), 0, GRows - 1));
+  GScrollChanged := False;
 end;
 
 function TcPrintText(const S: string): string;

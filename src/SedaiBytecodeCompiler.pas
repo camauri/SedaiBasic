@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiBytecodeCompiler;
 
@@ -443,6 +442,9 @@ begin
     ssaGfxDrawGML: Result := bcGfxDrawGML;
     ssaGfxDrawString: Result := bcGfxDrawString;
     ssaGfxPointCoord: Result := bcGfxPointCoord;
+    ssaGfxCtlStr: Result := bcGfxCtlStr;         // DIVERGENZE 741
+    ssaGfxCtlSetStr: Result := bcGfxCtlSetStr;   // DIVERGENZE 741
+    ssaGfxCtlSetInt: Result := bcGfxCtlSetInt;   // DIVERGENZE 741 (emitted by hand below: Src3 -> Dest)
     ssaGfxScreenList: Result := bcGfxScreenList;
     ssaGfxPoint: Result := bcGfxPoint;
     ssaConScreen: Result := bcConScreen;
@@ -818,6 +820,17 @@ begin
 
       BCInstr.Immediate := (BRegMapped shl 16) or ARegMapped;
     end;
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
+  // DIVERGENZE 741: ssaGfxCtlSetInt - Src1 = what, Src2 = param1, Src3 = param2 -> Dest (READ, see SedaiOpcodeBanks).
+  if Instr.OpCode = ssaGfxCtlSetInt then
+  begin
+    BCInstr := MakeBytecodeInstruction(bcGfxCtlSetInt, 0, 0, 0, 0);
+    BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

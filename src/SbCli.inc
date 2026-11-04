@@ -719,6 +719,8 @@ end;
 function TAutoWindow.Open: Boolean;
 begin
   Result := False;
+  // DIVERGENZE 740: "ScreenRes ..., GFX_NULL" asks for fbc's Null driver - no window, even where one could open
+  if VM.GfxActiveDriver = 'Null' then Exit;
   VM.ScreenModeCallback := nil;   // asked once: a later SCREENRES resizes the window that exists
   try
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
@@ -731,7 +733,10 @@ begin
     end;
   end;
   WirePresenter(VM);
+  if Assigned(GTermCtrl) then GTermCtrl.SetWindowShown(True);   // DIVERGENZE 729
 end;
+
+{$ENDIF}
 
 // Is there a screen to open a window on? On Unix the answer is in the environment; a session with
 // neither variable (ssh, a service, a CI runner) is headless, and opening a window there would fail.
@@ -743,16 +748,56 @@ begin
   Result := True;
   {$ENDIF}
 end;
-{$ENDIF}
+
+// ⭐ DIVERGENZE 740 - THE DRIVER, CHOSEN AS fbc CHOOSES IT. FBGFX names one ("null" is the off-screen Null driver, any
+// spelling); --headless and SB_HEADLESS=1 are sb's own names for the same; otherwise a WINDOW when there is a display
+// and this build can open one, and when there is neither, NO driver - SCREENRES then answers 1 and PRINT stays on
+// stdout, as an fbc executable does on a machine with no display.
+function ChooseGfxDriver: Integer;
+var
+  Req: string;
+begin
+  Req := UpperCase(GetEnvironmentVariable('FBGFX'));
+  if (Req = 'NULL') or OptHeadless or (GetEnvironmentVariable('SB_HEADLESS') = '1') then Exit(GFXDRV_NULL);
+  {$IFDEF WITH_WINDOW}
+  if OptWindow or DisplayAvailable then Exit(GFXDRV_WINDOW);
+  {$ENDIF}
+  Result := GFXDRV_NONE;
+end;
+
+function GfxWindowDriverName: string;
+begin
+  {$IFDEF WINDOWS}
+  Result := 'GDI';
+  {$ELSE}
+  Result := 'X11';
+  {$ENDIF}
+end;
 
 // Graphics setup shared by both run paths: a window presenter (sb --window, WITH_WINDOW build) or the
 // plain headless software backend (default — the regression target never opens a window).
 procedure SetupVMGraphics(AVM: TBytecodeVM);
 {$IFDEF WITH_WINDOW}
 var SW: TSoftwareGraphicsBackend;
+    DW, DH, DD: Integer;
 {$ENDIF}
 begin
+  // DIVERGENZE 740: which driver, its name, and the desktop SCREENINFO answers before a screen (fbc's Null and
+  // driverless answer: 320 200 32; a window: the real desktop)
+  AVM.GfxDriverKind := ChooseGfxDriver;
+  AVM.GfxDesktopW := 320; AVM.GfxDesktopH := 200; AVM.GfxDesktopDepth := 32;
+  case AVM.GfxDriverKind of
+    GFXDRV_NULL:   AVM.GfxDriverName := 'Null';
+    GFXDRV_WINDOW: AVM.GfxDriverName := GfxWindowDriverName;
+  else             AVM.GfxDriverName := '';
+  end;
   {$IFDEF WITH_WINDOW}
+  // ...and fbc asks the display for the desktop whatever the driver - under Null too - when there is one
+  if ((AVM.GfxDriverKind = GFXDRV_WINDOW) or ((AVM.GfxDriverKind = GFXDRV_NULL) and DisplayAvailable)) and
+     WindowDesktopSize(DW, DH, DD) then
+  begin
+    AVM.GfxDesktopW := DW; AVM.GfxDesktopH := DH; AVM.GfxDesktopDepth := DD;
+  end;
   if OptWindow then
   begin
     SW := TSoftwareGraphicsBackend.Create;
@@ -765,9 +810,10 @@ begin
     if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
     WirePresenter(AVM);
+    if Assigned(GTermCtrl) then GTermCtrl.SetWindowShown(True);   // DIVERGENZE 729
     Exit;
   end;
-  if not OptHeadless and (GetEnvironmentVariable('SB_HEADLESS') <> '1') and DisplayAvailable then
+  if AVM.GfxDriverKind = GFXDRV_WINDOW then
   begin
     // The headless wiring, with a backend this unit holds so the window can mirror it later.
     SW := TSoftwareGraphicsBackend.Create;

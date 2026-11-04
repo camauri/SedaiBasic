@@ -7,7 +7,8 @@
   Sprites are rendered as a layer on top of the text/graphics screen,
   similar to the C128 VIC-IIe sprite hardware.
 
-  Copyright (c) 2024-2025 Artiforge
+  Copyright (C) 2025 Maurizio Cammalleri
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see LICENSE, COPYING.RUNTIME)
 }
 unit SedaiSpriteEngine;
 

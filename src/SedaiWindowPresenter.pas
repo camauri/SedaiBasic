@@ -2,15 +2,16 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
- *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 
 { Lightweight SDL2 window presenter for the CLI VM (`sb --window`).
@@ -54,6 +55,10 @@ type
     procedure WaitClose;        // keep presenting at ~60 fps until the window is closed
     property Closed: Boolean read FClosed;
   end;
+
+// The desktop a window would open on - SCREENINFO's answer before any screen, as fbc reads it from X (DIVERGENZE 740).
+// False when the video cannot start: the caller keeps its own answer.
+function WindowDesktopSize(out W, H, Depth: Integer): Boolean;
 {$ENDIF}
 
 implementation
@@ -202,6 +207,25 @@ begin
   for i := 0 to n - 1 do
     if (i < 32) and (SDL_JoystickGetButton(GJoy[Id], i) <> 0) then Buttons := Buttons or (1 shl i);
   Result := True;
+end;
+
+function WindowDesktopSize(out W, H, Depth: Integer): Boolean;
+var
+  Mode: TSDL_DisplayMode;
+  Bits: Integer;
+begin
+  W := 0; H := 0; Depth := 0;
+  Result := False;
+  if not EnsureSDL2Bound then Exit;
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+  if SDL_WasInit(SDL_INIT_VIDEO) = 0 then
+    if SDL_InitSubSystem(SDL_INIT_VIDEO) < 0 then Exit;
+  if SDL_GetDesktopDisplayMode(0, @Mode) <> 0 then Exit;
+  W := Mode.w; H := Mode.h;
+  Bits := (Mode.format shr 8) and $FF;   // SDL_BITSPERPIXEL: 24 for an RGB888 desktop, as X reports it to fbc
+  if Bits <= 0 then Bits := 32;
+  Depth := Bits;
+  Result := (W > 0) and (H > 0);
 end;
 
 constructor TWindowPresenter.Create(ABackend: TSoftwareGraphicsBackend; const Title: string);

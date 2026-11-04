@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiPackratParser;
 
@@ -9429,7 +9428,14 @@ begin
        LooksLikeImageTarget then
       Result := TASTNode.Create(antGfxCircle, Token)
     else
+    begin
       Result := TASTNode.Create(antCircle, Token);
+      // ⛔ DIVERGENZE 743: the COMMODORE form ("CIRCLE source, x, y, r", "CIRCLE , x, y, r") in a FreeBASIC program is
+      // fbc's "error 6: Expected '('" - MODERN is FreeBASIC only (the owner, 9 Sep 2026: no salad with CLASSIC)
+      if FModernMode and (GetEnvironmentVariable('SB_C128FORMS') <> '1') then
+        Context.AddError('Expected ''('': CIRCLE takes (x, y), radius in FreeBASIC - "CIRCLE source, x, y, ..." is the ' +
+                         'Commodore form, CLASSIC only', Token);
+    end;
   end
   else if CmdName = 'DRAW' then
   begin
@@ -9446,7 +9452,14 @@ begin
       Context.Advance;
     end
     else
+    begin
       Result := TASTNode.Create(antDraw, Token);
+      // DIVERGENZE 743: "DRAW , x, y" is the Commodore form; FreeBASIC's DRAW takes [target,] a command string
+      if FModernMode and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparParam) and
+         (GetEnvironmentVariable('SB_C128FORMS') <> '1') then
+        Context.AddError('Expected expression: DRAW takes [target,] a command string in FreeBASIC - "DRAW , x, y" is ' +
+                         'the Commodore form, CLASSIC only', Token);
+    end;
   end
   else if CmdName = 'LOCATE' then
     Result := TASTNode.Create(antLocate, Token)
@@ -9472,7 +9485,12 @@ begin
        LooksLikeImageTarget then
       Result := TASTNode.Create(antGfxPaint, Token)
     else
+    begin
       Result := TASTNode.Create(antPaint, Token);
+      if FModernMode and (GetEnvironmentVariable('SB_C128FORMS') <> '1') then   // DIVERGENZE 743
+        Context.AddError('Expected ''('': PAINT takes (x, y) in FreeBASIC - "PAINT source, x, y" is the Commodore ' +
+                         'form, CLASSIC only', Token);
+    end;
   end
   else if CmdName = 'WINDOW' then
   begin
@@ -9484,7 +9502,12 @@ begin
        (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Result := TASTNode.Create(antGfxWindow, Token)
     else
+    begin
       Result := TASTNode.Create(antWindow, Token);
+      if FModernMode and (GetEnvironmentVariable('SB_C128FORMS') <> '1') then   // DIVERGENZE 743
+        Context.AddError('Expected ''('': WINDOW takes [SCREEN] (x1, y1)-(x2, y2) in FreeBASIC - "WINDOW col1, row1, ' +
+                         '..." is the Commodore text window, CLASSIC only', Token);
+    end;
   end
   else if CmdName = 'SSHAPE' then
     Result := TASTNode.Create(antSShape, Token)
@@ -9967,6 +9990,10 @@ begin
   // primitives with no effect on the buffered/headless backend). Consume any arguments, emit nothing.
   if Result.NodeType = antGfxNop then
   begin
+    // ⭐ WINDOWTITLE keeps its caption now (DIVERGENZE 741): it is SCREENCONTROL SET_WINDOW_TITLE
+    if (Result.Attributes.Values['NOP'] = 'WINDOWTITLE') and
+       not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      Result.AddChild(ParseExpression);
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
       Context.Advance;
     DoNodeCreated(Result);
@@ -11180,7 +11207,12 @@ begin
     'SETENVIRON': Result := TASTNode.Create(antSetenviron, Token);
     'SHELL': Result := TASTNode.Create(antShell, Token);
     'OUT': Result := TASTNode.Create(antOut, Token);
-    'SCREENCONTROL': Result := TASTNode.Create(antOut, Token);   // no-op: evaluate and discard the arguments
+    'SCREENCONTROL':
+      begin
+        // DIVERGENZE 741: OUT's argument list, lowered by ProcessScreenControl - it used to be discarded
+        Result := TASTNode.Create(antOut, Token);
+        Result.Attributes.Values['SCREENCONTROL'] := '1';
+      end;
     'MOVE', 'MV': Result := TASTNode.Create(antMove, Token);
     // FreeBASIC/QB filesystem mutation: KILL deletes a file (= SCRATCH), FILECOPY copies (= COPY),
     // RMDIR removes a directory (new).

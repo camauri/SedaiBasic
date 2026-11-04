@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiBytecodeVM;
 
@@ -121,6 +120,15 @@ type
 
   { Event poll callback for keeping UI responsive during VM execution }
   TEventPollCallback = function: Boolean of object;
+
+const
+  // DIVERGENZE 740 - TBytecodeVM.GfxDriverKind
+  GFXDRV_LEGACY = -1;   // the front end said nothing: the off-screen screen always opens (sbv, sbw, the runner)
+  GFXDRV_NONE   = 0;    // no driver: SCREENRES answers 1, as fbc with no display and no FBGFX
+  GFXDRV_NULL   = 1;    // fbc's Null driver: the screen lives off screen
+  GFXDRV_WINDOW = 2;    // a window shows the screen
+
+type
 
   { SPRDEF callback: runs the modal sprite editor for the given sprite number.
     Returns True if the VM should stop (e.g. the window was closed). }
@@ -513,6 +521,21 @@ type
     // so CLS means "clear the framebuffer POINT reads", not "clear the text device". The C128 GRAPHIC
     // modes keep their own path, which is why this is a flag and not a test on InGraphics.
     FGfxFBScreen: Boolean;
+    // ⭐ DIVERGENZE 740 - THE GRAPHICS DRIVER, as fbc chooses it (FBGFX, a display, GFX_NULL). The front end decides:
+    // GFXDRV_NONE = no driver could open a screen (no display, no FBGFX=null): SCREENRES answers 1 and no screen exists,
+    // as fbc's does; GFXDRV_NULL = fbc's "Null" driver, the screen lives off screen; GFXDRV_WINDOW = a window shows it.
+    // The default (every front end that does not say) is the off-screen screen sb always had, named ''.
+    FGfxDriverKind: Integer;
+    FGfxDriverName: string;              // what ScreenControl GET_DRIVER_NAME answers once a screen is up
+    FGfxActiveDriver: string;            // ...the name of the driver the CURRENT screen runs on ('' with none)
+    FGfxLastScreenRes: Int64;            // 0 = the last SCREENRES/SCREEN opened a screen, 1 = it could not
+    FGfxDesktopW, FGfxDesktopH, FGfxDesktopDepth: Integer;   // SCREENINFO before a screen exists
+    // DIVERGENZE 741 - SCREENCONTROL's state: the window title (WINDOWTITLE / SET_WINDOW_TITLE, kept from before any
+    // screen, as fbc keeps it), the requested driver (SET_DRIVER_NAME), the alpha-primitives flag, the window position
+    FGfxWindowTitle: string;
+    FGfxRequestedDriver: string;
+    FGfxAlphaPrims: Boolean;
+    FGfxWinPosX, FGfxWinPosY: Integer;
     // FreeBASIC GETMOUSE snapshot cache: bcGetmouse queries the input provider once and stores the state
     // here; bcMouseAxis(which) then reads the requested component (0=x,1=y,2=wheel,3=buttons,4=clip).
     FMouseX, FMouseY, FMouseWheel, FMouseButtons, FMouseClip: Integer;
@@ -1211,6 +1234,17 @@ type
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
     property PresentCallback: TEventPollCallback read FPresentCallback write FPresentCallback;
     property ScreenModeCallback: TEventPollCallback read FScreenModeCallback write FScreenModeCallback;
+    // DIVERGENZE 740: the driver the front end chose, its name, and the desktop SCREENINFO reports before a screen
+    property GfxDriverKind: Integer read FGfxDriverKind write FGfxDriverKind;
+    property GfxDriverName: string read FGfxDriverName write FGfxDriverName;
+    property GfxActiveDriver: string read FGfxActiveDriver;
+    property GfxDesktopW: Integer read FGfxDesktopW write FGfxDesktopW;
+    property GfxDesktopH: Integer read FGfxDesktopH write FGfxDesktopH;
+    property GfxDesktopDepth: Integer read FGfxDesktopDepth write FGfxDesktopDepth;
+    function GfxCanOpenScreen(Flags: Integer): Boolean;
+    function GfxCtlInt(What, Idx: Integer): Int64;                         // DIVERGENZE 741
+    function GfxCtlStr(What: Integer): string;
+    procedure GfxCtlSet(What: Integer; P1, P2: Int64; const S: string);
     // Minimum milliseconds between presents driven from the graphics opcodes. 0 disables the
     // mechanism entirely, which is the default and what every target other than `sb --window`
     // leaves it at, so nothing else changes behaviour or pays more than one integer compare.
@@ -1568,6 +1602,7 @@ end;
 const
   GFX_DESKTOP_W = 1280;
   GFX_DESKTOP_H = 960;
+  GFX_FLAGS_NULL = $FFFF;   // ScreenRes's fifth argument GFX_NULL (-1) as the low 16 bits ProcessScreenRes packs
   GFX_DESKTOP_DEPTH = 32;   // what fbc answers for a desktop it cannot ask about a colour depth
 
 // ⭐⭐ THE FULLSCREEN MODE LIST SCREENLIST ENUMERATES, TAKEN FROM THE ORACLE AND NOT DEDUCED.
@@ -2116,6 +2151,11 @@ begin
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   FPresentCallback := nil;
   FScreenModeCallback := nil;
+  FGfxDriverKind := GFXDRV_LEGACY;
+  FGfxDriverName := '';
+  FGfxActiveDriver := '';
+  FGfxLastScreenRes := 0;
+  FGfxDesktopW := GFX_DESKTOP_W; FGfxDesktopH := GFX_DESKTOP_H; FGfxDesktopDepth := GFX_DESKTOP_DEPTH;
   // Initialize error state for EL, ER, ERR$
   FCtx.LastErrorLine := 0;
   FCtx.LastErrorCode := 0;
@@ -12159,6 +12199,23 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;   // result
         // bcGfxBFile (DIVERGENZE 663): Dest = code, Src1 = name (string), Src2 = pointer, Immediate[0-15] = size,
         // [16-31] = palette pointer (int registers)
+        // DIVERGENZE 741: SCREENCONTROL
+        bcGfxCtlStr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        bcGfxCtlSetInt:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        end;
+        bcGfxCtlSetStr:
+        begin
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
         bcGfxBFile:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -21723,10 +21780,100 @@ begin
   FGfxVisiblePage := 0;
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
   FGfxFBScreen := True;
+  FGfxLastScreenRes := 0;
   FGfxViewActive := False;                      // a new mode has no viewport, as in FreeBASIC
   FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;
   RecomputeGfxWindow;                           // the surface changed size under any live WINDOW
   if Assigned(FScreenModeCallback) then FScreenModeCallback();
+end;
+
+function TBytecodeVM.GfxCtlInt(What, Idx: Integer): Int64;
+// ⭐ DIVERGENZE 741 - SCREENCONTROL's integer GETs, parameter Idx (0..3), as fbc answers them (measured, see
+// job/markdown/FBGFX-DRIVER.md). With no screen open every answer is 0 except the DESKTOP, which exists anyway.
+// The colours are the NATIVE pixel values - the palette index below 9 bits, RGB565 at 16 - as fbc keeps them.
+  function Native(C: Int64): Int64;
+  begin
+    if FGfxScreenDepth <= 8 then Result := C and $FF
+    else if FGfxScreenDepth <= 16 then
+      Result := (((C shr 19) and $1F) shl 11) or (((C shr 10) and $3F) shl 5) or ((C shr 3) and $1F)
+    else Result := UInt32(C);
+  end;
+var
+  W, H: Integer;
+begin
+  Result := 0;
+  if What = 3 then                                         // GET_DESKTOP_SIZE
+  begin
+    case Idx of 0: Result := FGfxDesktopW; 1: Result := FGfxDesktopH; end;
+    Exit;
+  end;
+  if not FGfxFBScreen or not Assigned(FGraphics) then Exit;   // no screen: 0, the alpha flag included
+  W := FGraphics.SurfaceWidth(FGraphics.ScreenSurface);
+  H := FGraphics.SurfaceHeight(FGraphics.ScreenSurface);
+  case What of
+    0: case Idx of 0: Result := FGfxWinPosX; 1: Result := FGfxWinPosY; end;   // GET_WINDOW_POS (0,0 off screen)
+    4: case Idx of 0: Result := W; 1: Result := H; end;                     // GET_SCREEN_SIZE
+    5: if Idx = 0 then Result := FGfxScreenDepth;                           // GET_SCREEN_DEPTH
+    6: if Idx = 0 then Result := FGraphics.SurfaceBytesPerPixel(FGraphics.ScreenSurface);   // GET_SCREEN_BPP
+    7: if Idx = 0 then Result := W * FGraphics.SurfaceBytesPerPixel(FGraphics.ScreenSurface); // GET_SCREEN_PITCH
+    10: if (Idx = 0) and (FGfxScreenDepth > 8) then Result := $FF00FF;      // GET_TRANSPARENT_COLOR (0 at 8 bits)
+    11: if FGfxViewActive then                                              // GET_VIEWPORT
+          case Idx of 0: Result := FGfxViewX1; 1: Result := FGfxViewY1; 2: Result := FGfxViewX2; 3: Result := FGfxViewY2; end
+        else
+          case Idx of 2: Result := W - 1; 3: Result := H - 1; end;
+    12: case Idx of 0: Result := FDrawPenX; 1: Result := FDrawPenY; end;   // GET_PEN_POS
+    13: case Idx of 0: Result := Native(FConColorFg); 1: Result := Native(FConColorBg); end;   // GET_COLOR
+    14: if (Idx = 0) and FGfxAlphaPrims then Result := -1;                  // GET_ALPHA_PRIMITIVES
+    17: if Idx = 0 then Result := 1;                                        // GET_SCANLINE_SIZE
+  end;
+end;
+
+function TBytecodeVM.GfxCtlStr(What: Integer): string;
+// DIVERGENZE 741: GET_WINDOW_TITLE (kept from before any screen), GET_DRIVER_NAME ('' with no screen), GET_GL_EXTENSIONS
+begin
+  case What of
+    1: Result := FGfxWindowTitle;
+    9: if FGfxFBScreen then Result := FGfxActiveDriver else Result := '';
+  else Result := '';
+  end;
+end;
+
+procedure TBytecodeVM.GfxCtlSet(What: Integer; P1, P2: Int64; const S: string);
+// DIVERGENZE 741: the SET_ operations. SET_WINDOW_POS moves a WINDOW (fbc's X11 reads back what was set); off screen and
+// under Null there is no window, and fbc answers 0,0 after it.
+begin
+  case What of
+    100: if FGfxFBScreen and (FGfxActiveDriver <> '') and (FGfxActiveDriver <> 'Null') then
+         begin
+           FGfxWinPosX := P1; FGfxWinPosY := P2;
+         end;
+    101: FGfxWindowTitle := S;                                              // SET_WINDOW_TITLE / WINDOWTITLE
+    102: begin FDrawPenX := P1; FDrawPenY := P2; end;                       // SET_PEN_POS
+    103: FGfxRequestedDriver := S;                                          // SET_DRIVER_NAME (next SCREENRES)
+    104: FGfxAlphaPrims := P1 <> 0;                                         // SET_ALPHA_PRIMITIVES
+    200: if Assigned(FEventPollCallback) then FEventPollCallback();         // POLL_EVENTS
+  end;
+end;
+
+function TBytecodeVM.GfxCanOpenScreen(Flags: Integer): Boolean;
+// DIVERGENZE 740 - may SCREENRES / SCREEN open a screen? GFX_NULL in the fifth argument always may - fbc's Null driver,
+// with or without a display - and with no driver nothing can. Leaves the answer SCREENRES-as-a-function reads.
+begin
+  if (Flags = GFX_FLAGS_NULL) or (UpperCase(FGfxRequestedDriver) = 'NULL') then   // ...or SET_DRIVER_NAME "null"
+  begin
+    FGfxActiveDriver := 'Null';
+    Result := True;
+  end
+  else if FGfxDriverKind = GFXDRV_NONE then
+  begin
+    FGfxLastScreenRes := 1;
+    Result := False;
+  end
+  else
+  begin
+    FGfxActiveDriver := FGfxDriverName;
+    Result := True;
+  end;
 end;
 
 function TBytecodeVM.DrawSurface: Integer;
@@ -21865,6 +22012,17 @@ begin
     for T := 0 to High(FGfxPages) do FGraphics.SyncSurfaceToNative(FGfxPages[T]);
 end;
 
+// A 16-bit line style after N pixels: pixel i reads bit (15 - i mod 16), so the next line starts N bits further on -
+// the pattern rotated left by N mod 16 (LINE ..., B, style - see bcGfxLineStyled).
+function StyleAfter(Style, N: Integer): Integer;
+var R: Integer;
+begin
+  R := N mod 16;
+  Style := Style and $FFFF;
+  if R = 0 then Exit(Style);
+  Result := ((Style shl R) or (Style shr (16 - R))) and $FFFF;
+end;
+
 procedure TBytecodeVM.ExecuteGraphicsOpBody(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -21912,7 +22070,7 @@ begin
   begin
     case Instr.OpCode of
       bcGraphicRGBA, bcGfxPoint, bcGfxPalGet, bcGfxImageInfo, bcGfxScreenInfo,
-      bcGfxPMap, bcGfxPointCoord, bcGfxScreenPtr, bcGfxScreenList,
+      bcGfxPMap, bcGfxPointCoord, bcGfxScreenPtr, bcGfxScreenList, bcGfxCtlStr,
       bcGfxBFile: ;   // answered in place, below (BSAVE/BLOAD answer an error code: DIVERGENZE 663)
     else
       begin
@@ -22185,8 +22343,12 @@ begin
         // The depth's REGISTER is in bits 32..47; $FFFF = the argument was absent (default 8).
         if ((Instr.Immediate shr 32) and $FFFF) = $FFFF then GetX1 := 0
         else GetX1 := Integer(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
-        SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate and $FFFF, GetX1);
-        GGfxScreenFlags := (Instr.Immediate shr 16) and $FFFF;
+        // DIVERGENZE 740: with no driver fbc answers 1 and opens nothing - Point -1, ScreenPtr 0, Print on stdout
+        if GfxCanOpenScreen((Instr.Immediate shr 16) and $FFFF) then
+        begin
+          SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate and $FFFF, GetX1);
+          GGfxScreenFlags := (Instr.Immediate shr 16) and $FFFF;
+        end;
       end;
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
@@ -22401,7 +22563,10 @@ begin
         Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
       end;
     36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
-      if Assigned(FGraphics) then
+      // DIVERGENZE 740: before a screen exists fbc answers 0, whatever the driver and even with an explicit depth
+      if (FGfxDriverKind <> GFXDRV_LEGACY) and not FGfxFBScreen then
+        Ctx.IntRegs[Instr.Dest] := 0
+      else if Assigned(FGraphics) then
       begin
         // ✅ DIVERGENZE 677: the image's DEPTH - the fourth argument (Immediate[16..31], $FFFF = not given), else the
         // screen's, else 32 - and with it fbc's bytes per pixel: 1 up to 8 bits, 2 at 15/16 (RGB565), 4 above. The fill
@@ -22557,11 +22722,13 @@ begin
       //   number can match it. GFX_DESKTOP_W/H is fbc's smallest fullscreen mode, which is also the
       //   canvas retrogra and the FreeBASIC examples are written for. A front end that HAS a desktop
       //   (sbv, --window) is the one entitled to answer differently.
-      if Assigned(FGraphics) and (FGraphics.SurfaceWidth(FGraphics.ScreenSurface) <= 0) then
+      // ...and after SCREEN 0 (or a SCREENRES that found no driver) there is no screen either (DIVERGENZE 740)
+      if Assigned(FGraphics) and ((FGraphics.SurfaceWidth(FGraphics.ScreenSurface) <= 0) or
+                                  ((FGfxDriverKind <> GFXDRV_LEGACY) and not FGfxFBScreen)) then
         case Instr.Immediate of
-          0: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_W;
-          1: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_H;
-          2: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_DEPTH;
+          0: Ctx.IntRegs[Instr.Dest] := FGfxDesktopW;
+          1: Ctx.IntRegs[Instr.Dest] := FGfxDesktopH;
+          2: Ctx.IntRegs[Instr.Dest] := FGfxDesktopDepth;
         else Ctx.IntRegs[Instr.Dest] := 0;   // fbc answers 0 for bytes-per-pixel, pitch and rate too
         end
       else if Assigned(FGraphics) then
@@ -22745,9 +22912,21 @@ begin
           WinW := 0; WinH := 0;   // mode 0 / unknown: no graphics mode change (v1)
         end;
         if (WinW > 0) and (WinH > 0) then
-          SetupGfxScreen(WinW, WinH, Instr.Immediate)
+        begin
+          // DIVERGENZE 740; and "Screen n, depth" names the depth (bit 32 of the Immediate, the register in Src2)
+          if GfxCanOpenScreen(0) then
+            if ((Instr.Immediate shr 32) and 1) <> 0 then
+              SetupGfxScreen(WinW, WinH, Instr.Immediate and $FFFF, Integer(Ctx.IntRegs[Instr.Src2]))
+            else
+              SetupGfxScreen(WinW, WinH, Instr.Immediate and $FFFF);
+        end
         else if Ctx.IntRegs[Instr.Src1] = 0 then
+        begin
           FGfxFBScreen := False;   // SCREEN 0 asks for text back: CLS belongs to the console again
+          FGfxActiveDriver := '';
+          // ...and PRINT too: with a window, text reaches stdout again, as fbc's console (DIVERGENZE 729)
+          if Assigned(FGraphics) then FGraphics.LeaveGraphics;
+        end;
       end;
     48: // bcMultikey - MULTIKEY(scancode): -1 if held, 0 otherwise (real-time, via the input provider)
       if Assigned(GKeyDownProvider) and GKeyDownProvider(Ctx.IntRegs[Instr.Src1]) then
@@ -22848,8 +23027,18 @@ begin
     58: // bcGfxPointCoord - POINTCOORD(n): the DRAW pen coordinate (Src1 selector: 0 = x, 1 = y).
       if Ctx.IntRegs[Instr.Src1] = 1 then
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
+      else if Ctx.IntRegs[Instr.Src1] = 2 then
+        Ctx.IntRegs[Instr.Dest] := FGfxLastScreenRes   // DIVERGENZE 740: SCREENRES as a FUNCTION answers this
+      else if Ctx.IntRegs[Instr.Src1] >= $10000 then   // DIVERGENZE 741: SCREENCONTROL's integer GETs
+        Ctx.IntRegs[Instr.Dest] := GfxCtlInt((Ctx.IntRegs[Instr.Src1] - $10000) div 4, (Ctx.IntRegs[Instr.Src1] - $10000) mod 4)
       else
         Ctx.IntRegs[Instr.Dest] := FDrawPenX;
+    72: // bcGfxCtlStr - SCREENCONTROL's string GETs (DIVERGENZE 741)
+      Ctx.StringRegs[Instr.Dest] := GfxCtlStr(Ctx.IntRegs[Instr.Src1]);
+    73: // bcGfxCtlSetInt - SCREENCONTROL SET_xxx with numbers: Src2 = param1, Dest = param2 (READ)
+      GfxCtlSet(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Ctx.IntRegs[Instr.Dest], '');
+    74: // bcGfxCtlSetStr - SCREENCONTROL SET_xxx with a string: Src2 = the string
+      GfxCtlSet(Ctx.IntRegs[Instr.Src1], 0, 0, Ctx.StringRegs[Instr.Src2]);
     71: // bcGfxBFile - BSAVE / BLOAD of fbgfx (DIVERGENZE 663): see GfxBFile
       Ctx.IntRegs[Instr.Dest] := GfxBFile(Ctx, ((Instr.Immediate shr 32) and 1) <> 0, Ctx.StringRegs[Instr.Src1],
                                           Ctx.IntRegs[Instr.Src2], Ctx.IntRegs[Instr.Immediate and $FFFF],
@@ -22931,11 +23120,19 @@ begin
         GetSy := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF] and $FFFF;   // style mask (16-bit)
         if ((Instr.Immediate shr 48) and $3) = 1 then
         begin
-          // B: styled box outline = four styled edges (pattern restarts on each edge).
+          // B: a styled box outline is four edges, and ONE pattern runs through all four (measured on fbc, 3 Nov 2026,
+          // m276): the corners sorted, then bottom x1->x2, top x1->x2, right y1->y2, left y1->y2, each edge starting where
+          // the previous one left the 16-bit pattern - it rotates left by the pixels drawn. It used to restart on every
+          // edge, in a clockwise order, and the dashes of three edges came out shifted against fbc's.
+          if GetX1 > GetX2 then begin SwapTmp := GetX1; GetX1 := GetX2; GetX2 := SwapTmp; end;
+          if GetY1 > GetY2 then begin SwapTmp := GetY1; GetY1 := GetY2; GetY2 := SwapTmp; end;
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          GetSy := StyleAfter(GetSy, GetX2 - GetX1 + 1);
           FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          GetSy := StyleAfter(GetSy, GetX2 - GetX1 + 1);
           FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          GetSy := StyleAfter(GetSy, GetY2 - GetY1 + 1);
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX1, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
         end
         else
           FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));

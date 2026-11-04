@@ -1,3 +1,23 @@
+{*
+ * SedaiBasic - A BASIC interpreter with bytecode VM
+ * Copyright (C) 2025 Maurizio Cammalleri
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
+ *
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
+ *}
 unit SedaiStaticLocals;
 
 {$mode objfpc}{$H+}
@@ -245,15 +265,51 @@ begin
   Result := IfNode;
 end;
 
+// ⭐ DIVERGENZE 486 - fbc builds a STATIC local of a type with a constructor at the FIRST CALL, in place, and
+// destroys it at program end BEFORE the shared globals, in the reverse order of those first constructions; a
+// procedure never called never builds it. So a scalar static whose type may be a record is lowered in two parts:
+// the hoisted Dim Shared (marked STATICLAZY: allocated, NOT constructed, at program start) and a STATICSITE copy of
+// the declaration left where it was written, which the SSA turns into "if not built yet: construct in place, then
+// record the construction order in <mangled>.ORD". Whether the type IS a record only the SSA knows (FindUDT): for
+// any other type it drops the site and the hoisted declaration initialises as it always did. The builtin types are
+// left out here so they cost no extra global. SB_STATIC_LAZY=0 is the A/B.
+const
+  STATIC_COUNT_NAME = 'STATIC..COUNT';   // how many lazy statics have been built so far (the order counter)
+
+function MayBeRecordType(const TName: string): Boolean;
+const
+  Builtins: array[0..18] of string = ('INTEGER', 'UINTEGER', 'LONG', 'ULONG', 'LONGINT', 'ULONGINT', 'SHORT',
+    'USHORT', 'BYTE', 'UBYTE', 'SINGLE', 'DOUBLE', 'STRING', 'ZSTRING', 'WSTRING', 'BOOLEAN', 'ANY', 'BIGINT',
+    'CLONGDOUBLE');
+var
+  k: Integer;
+begin
+  Result := False;
+  if (TName = '') or (Pos(' PTR', TName) > 0) or (Pos(' POINTER', TName) > 0) then Exit;
+  for k := Low(Builtins) to High(Builtins) do
+    if TName = Builtins[k] then Exit;
+  Result := True;
+end;
+
+var
+  GStaticLazyAsked: Integer = -1;
+
+function StaticLazyOn: Boolean;
+begin
+  if GStaticLazyAsked < 0 then
+    if GetEnvironmentVariable('SB_STATIC_LAZY') = '0' then GStaticLazyAsked := 0 else GStaticLazyAsked := 1;
+  Result := GStaticLazyAsked = 1;
+end;
+
 // Lower the STATIC declarations inside one procedure: rewrite each to a hoisted DIM SHARED (collected
 // into Hoisted) and rename its references in the body. ProcIdx makes the mangled name unique.
-procedure LowerProc(Proc: TASTNode; ProcIdx: Integer; Hoisted: TFPList);
+procedure LowerProc(Proc: TASTNode; ProcIdx: Integer; Hoisted: TFPList; var NeedCount: Boolean);
 var
   Decls: TFPList;                 // the STATIC antArrayDecl nodes found in this proc
   Parents: TFPList;               // the owning antDim of each
   Grands: TFPList;                // the block that owns the antDim (where a sizing guard is spliced in)
   i, SlotIdx, HoistBase: Integer;
-  DimNode, Decl, NameNode, TypeNode, InitClone, GrandNode, InitOne: TASTNode;
+  DimNode, Decl, NameNode, TypeNode, InitClone, GrandNode, InitOne, SiteDim, SiteDecl, Lazy: TASTNode;
   VName, TName, Mangled, FlagName, OwnerType: string;
 
   procedure CollectStatics(N: TASTNode);
@@ -406,7 +462,29 @@ begin
           InitClone := Decl.GetChild(2).Clone
         else
           InitClone := nil;
-        Hoisted.Add(BuildSharedDecl(Decl, Mangled, TName, InitClone, NameNode.Token));
+        Lazy := BuildSharedDecl(Decl, Mangled, TName, InitClone, NameNode.Token);
+        Hoisted.Add(Lazy);
+        // DIVERGENZE 486: a record static is built where it is declared, on the first call (see MayBeRecordType)
+        if StaticLazyOn and MayBeRecordType(TName) and (Decl.Attributes.Values['BYREF'] <> '1') then
+        begin
+          Lazy.GetChild(0).Attributes.Values['STATICLAZY'] := Mangled + '.ORD';
+          Hoisted.Add(BuildSharedDecl(nil, Mangled + '.ORD', 'INTEGER', nil, NameNode.Token));
+          NeedCount := True;
+          // ⛔ NOT a declaration any pre-pass can read: a Dim of the mangled name inside the procedure would make it a
+          // LOCAL there, shadowing the shared one. The antDim carries the mark, its child is a list (no walker takes it
+          // for an antArrayDecl), and the copy of the declaration inside names the static by a literal.
+          SiteDecl := Lazy.GetChild(0).Clone;
+          SiteDecl.Attributes.Values['SHARED'] := '0';
+          SiteDecl.Attributes.Values['STATICLAZY'] := '';
+          SiteDecl.GetChild(0).NodeType := antLiteral;
+          SiteDim := TASTNode.Create(antDim, NameNode.Token);
+          SiteDim.Attributes.Values['STATICSITE'] := Mangled + '.ORD';
+          SiteDim.AddChild(TASTNode.Create(antExpressionList, NameNode.Token));
+          SiteDim.GetChild(0).AddChild(SiteDecl);
+          SlotIdx := GrandNode.Children.IndexOf(DimNode);
+          if SlotIdx < 0 then SlotIdx := GrandNode.ChildCount;
+          GrandNode.Children.Insert(SlotIdx, SiteDim);
+        end;
       end;
       // Rename references to the static, then drop the declaration. An antDim left empty afterwards is
       // harmless (ProcessDim exits early when it has no children).
@@ -431,7 +509,7 @@ end;
 
 // Walk the whole program, lowering each procedure's statics; also demote any module-level STATIC to a
 // plain DIM (clearing the attribute). Returns proc count via the recursive index.
-procedure WalkProcs(Node: TASTNode; var ProcIdx: Integer; Hoisted: TFPList);
+procedure WalkProcs(Node: TASTNode; var ProcIdx: Integer; Hoisted: TFPList; var NeedCount: Boolean);
 var
   i, k: Integer;
   Dim, Decl: TASTNode;
@@ -441,7 +519,7 @@ begin
   begin
     if Node.GetChild(i).NodeType = antProcedureDecl then
     begin
-      LowerProc(Node.GetChild(i), ProcIdx, Hoisted);
+      LowerProc(Node.GetChild(i), ProcIdx, Hoisted, NeedCount);
       Inc(ProcIdx);
     end
     else
@@ -457,7 +535,7 @@ begin
             Decl.Attributes.Values['STATIC'] := '0';
         end;
       end;
-      WalkProcs(Node.GetChild(i), ProcIdx, Hoisted);
+      WalkProcs(Node.GetChild(i), ProcIdx, Hoisted, NeedCount);
     end;
   end;
 end;
@@ -523,13 +601,17 @@ var
   ProcIdx, i, j, TopCount: Integer;
   Hoisted, Refs: TFPList;
   Key: string;
+  NeedCount: Boolean;
 begin
   if AST = nil then Exit;
   Hoisted := TFPList.Create;
   Refs := TFPList.Create;
   try
     ProcIdx := 0;
-    WalkProcs(AST, ProcIdx, Hoisted);
+    NeedCount := False;
+    WalkProcs(AST, ProcIdx, Hoisted, NeedCount);
+    if NeedCount and (AST.ChildCount > 0) then
+      Hoisted.Add(BuildSharedDecl(nil, STATIC_COUNT_NAME, 'INTEGER', nil, AST.GetChild(0).Token));
     // Prepend the hoisted "DIM SHARED" declarations to the top of the program, in collection order, so
     // each static global is declared and initialised before any procedure that uses it runs.
     // ⛔⛔ ...EXCEPT A STATIC REFERENCE (DIVERGENZE 270). "Static ByRef As Integer a = v" BINDS where the

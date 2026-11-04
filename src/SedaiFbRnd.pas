@@ -14,7 +14,7 @@ unit SedaiFbRnd;
   so does this unit. Only the MODERN dialect comes here - Commodore RND keeps its own rules in the VM.
 
   Copyright (c) 2025 Maurizio Cammalleri
-  Released under GNU GPL v3 }
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see COPYING.RUNTIME) }
 
 {$mode objfpc}{$H+}
 {$codepage UTF8}

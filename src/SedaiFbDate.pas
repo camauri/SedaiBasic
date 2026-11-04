@@ -2,7 +2,7 @@
   SedaiFbDate - the date arithmetic of FreeBASIC's datetime.bi, as fbc's runtime answers it
 
   Copyright (C) 2026 Maurizio Cammalleri
-  Released under GNU GPL v3 (see LICENCE.md)
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see LICENSE, COPYING.RUNTIME)
 
   ⛔ WHY THIS UNIT EXISTS (17 Sep 2026, the `datetime` library deck). The VM answered DatePart, DateDiff,
   DateAdd and Weekday with FPC's DateUtils and its own rules, and they differ from fbc where it is least

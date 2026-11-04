@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiSuperinstructions;
 
@@ -2249,10 +2248,11 @@ begin
     Exit;
   end;
 
-  // Check if load result is temporary
-  // NOTE: For ArrayCopyElement, we don't need this check because the
-  // pattern is simple: load + store with same value register
-  // if not IsTemporaryResult(Index, LoadDest) then Exit;
+  // ⛔ THE LOADED VALUE MUST DIE HERE. This check was commented out ("the pattern is simple: load + store with the same
+  // value register"), and the fused copy writes NO register: "ArrayLoadInt R2, ARR[0] + ArrayStoreInt ARR[0], R2" read
+  // back the handle of a shared record for a constructor that ran right after with THIS = R2 - and R2 was never
+  // written. "Null or invalid pointer dereference (address 0)" inside the constructor (2 Nov 2026, DIVERGENZE 486).
+  if not IsTemporaryResult(Index, LoadDest) then Exit;
 
   // Create fused instruction: arr_dest[idx] = arr_src[idx]
   FillChar(FusedInstr, SizeOf(FusedInstr), 0);

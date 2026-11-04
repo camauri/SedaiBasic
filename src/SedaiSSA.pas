@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiSSA;
 
@@ -340,6 +339,11 @@ type
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
     FModuleRecordVars: TStringList;      // V5b: "VARNAME|TYPENAME" of module-scope DIM'd UDTs (globals)
+    FLazyStatics: TStringList;           // DIVERGENZE 486: "VARNAME|TYPENAME|ORDNAME" of the record STATICs built on first call
+    FModuleSharedNames: TStringList;     // DIVERGENZE 486: module names declared SHARED - torn down after the main's locals
+    FStaticSiteBody: Boolean;            // DIVERGENZE 486: ProcessDimBody is constructing a lazy static IN PLACE
+    FModuleLocalNames: TStringList;      // DIVERGENZE 486: module names declared WITHOUT Shared (fbc's main locals)
+    FHasEarlyShared: Boolean;            // DIVERGENZE 486: a Dim Shared record is built before the module body
     FModuleCtors: TStringList;           // FB module constructors (proc labels), in definition order
     FModuleDtors: TStringList;           // FB module destructors (proc labels), in definition order
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
@@ -1061,6 +1065,12 @@ type
     function BodyHasReturnStatement(Proc: TASTNode): Boolean;                          // V5f
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
     procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
+    procedure CollectLazyStatics(Node: TASTNode);                // DIVERGENZE 486
+    procedure ProcessStaticSite(Node: TASTNode);                 // DIVERGENZE 486: first call builds the static
+    procedure EmitLazyStaticDestructors;                         // DIVERGENZE 486: reverse order of construction
+    function LoadSharedIntScalar(const Name: string): TSSAValue; // element 0 of a SHARED integer's backing
+    function RunsBeforeModuleBody: Boolean;                      // module ctors, or early Dim Shared records
+    procedure EmitEarlySharedRecords(Node: TASTNode);            // DIVERGENZE 486
     procedure CollectModuleCtorDtors(Node: TASTNode);  // FB module constructor/destructor procs
     procedure OrderModuleCtorDtorList(L: TStringList);  // ...into the order fbc runs them in
     procedure EmitModuleConstructors;    // FB: call module constructors before module-level code
@@ -1916,6 +1926,7 @@ type
     procedure ProcessSetenviron(Node: TASTNode);
     procedure ProcessShell(Node: TASTNode);
     procedure ProcessOut(Node: TASTNode);
+    procedure ProcessScreenControl(Node: TASTNode);   // DIVERGENZE 741
     procedure ProcessChdir(Node: TASTNode);
     procedure ProcessRmdir(Node: TASTNode);
     procedure ProcessMoveFile(Node: TASTNode);
@@ -2235,6 +2246,11 @@ begin
   FFuncPtrTypes := TIndexedStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TIndexedStringList.Create;
+  FLazyStatics := TStringList.Create;
+  FModuleSharedNames := TIndexedStringList.Create;
+  FModuleSharedNames.CaseSensitive := False;
+  FModuleLocalNames := TIndexedStringList.Create;
+  FModuleLocalNames.CaseSensitive := False;
   FModuleCtors := TIndexedStringList.Create;
   FModuleDtors := TIndexedStringList.Create;
   FTypeAliases := TIndexedStringList.Create;
@@ -2465,6 +2481,9 @@ begin
   FFuncPtrTypeDefs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
+  FLazyStatics.Free;
+  FModuleSharedNames.Free;
+  FModuleLocalNames.Free;
   FModuleCtors.Free;
   FModuleDtors.Free;
   FTypeAliases.Free;
@@ -8783,6 +8802,13 @@ begin
           EmitInstruction(ssaConScreen, Result, ArgReg, MaskReg, IntRegVal);  // Src3=colorflag -> Immediate
           Exit;
         end;
+        // ⛔ DIVERGENZE 742 - ...and with ONE argument it is not a function at all: "r = Screen(13)" is fbc's
+        // "error 16: Expected ','" (the statement SCREEN sets a mode and answers nothing). It compiled here and answered 0.
+        if (FuncName = kSCREENGFX) and (ArgListNode <> nil) and
+           (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and (ArgListNode.ChildCount < 2) and
+           (GetEnvironmentVariable('SB_SCREENFN_CHECK') <> '0') then
+          raise Exception.Create('Expected '','', found '')'': the function SCREEN(row, column [, colorflag]) reads the ' +
+                                 'text screen; SCREEN n is a statement and answers nothing');
 
         // Handle RGBA function specially (4 integer args -> 1 integer result)
         if FuncName = 'RGBA' then
@@ -8931,6 +8957,35 @@ begin
           else
             raise Exception.Create('__IMGINFO requires 2 arguments');
         end
+        else if (FuncName = '__GFXCTLINT') or (FuncName = '__GFXCTLSTR') then
+        begin
+          // DIVERGENZE 741 - SCREENCONTROL's answers (ProcessScreenControl): __GFXCTLINT(selector) reads POINTCOORD's
+          // selector space ($10000 + what*4 + param), __GFXCTLSTR(what) the string ones (title, driver name, GL ext).
+          ProcessExpression(ArgListNode.GetChild(0), RVal);   // what
+          if FuncName = '__GFXCTLINT' then
+          begin
+            // selector = $10000 + what*4 + param index (the second argument, a literal)
+            ProcessExpression(ArgListNode.GetChild(1), GVal);
+            if (RVal.Kind = svkConstInt) and (GVal.Kind = svkConstInt) then
+              RVal := MakeSSAConstInt($10000 + RVal.ConstInt * 4 + GVal.ConstInt)
+            else
+            begin
+              DestReg := FProgram.AllocRegister(srtInt);
+              EmitInstruction(ssaMulInt, MakeSSARegister(srtInt, DestReg), EnsureIntRegister(RVal),
+                              EnsureIntRegister(MakeSSAConstInt(4)), MakeSSAValue(svkNone));
+              RVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, RVal, MakeSSARegister(srtInt, DestReg),
+                              EnsureIntRegister(MakeSSAConstInt($10000 + GVal.ConstInt)), MakeSSAValue(svkNone));
+            end;
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaGfxPointCoord, Result, EnsureIntRegister(RVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+          begin
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaGfxCtlStr, Result, EnsureIntRegister(RVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end
         else if FuncName = '__SCRINFO' then
         begin
           // Internal helper for SCREENINFO: __SCRINFO(which) -> w(0)/h(1)/depth(2)/bpp(3)/pitch(4)/rate(5).
@@ -9060,7 +9115,10 @@ begin
           ProcessScreenRes(ArgListNode);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // ⭐ DIVERGENZE 740: 1 when no driver could open the screen, as fbc's - read back through POINTCOORD's
+          // selector 2, which the VM answers from the SCREENRES that just ran (no new opcode)
+          EmitInstruction(ssaGfxPointCoord, Result, EnsureIntRegister(MakeSSAConstInt(2)),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = kIMAGEINFO) and (ArgListNode <> nil) and
                 (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
@@ -10442,6 +10500,16 @@ begin
           Result := EmitFuncPtrCall(UpperFast(ArrName), FFuncPtrSigs.Values[UpperFast(ArrName)], Node.GetChild(1));
           Exit;
         end;
+
+        // ⭐ DIVERGENZE 739 - INSIDE A METHOD THE MEMBER COMES FIRST: "later()" in "Sub P.run" is "this.later()" when P
+        // declares a method of that name, even with a free FUNCTION later() in the program - fbc prints the member's
+        // answer, and this branch below called the free one. The bare spelling and "this.later()" were already right.
+        // SB_MEMBER_FIRST=0 is the A/B.
+        // ⚠️ A TYPE: inside a NAMESPACE procedure FCurrentThisType names the namespace, and "NS.G" reads as a method.
+        if (FCurrentThisType <> '') and (FindUDT(FCurrentThisType) >= 0) and
+           (FProcedureNames.IndexOf(UpperFast(ArrName)) >= 0) and
+           MethodNameDeclared(FCurrentThisType, ArrName) and (GetEnvironmentVariable('SB_MEMBER_FIRST') <> '0') and
+           TryImplicitThisMethod(ArrName, Node.GetChild(1), Node.Token, Result) then Exit;
 
         // User-defined FUNCTION (M2): "name(args)" parses as array access, but if the name
         // is a declared FUNCTION it is a call. Stage args, call, read the result slot.
@@ -13486,7 +13554,7 @@ begin
   if FSharedScalarArr = nil then Exit;
   ai := FSharedScalarArr.IndexOf(UpperFast(VarName));
   if ai < 0 then Exit;
-  if (FModuleCtors <> nil) and (FModuleCtors.Count > 0) then Exit;
+  if RunsBeforeModuleBody then Exit;
   ai := PtrInt(FSharedScalarArr.Objects[ai]);
   ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
   EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
@@ -15466,6 +15534,12 @@ var
   SavedThis: string;
   i: Integer;
 begin
+  if (Node <> nil) and (Node.Attributes.Values['STATICSITE'] <> '') then
+  begin
+    ProcessStaticSite(Node);   // DIVERGENZE 486
+    Exit;
+  end;
+  if (Node <> nil) and (Node.Attributes.Values['EARLYSHARED'] = '2') then Exit;   // built before the body (486)
   // ⛔ DIVERGENZE 714 - a SHARED the program wrote is module scope only, as fbc says: "Illegal inside functions" (error 61)
   // and "Illegal inside a compound statement or scoped block" (error 96). A Namespace is neither. MODERN only: CLASSIC has no
   // SHARED of this kind. SB_SHARED_SCOPE=0 is the A/B.
@@ -16075,7 +16149,9 @@ begin
         // block (EmitSharedScalarAllocs) so the ctors could touch globals. Re-sizing here would zero the
         // value a ctor just wrote, so skip the DIM's re-allocation in that case (the "= expr" init below,
         // if any, still applies).
-        if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then
+        // DIVERGENZE 486: the site of a lazy static builds INTO the backing the hoisted Dim sized and published
+        if FStaticSiteBody then
+        else if not RunsBeforeModuleBody then
           EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                           MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         // ⛔ ...BUT THE SKIPPED RE-SIZE WAS ALSO WHAT ZEROED IT. A numeric scalar declared with no initialiser inside a
@@ -16106,11 +16182,30 @@ begin
           // and store its handle into element 0 — so any thread reaches the same instance. (Nested-UDT
           // field instances are still per-thread; flat UDTs are fully cross-thread.)
           CheckInstantiable(FUDTs[RecUDTIdx].Name);   // OOP: an unimplemented ABSTRACT refuses here
-          RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaRecordNew, RecHandleVal,
-                          MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
-                          MakeSSAConstInt(0),
-                          MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
+          // ⭐ DIVERGENZE 486: a record STATIC is ALLOCATED here, at program start, and built at its first call
+          // (ProcessStaticSite): the hoisted Dim stops after publishing the handle, the site resumes with the
+          // existing record - its field initialisation, its constructor and its initialiser.
+          if FStaticSiteBody then
+            RecHandleVal := LoadSharedIntScalar(UpperFast(ArrName))
+          else
+          begin
+            RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRecordNew, RecHandleVal,
+                            MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
+                            MakeSSAConstInt(0),
+                            MakeSSAConstInt(FUDTs[RecUDTIdx].NStr or (Int64(RecUDTIdx) shl 32) or (Int64(1) shl 48)));
+          end;
+          if (ArrayDeclNode.Attributes.Values['STATICLAZY'] <> '') and not FStaticSiteBody then
+          begin
+            EmitSharedScalarStoreVal(UpperFast(ArrName), RecHandleVal);
+            if not FInProcedure then
+            begin
+              MDtorSlotIdx := FModuleDtorSlots.IndexOf(UpperFast(ArrName));
+              if MDtorSlotIdx >= 0 then
+                EmitXferStore(srtInt, PtrInt(FModuleDtorSlots.Objects[MDtorSlotIdx]), RecHandleVal);
+            end;
+            Continue;
+          end;
           EmitRecordInit(RecHandleVal, RecUDTIdx);
           // An initializer that is NOT a constructor argument list is either an implicit conversion
           // through a one-argument constructor ("DIM SHARED v AS T = <scalar>") or a plain "= expr"
@@ -16148,7 +16243,9 @@ begin
           // with the publish AFTER, "@u0" read an element 0 that was still 0 inside the very ctor that
           // was building u0: the test that asks "am I the shared instance?" always answered no.
           // The value-copy of an "= expr" still runs after, and still needs the handle in place.
-          EmitSharedScalarStoreVal(UpperFast(ArrName), RecHandleVal);
+          // (The site of a lazy static reads the handle it would store: nothing to publish - DIVERGENZE 486.)
+          if not FStaticSiteBody then
+            EmitSharedScalarStoreVal(UpperFast(ArrName), RecHandleVal);
           if CopyCtorInit then
           begin
             // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter
@@ -23845,10 +23942,13 @@ begin
     // (The nil test is belt-and-braces - the parser no longer builds one, and when it did, every AST
     // pre-pass was one step from the access violation this cost.)
     if (Node.GetChild(i) = nil) or (Node.GetChild(i).NodeType = antLiteral) then Continue;
-    WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+    // ⭐ The SEVENTH destination is the DRIVER NAME, a string (DIVERGENZE 741): GET_DRIVER_NAME's answer.
+    if i = 6 then WhichLit := TASTNode.CreateWithValue(antLiteral, 9, Node.Token)
+    else WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
     ArgList := TASTNode.Create(antArgumentList, Node.Token);
     ArgList.AddChild(WhichLit);
-    Call := TASTNode.CreateWithValue(antGraphicsFunction, '__SCRINFO', Node.Token);
+    if i = 6 then Call := TASTNode.CreateWithValue(antGraphicsFunction, '__GFXCTLSTR', Node.Token)
+    else Call := TASTNode.CreateWithValue(antGraphicsFunction, '__SCRINFO', Node.Token);
     Call.AddChild(ArgList);
     Assign := TASTNode.Create(antAssignment, Node.Token);
     Assign.AddChild(Node.GetChild(i).Clone);   // destination variable
@@ -24043,13 +24143,26 @@ end;
 
 procedure TSSAGenerator.ProcessGfxScreen(Node: TASTNode);
 // SCREEN mode [, depth [, num_pages]] : numbered graphics mode. Src1=mode; num_pages (child 2, a
-// compile-time constant, default 1) in Src3 -> Immediate. depth (child 1) is accepted-and-ignored.
+// compile-time constant, default 1) in Src3 -> Immediate.
+// ⭐ The DEPTH (child 1) rides in Src2, with bit 32 of the Immediate saying it was given: "Screen 15, 32" is a 32-bit
+// 400x300 screen in fbc, and it was ignored here - every such screen came out at the default 8 bits (3 Nov 2026,
+// found when the graphics guards could at last be measured against fbc, DIVERGENZE 740). An omitted one
+// ("Screen , 0, 1") is the parser's literal placeholder and stays absent.
 var
-  ModeVal, ModeReg, NVal: TSSAValue;
+  ModeVal, ModeReg, NVal, DepthReg: TSSAValue;
   NumPages: Int64;
+  HasDepth: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
   ProcessExpression(Node.GetChild(0), ModeVal); ModeReg := EnsureIntRegister(ModeVal);
+  HasDepth := (Node.ChildCount >= 2) and (Node.GetChild(1) <> nil) and
+              not ((Node.GetChild(1).NodeType = antLiteral) and (VarToStr(Node.GetChild(1).Value) = ''));
+  DepthReg := MakeSSAValue(svkNone);
+  if HasDepth then
+  begin
+    ProcessExpression(Node.GetChild(1), NVal);
+    DepthReg := EnsureIntRegister(NVal);
+  end;
   NumPages := 1;
   if Node.ChildCount >= 3 then
   begin
@@ -24058,7 +24171,11 @@ begin
     else if NVal.Kind = svkConstFloat then NumPages := Trunc(NVal.ConstFloat);
   end;
   if NumPages < 1 then NumPages := 1;
-  EmitInstruction(ssaGfxScreen, MakeSSAValue(svkNone), ModeReg, MakeSSAValue(svkNone), MakeSSAConstInt(NumPages));
+  if HasDepth then
+    EmitInstruction(ssaGfxScreen, MakeSSAValue(svkNone), ModeReg, DepthReg,
+                    MakeSSAConstInt((NumPages and $FFFF) or (Int64(1) shl 32)))
+  else
+    EmitInstruction(ssaGfxScreen, MakeSSAValue(svkNone), ModeReg, MakeSSAValue(svkNone), MakeSSAConstInt(NumPages));
 end;
 
 procedure TSSAGenerator.ProcessBeep(Node: TASTNode);
@@ -31508,8 +31625,133 @@ var
   Val: TSSAValue;
 begin
   if FCurrentBlock = nil then Exit;
+  if Node.Attributes.Values['SCREENCONTROL'] = '1' then
+  begin
+    ProcessScreenControl(Node);   // DIVERGENZE 741 - shares OUT's argument list, not its emptiness
+    Exit;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     ProcessExpression(Node.GetChild(i), Val);
+end;
+
+procedure TSSAGenerator.ProcessScreenControl(Node: TASTNode);
+// ⭐ DIVERGENZE 741 - SCREENCONTROL what [, p1 [, p2 [, p3 [, p4]]]], fbgfx's GET_/SET_ operations, as fbc answers them
+// (measured: job/markdown/FBGFX-DRIVER.md). A GET (what < 100) writes its answers into the parameters - ALL FOUR, zero
+// where the operation has nothing to say, as fbc does - or the one string; a SET reads them. fbc chooses the overload
+// from the BANK of the first parameter (a String or numbers), and so does this; the operation itself may be computed
+// at run time, and then the choice between writing and reading the parameters is made at run time too.
+var
+  What: Int64;
+  IsConst, IsStr: Boolean;
+  WVal, P1, P2, WReg, C: TSSAValue;
+  ElseLabel, EndLabel, GetLabel: string;
+  PrevBlock, GetBlock, ElseBlock, EndBlock: TSSABasicBlock;
+
+  function ParamGiven(Idx: Integer): Boolean;
+  begin
+    Result := (Node.ChildCount > Idx) and (Node.GetChild(Idx) <> nil) and
+              not ((Node.GetChild(Idx).NodeType = antLiteral) and (VarToStr(Node.GetChild(Idx).Value) = ''));
+  end;
+
+  procedure AssignFrom(Idx: Integer; const Fn: string);
+  var Assign, Call, ArgList: TASTNode;
+  begin
+    ArgList := TASTNode.Create(antArgumentList, Node.Token);
+    ArgList.AddChild(Node.GetChild(0).Clone);                                 // what
+    if Fn = '__GFXCTLINT' then ArgList.AddChild(TASTNode.CreateWithValue(antLiteral, Idx - 1, Node.Token));
+    Call := TASTNode.CreateWithValue(antGraphicsFunction, Fn, Node.Token);
+    Call.AddChild(ArgList);
+    Assign := TASTNode.Create(antAssignment, Node.Token);
+    Assign.AddChild(Node.GetChild(Idx).Clone);
+    Assign.AddChild(Call);
+    try
+      ProcessStatement(Assign);
+    finally
+      Assign.Free;
+    end;
+  end;
+
+  function IntParam(Idx: Integer): TSSAValue;
+  var V: TSSAValue;
+  begin
+    if ParamGiven(Idx) then
+    begin
+      ProcessExpression(Node.GetChild(Idx), V);
+      Result := EnsureIntRegister(V);
+    end
+    else
+      Result := EnsureIntRegister(MakeSSAConstInt(0));
+  end;
+
+  procedure EmitGet;
+  var k: Integer;
+  begin
+    if IsStr then
+    begin
+      if ParamGiven(1) then AssignFrom(1, '__GFXCTLSTR');
+    end
+    else
+      for k := 1 to 4 do
+        if ParamGiven(k) then AssignFrom(k, '__GFXCTLINT');
+  end;
+
+  procedure EmitSet;
+  begin
+    if IsStr then
+    begin
+      if ParamGiven(1) then ProcessExpression(Node.GetChild(1), P1) else P1 := MakeSSAConstString('');
+      EmitInstruction(ssaGfxCtlSetStr, MakeSSAValue(svkNone), WReg, EnsureStringRegister(P1), MakeSSAValue(svkNone));
+    end
+    else
+    begin
+      P1 := IntParam(1);
+      P2 := IntParam(2);
+      EmitInstruction(ssaGfxCtlSetInt, MakeSSAValue(svkNone), WReg, P1, P2);
+    end;
+  end;
+
+begin
+  if (FCurrentBlock = nil) or (Node.ChildCount < 1) then Exit;
+  IsConst := TryFoldConstIntExpr(Node.GetChild(0), What);
+  ProcessExpression(Node.GetChild(0), WVal);
+  if (not IsConst) and (WVal.Kind = svkConstInt) then begin IsConst := True; What := WVal.ConstInt; end;
+  WReg := EnsureIntRegister(WVal);
+  // the overload: a String first parameter is the string form (titles, driver names), numbers otherwise
+  IsStr := False;
+  if ParamGiven(1) then
+  begin
+    ProcessExpression(Node.GetChild(1), P1);
+    IsStr := (P1.Kind = svkConstString) or ((P1.Kind = svkRegister) and (P1.RegType = srtString));
+  end;
+  if IsConst then
+  begin
+    if (What >= 0) and (What < 100) then EmitGet else EmitSet;
+    Exit;
+  end;
+  // a WHAT computed at run time: "if what < 100 then GET else SET"
+  C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, C, WReg, EnsureIntRegister(MakeSSAConstInt(100)), MakeSSAValue(svkNone));
+  GetLabel := GenerateUniqueLabel('scrctl_get');
+  ElseLabel := GenerateUniqueLabel('scrctl_set');
+  EndLabel := GenerateUniqueLabel('scrctl_end');
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(ElseLabel), C, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  PrevBlock := FCurrentBlock;
+  FCurrentBlock := FProgram.CreateBlock(GetLabel);
+  GetBlock := FCurrentBlock;
+  PrevBlock.AddSuccessor(GetBlock); GetBlock.AddPredecessor(PrevBlock);
+  EmitGet;
+  EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  GetBlock := FCurrentBlock;
+  FCurrentBlock := FProgram.CreateBlock(ElseLabel);
+  ElseBlock := FCurrentBlock;
+  PrevBlock.AddSuccessor(ElseBlock); ElseBlock.AddPredecessor(PrevBlock);
+  EmitSet;
+  EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  ElseBlock := FCurrentBlock;
+  EndBlock := FProgram.CreateBlock(EndLabel);
+  GetBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(GetBlock);
+  ElseBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(ElseBlock);
+  FCurrentBlock := EndBlock;
 end;
 
 procedure TSSAGenerator.ProcessChdir(Node: TASTNode);
@@ -47064,18 +47306,26 @@ procedure TSSAGenerator.EmitModuleDestructors(UseSlots: Boolean = False);
 // handle from its reserved frame-independent slot (FModuleDtorSlots) instead. A global with no reserved
 // slot (slot space exhausted) is skipped on this path.
 var
-  i, slotIdx: Integer;
-  VName, TName, SavedThis: string;
-  IsArr: Boolean;
-  H: TSSAValue;
-  AccessNode: TASTNode;
-begin
-  if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
-  SavedThis := FCurrentThisType;
-  try
-  for i := FModuleRecordVars.Count - 1 downto 0 do
+  i, Pass: Integer;
+  SavedThis: string;
+
+  function IsLazy(const VName: string): Boolean;
+  var k: Integer;
   begin
-    if not SplitRecordVar(FModuleRecordVars[i], VName, TName, IsArr) then Continue;
+    Result := False;
+    for k := 0 to FLazyStatics.Count - 1 do
+      if SameText(Copy(FLazyStatics[k], 1, Length(VName) + 1), VName + '|') then Exit(True);
+  end;
+
+  procedure OneVar(const Entry: string);
+  var
+    slotIdx: Integer;
+    VName, TName: string;
+    IsArr: Boolean;
+    H: TSSAValue;
+    AccessNode: TASTNode;
+  begin
+    if not SplitRecordVar(Entry, VName, TName, IsArr) then Exit;
     // A hoisted STATIC local is torn down HERE, at module scope, though it was declared inside a method
     // and FreeBASIC judges its access there. Put the owning type back for this one teardown, so a type
     // whose own method keeps a "Static As T x" is not refused its own PRIVATE destructor.
@@ -47084,18 +47334,18 @@ begin
     // scope has the empty procedure name, spelled out because this emitter can run from an END inside a
     // SUB (where FCurrentProcName is that SUB's).
     if (not FModernMode) and
-       (FBlockHandledVars.IndexOf(BlockHandledKey('', VName)) >= 0) then Continue;
+       (FBlockHandledVars.IndexOf(BlockHandledKey('', VName)) >= 0) then Exit;
     // An ARRAY of records is torn down element by element, through its own array handle - there is no
     // single handle to read from a register or a reserved slot.
     if IsArr then
     begin
       EmitRecordVarDestruction(VName, TName, True);
-      Continue;
+      Exit;
     end;
     if UseSlots then
     begin
       slotIdx := FModuleDtorSlots.IndexOf(VName);
-      if slotIdx < 0 then Continue;                           // no frame-independent handle available here
+      if slotIdx < 0 then Exit;                           // no frame-independent handle available here
       H := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, PtrInt(FModuleDtorSlots.Objects[slotIdx]), H);
       EmitDestructorCall(H, TName);
@@ -47121,9 +47371,234 @@ begin
     else
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
   end;
+
+begin
+  // ⭐ DIVERGENZE 486 - THREE groups, in fbc's order (measured): the main program's own module variables (a Dim that
+  // is not Shared lives in fbc's main and dies when it returns), then the record STATICs in the reverse order they
+  // were BUILT (at run time: EmitLazyStaticDestructors), then the SHARED globals; each group last declared first.
+  // Before 2 Nov 2026 it was one list, last declared first, with the hoisted statics at its top - so they died last.
+  // A CLASSIC program declares nothing Shared and no static, and keeps the single reverse walk.
+  if ((FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0)) and (FLazyStatics.Count = 0) then Exit;
+  SavedThis := FCurrentThisType;
+  try
+    for Pass := 0 to 1 do
+    begin
+      if Pass = 1 then EmitLazyStaticDestructors;
+      if FModuleRecordVars <> nil then
+        for i := FModuleRecordVars.Count - 1 downto 0 do
+        begin
+          if IsLazy(Copy(FModuleRecordVars[i], 1, Pos('|', FModuleRecordVars[i]) - 1)) then Continue;
+          if (FModuleSharedNames.IndexOf(Copy(FModuleRecordVars[i], 1, Pos('|', FModuleRecordVars[i]) - 1)) >= 0) <>
+             (Pass = 1) then Continue;
+          OneVar(FModuleRecordVars[i]);
+        end;
+    end;
   finally
     FCurrentThisType := SavedThis;
   end;
+end;
+
+function TSSAGenerator.LoadSharedIntScalar(const Name: string): TSSAValue;
+// The twin of EmitSharedScalarStoreVal: element 0 of a SHARED scalar's backing, as an integer register.
+var
+  ai: Integer;
+  Idx0: TSSAValue;
+begin
+  ai := PtrInt(FSharedScalarArr.Objects[FSharedScalarArr.IndexOf(UpperFast(Name))]);
+  Idx0 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, Idx0, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaArrayLoad, Result, MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType), Idx0,
+                  MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.RunsBeforeModuleBody: Boolean;
+// Does anything run before the module body - a module constructor, or a Dim Shared record built early (DIVERGENZE
+// 486)? Then every shared backing is sized in the entry block and a Dim in the body must not size it again.
+begin
+  Result := ((FModuleCtors <> nil) and (FModuleCtors.Count > 0)) or FHasEarlyShared;
+end;
+
+procedure TSSAGenerator.EmitEarlySharedRecords(Node: TASTNode);
+// DIVERGENZE 486 - the Dim Shared records, built before the module body as fbc does: its initialiser may name shared
+// variables and procedures but not a variable of the main program, which does not exist yet - fbc's error 272.
+
+  procedure CheckNoLocal(N: TASTNode; const Decl: string);
+  var c: Integer;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antIdentifier) and (FModuleLocalNames.IndexOf(N.ValueUpper) >= 0) and
+       (FModuleSharedNames.IndexOf(N.ValueUpper) < 0) then
+      raise Exception.CreateFmt('Local symbols can''t be referenced in ''Dim Shared %s'': %s is a variable of the ' +
+                                'main program, and a shared variable is built before the program starts',
+                                [Decl, LowerCase(N.ValueUpper)]);
+    if N.NodeType = antMemberAccess then
+    begin
+      if N.ChildCount > 0 then CheckNoLocal(N.GetChild(0), Decl);
+      Exit;
+    end;
+    for c := 0 to N.ChildCount - 1 do CheckNoLocal(N.GetChild(c), Decl);
+  end;
+
+var
+  i, k: Integer;
+  D: TASTNode;
+begin
+  if (Node = nil) or not FHasEarlyShared then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if (Node.GetChild(i).NodeType <> antDim) or (Node.GetChild(i).Attributes.Values['EARLYSHARED'] <> '1') then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      D := Node.GetChild(i).GetChild(k);
+      if (D.NodeType = antArrayDecl) and (D.ChildCount >= 3) and (D.GetChild(0).NodeType = antIdentifier) then
+        CheckNoLocal(D.GetChild(2), LowerCase(D.GetChild(0).ValueUpper));
+    end;
+    ProcessDim(Node.GetChild(i));
+    Node.GetChild(i).Attributes.Values['EARLYSHARED'] := '2';   // built: the module walk passes it by
+  end;
+end;
+
+procedure TSSAGenerator.CollectLazyStatics(Node: TASTNode);
+// DIVERGENZE 486: the module's SHARED names, and the record STATICs LowerStaticLocals marked STATICLAZY whose type is
+// a record here (FindUDT: only the SSA can tell) - "VARNAME|TYPENAME|ORDNAME", in hoisting order. Top level only: that
+// is where both live once namespaces are flattened.
+var
+  i, k: Integer;
+  D: TASTNode;
+  VName, TName: string;
+begin
+  if Node = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType <> antDim then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      D := Node.GetChild(i).GetChild(k);
+      if (D.NodeType <> antArrayDecl) or (D.ChildCount < 2) or (D.GetChild(0).NodeType <> antIdentifier) then Continue;
+      VName := D.GetChild(0).ValueUpper;
+      if D.Attributes.Values['SHARED'] = '1' then FModuleSharedNames.Add(VName)
+      else FModuleLocalNames.Add(VName);
+      // ⭐ DIVERGENZE 486: a Dim Shared RECORD is built before the module body, after the module constructors, as fbc's
+      // static initialisation does ("modc c 1 start c 2"). SB_SHARED_EARLY=0 is the A/B.
+      if FModernMode and (D.Attributes.Values['SHARED'] = '1') and (D.Attributes.Values['STATICLAZY'] = '') and
+         (D.Attributes.Values['BYREF'] <> '1') and (D.GetChild(1).NodeType = antIdentifier) and
+         (FindUDT(CanonicalType(D.GetChild(1).ValueUpper)) >= 0) and
+         (GetEnvironmentVariable('SB_SHARED_EARLY') <> '0') then
+      begin
+        Node.GetChild(i).Attributes.Values['EARLYSHARED'] := '1';
+        FHasEarlyShared := True;
+      end;
+      if (D.Attributes.Values['STATICLAZY'] = '') or (D.GetChild(1).NodeType <> antIdentifier) then Continue;
+      TName := CanonicalType(D.GetChild(1).ValueUpper);
+      if FindUDT(TName) >= 0 then
+        FLazyStatics.Add(VName + '|' + TName + '|' + UpperFast(D.Attributes.Values['STATICLAZY']))
+      else
+        D.Attributes.Values['STATICLAZY'] := '';   // not a record: initialised at program start, as before
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessStaticSite(Node: TASTNode);
+// DIVERGENZE 486 - where "Static s As T = ..." was written: on the FIRST pass build the record the hoisted Dim
+// allocated - field initialisation, constructor, initialiser, through the same branch a Dim Shared takes - then
+// number the construction (<mangled>.ORD = ++STATIC..COUNT) for the teardown. ORD is -1 while the constructor runs,
+// so a constructor that reaches its own static does not build it twice.
+var
+  Decl, Tmp, D2: TASTNode;
+  VName, TName, OrdName: string;
+  i: Integer;
+  Found: Boolean;
+  O, Cnt, Cnt1: TSSAValue;
+  SkipLabel, BodyLabel: string;
+  PrevBlock, BodyBlock, SkipBlock: TSSABasicBlock;
+begin
+  if (Node.ChildCount < 1) or (Node.GetChild(0).ChildCount < 1) then Exit;
+  Decl := Node.GetChild(0).GetChild(0);
+  if (Decl.ChildCount < 2) or (Decl.GetChild(1).NodeType <> antIdentifier) then Exit;
+  VName := UpperFast(VarToStr(Decl.GetChild(0).Value));
+  TName := CanonicalType(Decl.GetChild(1).ValueUpper);
+  OrdName := UpperFast(Node.Attributes.Values['STATICSITE']);
+  Found := False;
+  for i := 0 to FLazyStatics.Count - 1 do
+    if SameText(FLazyStatics[i], VName + '|' + TName + '|' + OrdName) then Found := True;
+  if not Found then Exit;   // not a record: the hoisted Dim did everything at program start
+  O := LoadSharedIntScalar(OrdName);
+  SkipLabel := GenerateUniqueLabel('static_built');
+  BodyLabel := GenerateUniqueLabel('static_build');
+  EmitInstruction(ssaJumpIfNotZero, MakeSSALabel(SkipLabel), O, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  PrevBlock := FCurrentBlock;
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  PrevBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(PrevBlock);
+  EmitSharedScalarStoreVal(OrdName, EnsureIntRegister(MakeSSAConstInt(-1)));
+  Tmp := TASTNode.Create(antDim, Node.Token);
+  D2 := Decl.Clone;
+  D2.GetChild(0).NodeType := antIdentifier;
+  D2.Attributes.Values['SHARED'] := '1';
+  D2.Attributes.Values['STATICLAZY'] := '';
+  Tmp.AddChild(D2);
+  FStaticSiteBody := True;
+  try
+    ProcessDimBody(Tmp);
+  finally
+    FStaticSiteBody := False;
+    Tmp.Free;
+  end;
+  Cnt := LoadSharedIntScalar('STATIC..COUNT');
+  Cnt1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Cnt1, Cnt, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitSharedScalarStoreVal('STATIC..COUNT', Cnt1);
+  EmitSharedScalarStoreVal(OrdName, Cnt1);
+  EmitInstruction(ssaJump, MakeSSALabel(SkipLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BodyBlock := FCurrentBlock;   // the constructor call split the body: the edge leaves from where the jump IS
+  SkipBlock := FProgram.CreateBlock(SkipLabel);
+  BodyBlock.AddSuccessor(SkipBlock); SkipBlock.AddPredecessor(BodyBlock);
+  PrevBlock.AddSuccessor(SkipBlock); SkipBlock.AddPredecessor(PrevBlock);
+  FCurrentBlock := SkipBlock;
+end;
+
+procedure TSSAGenerator.EmitLazyStaticDestructors;
+// DIVERGENZE 486 - the record statics in the REVERSE order of their construction, which only the run knows: position
+// n (STATIC..COUNT down to 1) is the static whose ORD is n. Unrolled, L positions x L statics; a static never built
+// has ORD 0 and matches none. ORD goes back to 0 once destroyed, so a second END destroys nothing twice.
+var
+  Place, k: Integer;
+  VName, TName, OrdName, E: string;
+  O, C, H: TSSAValue;
+  NextLabel, BodyLabel: string;
+  PrevBlock, BodyBlock, NextBlock: TSSABasicBlock;
+begin
+  if FLazyStatics.Count = 0 then Exit;
+  for Place := FLazyStatics.Count downto 1 do
+    for k := 0 to FLazyStatics.Count - 1 do
+    begin
+      E := FLazyStatics[k];
+      VName := Copy(E, 1, Pos('|', E) - 1); Delete(E, 1, Pos('|', E));
+      TName := Copy(E, 1, Pos('|', E) - 1); Delete(E, 1, Pos('|', E));
+      OrdName := E;
+      if not TypeNeedsDestruction(TName) then Continue;
+      O := LoadSharedIntScalar(OrdName);
+      C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaCmpEqInt, C, O, EnsureIntRegister(MakeSSAConstInt(Place)), MakeSSAValue(svkNone));
+      NextLabel := GenerateUniqueLabel('static_dtor_next');
+      BodyLabel := GenerateUniqueLabel('static_dtor');
+      EmitInstruction(ssaJumpIfZero, MakeSSALabel(NextLabel), C, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      PrevBlock := FCurrentBlock;
+      FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+      BodyBlock := FCurrentBlock;
+      PrevBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(PrevBlock);
+      FCurrentThisType := FStaticLocalOwner.Values[VName];
+      H := LoadSharedIntScalar(VName);
+      EmitDestructorCall(H, TName);
+      EmitSharedScalarStoreVal(OrdName, EnsureIntRegister(MakeSSAConstInt(0)));
+      EmitInstruction(ssaJump, MakeSSALabel(NextLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      BodyBlock := FCurrentBlock;
+      NextBlock := FProgram.CreateBlock(NextLabel);
+      BodyBlock.AddSuccessor(NextBlock); NextBlock.AddPredecessor(BodyBlock);
+      PrevBlock.AddSuccessor(NextBlock); NextBlock.AddPredecessor(PrevBlock);
+      FCurrentBlock := NextBlock;
+    end;
 end;
 
 function TSSAGenerator.InnermostBlockFrameIdx: Integer;
@@ -48455,7 +48930,7 @@ var
   i, ai: Integer;
   ArrayRef: TSSAValue;
 begin
-  if (FSharedScalarArr = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  if (FSharedScalarArr = nil) or not RunsBeforeModuleBody then Exit;
   for i := 0 to FSharedScalarArr.Count - 1 do
   begin
     ai := PtrInt(FSharedScalarArr.Objects[i]);
@@ -48512,7 +48987,7 @@ var
 begin
   // ⭐ DIVERGENZE 662: a module array named by an ADDRESS item of a DATA statement ("Data @arr(2)") is static storage in
   // fbc too, and EmitDataAddressItems takes its address right after this - so it is hoisted the same way, shared or not.
-  if (Node = nil) or (((FModuleCtors = nil) or (FModuleCtors.Count = 0)) and (FDataAddrNames.Count = 0)) then Exit;
+  if (Node = nil) or ((not RunsBeforeModuleBody) and (FDataAddrNames.Count = 0)) then Exit;
   for i := 0 to Node.ChildCount - 1 do
   begin
     if Node.GetChild(i).NodeType <> antDim then Continue;
@@ -48520,7 +48995,7 @@ begin
     begin
       Decl := Node.GetChild(i).GetChild(k);
       if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
-      if not (((Decl.Attributes.Values['SHARED'] = '1') and Assigned(FModuleCtors) and (FModuleCtors.Count > 0)) or
+      if not (((Decl.Attributes.Values['SHARED'] = '1') and RunsBeforeModuleBody) or
               ((Decl.GetChild(0).NodeType = antIdentifier) and
                (FDataAddrNames.IndexOf(Decl.GetChild(0).ValueUpper) >= 0))) then Continue;
       if Decl.GetChild(1).NodeType <> antDimensions then Continue;      // a scalar: the allocs above have it
@@ -48550,7 +49025,7 @@ var
   Decl, InitNode, InitAssign: TASTNode;
   NameU: string;
 begin
-  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  if (Node = nil) or not RunsBeforeModuleBody then Exit;
   for i := 0 to Node.ChildCount - 1 do
   begin
     if Node.GetChild(i).NodeType <> antDim then Continue;
@@ -52076,28 +52551,75 @@ procedure TSSAGenerator.CheckProcUsedBeforeDefinition(AST: TASTNode);
 // that point of the source. "ProcPtr(later)" is "error 8: Undefined symbol", "@later" and a CALL "later(...)" are
 // "error 42: Variable not declared". This pipeline sees the whole program before it lowers a call, so it took all
 // three and answered as if the definition had come first.
-// ⚠️ DELIBERATELY NARROW, because a refusal that is wrong breaks a valid program: only a procedure defined at the TOP
-// level of the program (not in a namespace, not a method - no '.' in the name), never DECLAREd anywhere, whose name is
-// never a variable, a parameter or an array anywhere in the program; and only the four unambiguous forms of a use -
-// ProcPtr(name), @name, a statement call, name(args). A bare "name" with no parentheses is left alone: it can be a
-// local variable shadowing nothing this walk can see. MODERN only (the caller gates it): CLASSIC has no procedures of
-// this kind. SB_PROC_ORDER=0 is the A/B.
+// ⭐ DIVERGENZE 723 - and the three forms 716 left out on purpose: (1) the BARE name, "Dim z As Long = later_fn" or
+// "Print later" (a call with no parentheses), refused only where an identifier is certainly an expression; (2) a
+// procedure defined in a NAMESPACE (its flattened name has a dot; a METHOD, whose prefix is a type, is always declared
+// inside its Type and stays out); (3) a name that is also a variable SOMEWHERE ELSE - the exclusion is now by SCOPE: a
+// use inside a procedure is a variable when that procedure declares it (or the module does), a use in the main
+// program when the module does. SB_PROC_ORDER_BARE=0 turns (1) off, as an A/B.
+// ⚠️ Still narrow in the direction that matters - a wrong refusal breaks a valid program: never DECLAREd anywhere,
+// and a name the scope can see as a variable is never refused. MODERN only (the caller gates it). SB_PROC_ORDER=0 is
+// the A/B of the whole check.
 var
   DefIdx: TStringList;         // name -> source line of its first top-level definition
-  Shadow, Fwd: TStringList;    // names that are also variables/parameters; names DECLAREd
+  ModVars, Fwd: TStringList;   // names declared as variables at module level; names DECLAREd
+  Locals: TStringList;         // the variables of the procedure being walked (nil in the main program)
+  Methods: TStringList;        // "TYPE|SHORTNAME" of every method defined (a call inside a method may be a member)
+  CurType: string;             // the type whose METHOD is being walked ('' elsewhere)
+  Shorts: TStringList;         // the last component of every definition, to find a name defined twice
   i: Integer;
-  Ch: TASTNode;
-  Nm: string;
 
-  procedure NoteShadows(N: TASTNode);
+
+  Ch: TASTNode;
+  Nm, Pfx: string;
+  Bare: Boolean;
+
+  function CountOf(L: TStringList; const S: string): Integer;
+  var k: Integer;
+  begin
+    Result := 0;
+    for k := 0 to L.Count - 1 do if L[k] = S then Inc(Result);
+  end;
+
+  procedure NoteVars(N: TASTNode; Into: TStringList; IntoProcs: Boolean);
   var c: Integer;
   begin
     if N = nil then Exit;
+    if (N.NodeType = antProcedureDecl) and not IntoProcs then Exit;
     if (N.NodeType in [antArrayDecl, antParameterList]) then
       for c := 0 to N.ChildCount - 1 do
         if (N.GetChild(c).NodeType = antIdentifier) and ((N.NodeType = antParameterList) or (c = 0)) then
-          Shadow.Add(UpperFast(VarToStr(N.GetChild(c).Value)));
-    for c := 0 to N.ChildCount - 1 do NoteShadows(N.GetChild(c));
+          Into.Add(UpperFast(VarToStr(N.GetChild(c).Value)));
+    // a FOR counter declared in the loop ("For i As Integer = ...") is a variable of the scope too
+    if (N.NodeType = antForLoop) and (N.ChildCount > 0) and (N.GetChild(0).NodeType = antIdentifier) then
+      Into.Add(UpperFast(VarToStr(N.GetChild(0).Value)));
+    for c := 0 to N.ChildCount - 1 do NoteVars(N.GetChild(c), Into, IntoProcs);
+  end;
+
+  function IsVar(const Name: string): Boolean;
+  begin
+    Result := (ModVars.IndexOf(Name) >= 0) or ((Locals <> nil) and (Locals.IndexOf(Name) >= 0));
+  end;
+
+  // Inside a method of T, "proc()" is the MEMBER when T or an ancestor has one of that name - the implicit This.
+  function IsMember(const Name: string): Boolean;
+  var T, Short: string; U, f, Guard: Integer;
+  begin
+    Result := False;
+    if CurType = '' then Exit;
+    Short := Name;
+    if LastDelimiter('.', Short) > 0 then Short := Copy(Short, LastDelimiter('.', Short) + 1, MaxInt);
+    T := CurType; Guard := 0;
+    while (T <> '') and (Guard < 64) do
+    begin
+      if Methods.IndexOf(T + '|' + Short) >= 0 then Exit(True);
+      U := FindUDT(T);
+      if U < 0 then Exit;
+      for f := 0 to High(FUDTs[U].Fields) do
+        if SameText(FUDTs[U].Fields[f].Name, Short) then Exit(True);
+      T := UpperFast(FUDTs[U].Parent);
+      Inc(Guard);
+    end;
   end;
 
   function LaterProc(const Name: string; Here: Integer): Boolean;
@@ -52105,7 +52627,7 @@ var
   begin
     Result := False;
     d := DefIdx.IndexOfName(Name);
-    if (d < 0) or (Here <= 0) then Exit;
+    if (d < 0) or (Here <= 0) or IsVar(Name) or IsMember(Name) then Exit;
     Result := StrToInt(DefIdx.ValueFromIndex[d]) > Here;
   end;
 
@@ -52125,12 +52647,52 @@ var
       'declare it above (fbc reads the file once)', [Form, Name, Where]);
   end;
 
+  // (1) Is the child at Idx of Parent certainly an EXPRESSION? Only these positions: anything else - a declared
+  // name, a type, a label, a FOR counter, a field - is never asked.
+  function ExprPosition(Parent: TASTNode; Idx: Integer): Boolean;
+  begin
+    case Parent.NodeType of
+      antBinaryOp, antUnaryOp, antParentheses, antPrint, antReturn, antArgumentList: Result := True;
+      antAssignment: Result := Idx >= 1;
+      antArrayDecl: Result := (Idx = 2) and (Parent.ChildCount >= 2) and (Parent.GetChild(1).NodeType = antIdentifier);
+      antIf: Result := Idx = 0;
+    else
+      Result := False;
+    end;
+  end;
+
   procedure Walk(N: TASTNode);
-  var c, Here: Integer; H: TASTNode; Up: string;
+  var c, Here: Integer; H, Kid: TASTNode; Up, SavedType: string; Saved: TStringList;
   begin
     if N = nil then Exit;
     Here := N.SourceLine;
     case N.NodeType of
+      antTypeDecl: Exit;   // field names and method declarations, not uses
+      antProcedureDecl:
+        begin
+          // (3) the procedure's own variables, for the length of its body
+          Saved := Locals;
+          SavedType := CurType;
+          Locals := TStringList.Create;
+          try
+            Locals.Sorted := True; Locals.Duplicates := dupIgnore;
+            NoteVars(N, Locals, True);
+            // a METHOD ("T.M", T a type): its body sees T's members by their bare names
+            CurType := '';
+            if (N.ChildCount > 0) and (N.GetChild(0).NodeType = antIdentifier) then
+            begin
+              Up := UpperFast(VarToStr(N.GetChild(0).Value));
+              if (LastDelimiter('.', Up) > 0) and (FindUDT(Copy(Up, 1, LastDelimiter('.', Up) - 1)) >= 0) then
+                CurType := UpperFast(FUDTs[FindUDT(Copy(Up, 1, LastDelimiter('.', Up) - 1))].Name);
+            end;
+            for c := 0 to N.ChildCount - 1 do Walk(N.GetChild(c));
+          finally
+            Locals.Free;
+            Locals := Saved;
+            CurType := SavedType;
+          end;
+          Exit;
+        end;
       antProcAddress:
         if N.ChildCount = 0 then
         begin
@@ -52156,37 +52718,84 @@ var
           else if LaterProc(Up, Here) then Refuse(N, Up, 'the call of');
         end;
     end;
-    for c := 0 to N.ChildCount - 1 do Walk(N.GetChild(c));
+    for c := 0 to N.ChildCount - 1 do
+    begin
+      Kid := N.GetChild(c);
+      if Bare and (Kid.NodeType = antIdentifier) and ExprPosition(N, c) then
+      begin
+        Up := UpperFast(VarToStr(Kid.Value));
+        if LaterProc(Up, Kid.SourceLine) then Refuse(Kid, Up, 'the call of');
+      end;
+      Walk(Kid);
+    end;
   end;
 
 begin
   // ⚠️ A source that asks for qb/fblite/deprecated is another language (fbc takes "Call later(...)" there).
   if (AST = nil) or SourceDeclaresNonFbDialect or (GetEnvironmentVariable('SB_PROC_ORDER') = '0') then Exit;
-  DefIdx := TStringList.Create; Shadow := TStringList.Create; Fwd := TStringList.Create;
+  Bare := GetEnvironmentVariable('SB_PROC_ORDER_BARE') <> '0';
+  DefIdx := TStringList.Create; ModVars := TStringList.Create; Fwd := TStringList.Create;
+  Methods := TStringList.Create;
+  Methods.Sorted := True; Methods.Duplicates := dupIgnore;
+  Locals := nil;
+  CurType := '';
   try
-    Shadow.Sorted := True; Shadow.Duplicates := dupIgnore;
+    ModVars.Sorted := True; ModVars.Duplicates := dupIgnore;
     Fwd.Sorted := True; Fwd.Duplicates := dupIgnore;
     Fwd.DelimitedText := UpperFast(AST.Attributes.Values['FWDDECL']);
-    NoteShadows(AST);
+    NoteVars(AST, ModVars, False);
     for i := 0 to AST.ChildCount - 1 do
     begin
       Ch := AST.GetChild(i);
       if (Ch.NodeType <> antProcedureDecl) or (Ch.ChildCount < 1) or
          (Ch.GetChild(0).NodeType <> antIdentifier) then Continue;
-      if not (SameText(VarToStr(Ch.Value), 'SUB') or SameText(VarToStr(Ch.Value), 'FUNCTION')) then Continue;
       Nm := UpperFast(VarToStr(Ch.GetChild(0).Value));
+      // every member a type DEFINES - sub, function, property, operator - is a name its methods reach bare
+      if (LastDelimiter('.', Nm) > 0) and (FindUDT(Copy(Nm, 1, LastDelimiter('.', Nm) - 1)) >= 0) then
+        Methods.Add(UpperFast(FUDTs[FindUDT(Copy(Nm, 1, LastDelimiter('.', Nm) - 1))].Name) + '|' +
+                    Copy(Nm, LastDelimiter('.', Nm) + 1, MaxInt));
+      if not (SameText(VarToStr(Ch.Value), 'SUB') or SameText(VarToStr(Ch.Value), 'FUNCTION')) then Continue;
       // ⚠️ '$' and a leading "__FB" name a procedure OUR passes synthesise (SADDR$..., __FBHDR_...), which has no
       // place in the user's source; and a definition with no line is one of those too.
-      if (Nm = '') or (Pos('.', Nm) > 0) or (Pos('$', Nm) > 0) or (Copy(Nm, 1, 4) = '__FB') or
-         (Ch.SourceLine <= 0) or (Fwd.IndexOf(Nm) >= 0) or (Shadow.IndexOf(Nm) >= 0) then Continue;
+      if (Nm = '') or (Pos('$', Nm) > 0) or (Copy(Nm, 1, 4) = '__FB') or (Ch.SourceLine <= 0) or
+         (Fwd.IndexOf(Nm) >= 0) or (ModVars.IndexOf(Nm) >= 0) then Continue;
+      // (2) a dotted name: a NAMESPACE procedure counts, a METHOD (prefix = a type) does not. A DECLARE inside the
+      // namespace may have been noted under the short name: either spelling exempts it.
+      if Pos('.', Nm) > 0 then
+      begin
+        Pfx := Copy(Nm, 1, LastDelimiter('.', Nm) - 1);
+        if FindUDT(Pfx) >= 0 then Continue;
+        if Fwd.IndexOf(Copy(Nm, LastDelimiter('.', Nm) + 1, MaxInt)) >= 0 then Continue;
+      end;
       if DefIdx.IndexOfName(Nm) < 0 then DefIdx.Add(Nm + '=' + IntToStr(Ch.SourceLine));
+    end;
+    // ⚠️ A SHORT name defined more than once (at top level and in a namespace, or in two namespaces): which one a call
+    // means depends on what fbc has seen at that line, and the namespace flattening here may have picked the other
+    // one (structs/inherit-type-3: "proc()" in N.A1 before N.A1's own proc is defined is the OUTER proc for fbc). Such
+    // a name is never refused.
+    Shorts := TStringList.Create;
+    try
+      for i := 0 to DefIdx.Count - 1 do
+      begin
+        Nm := DefIdx.Names[i];
+        if LastDelimiter('.', Nm) > 0 then Nm := Copy(Nm, LastDelimiter('.', Nm) + 1, MaxInt);
+        Shorts.Add(Nm);
+      end;
+      for i := DefIdx.Count - 1 downto 0 do
+      begin
+        Nm := DefIdx.Names[i];
+        if LastDelimiter('.', Nm) > 0 then Nm := Copy(Nm, LastDelimiter('.', Nm) + 1, MaxInt);
+        if CountOf(Shorts, Nm) > 1 then DefIdx.Delete(i);
+      end;
+    finally
+      Shorts.Free;
     end;
     if DefIdx.Count = 0 then Exit;
     // ⚠️ By source LINE, not by position among the children: the Static pass hoists initialisers to the top of the
     // program ("Static sf As Function() As Integer = @foo" inside a Sub defined after foo).
     for i := 0 to AST.ChildCount - 1 do Walk(AST.GetChild(i));
   finally
-    DefIdx.Free; Shadow.Free; Fwd.Free;
+    DefIdx.Free; ModVars.Free; Fwd.Free; Methods.Free;
   end;
 end;
 
@@ -63455,7 +64064,11 @@ begin
   // had two callers, BOTH on the expression side, so the very same call written as a statement died as
   // "Undefined procedure: BAR" one line below its working twin. Tried before the no-op rule below: a
   // method of the owner type is not a stray identifier.
-  if (FProcedureNames.IndexOf(Node.ValueUpper) < 0) and
+  if ((FProcedureNames.IndexOf(Node.ValueUpper) < 0) or
+      // DIVERGENZE 739: the member first, inside a method of a type that declares one of that name
+      ((FCurrentThisType <> '') and (FindUDT(FCurrentThisType) >= 0) and
+       MethodNameDeclared(FCurrentThisType, Node.ValueUpper) and
+       (GetEnvironmentVariable('SB_MEMBER_FIRST') <> '0'))) and
      TryImplicitThisMethod(Node.ValueUpper, ArgList, Node.Token, PtrVal) then Exit;
   // ⭐ A FOREIGN SUB, called as a statement. Asked BEFORE the "a bare parameterless name is a stray
   // identifier" rule below, because a foreign SUB with no arguments is exactly that shape and treating
@@ -65058,6 +65671,7 @@ var
   FlagVal, SleepFlag: TSSAValue;  // SLEEP n, 1: the "do not wake" flag (DIVERGENZE 415)
   EndCodeVal: TSSAValue;  // END <expr>: a computed exit code (DIVERGENZE 646)
   FPSReg: TSSAValue;  // For FRAME command
+  NopVal: TSSAValue;  // WINDOWTITLE's caption (DIVERGENZE 741)
   ArgReg: TSSAValue;      // For SETDATE/SETTIME string argument
   SelImm: Integer;        // For SETDATE/SETTIME selector
   KeyNumVal, KeyTextVal, KeyNumReg, KeyTextReg: TSSAValue;  // For KEY command
@@ -65352,7 +65966,14 @@ begin
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
       else if Node.Attributes.Values['NOP'] = 'SCREENUNLOCK' then
         EmitInstruction(ssaScreenUnlock, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      // DIVERGENZE 741: WINDOWTITLE is SCREENCONTROL SET_WINDOW_TITLE, and GET_WINDOW_TITLE reads it back
+      else if (Node.Attributes.Values['NOP'] = 'WINDOWTITLE') and (Node.ChildCount >= 1) then
+      begin
+        ProcessExpression(Node.GetChild(0), NopVal);
+        EmitInstruction(ssaGfxCtlSetStr, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(101)),
+                        EnsureStringRegister(NopVal), MakeSSAValue(svkNone));
+      end;
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);
@@ -66460,6 +67081,11 @@ begin
   // implicit fall-through halt can emit their destructor calls (in reverse construction order).
   FModuleRecordVars.Clear;
   CollectModuleRecordVars(AST);
+  FLazyStatics.Clear;
+  FModuleSharedNames.Clear;
+  FModuleLocalNames.Clear;
+  FHasEarlyShared := False;
+  CollectLazyStatics(AST);
   // FreeBASIC module constructors/destructors (top-level "SUB name Constructor|Destructor").
   FModuleCtors.Clear;
   FModuleDtors.Clear;
@@ -66555,6 +67181,7 @@ begin
   EmitSharedArrayAllocs(AST);
   EmitDataAddressItems;   // DIVERGENZE 662: after the cells and arrays exist, before anything can READ
   EmitModuleConstructors;
+  EmitEarlySharedRecords(AST);   // DIVERGENZE 486: the Dim Shared records, after the module constructors
 
   // Process AST (DATA statements will be skipped since they're already processed).
   // SUB/FUNCTION declarations are collected (not lowered) during this walk.

@@ -15,7 +15,8 @@
  *   - ImmediateType: Whether Immediate contains register index(es)
  *
  * Copyright (C) 2025 Maurizio Cammalleri
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
+ * Additional permission: GCC Runtime Library Exception 3.1 (see COPYING.RUNTIME)
  *}
 
 { ============================================================================

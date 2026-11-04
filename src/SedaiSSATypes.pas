@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiSSATypes;
 
@@ -890,6 +889,9 @@ type
     // DIVERGENZE 738: CLASSIC only. Src1 = a float register just produced by an operation that can overflow;
     // an infinite (or NaN) value raises ?OVERFLOW ERROR, as Commodore BASIC does -> bcFloatOverflowCheck.
     ssaFloatOverflowCheck,
+    // DIVERGENZE 741: SCREENCONTROL. GfxCtlStr: Dest = string, Src1 = what (int). GfxCtlSetInt: Src1 = what, Src2 =
+    // param1, Src3 = param2 (int registers). GfxCtlSetStr: Src1 = what (int), Src2 = the string.
+    ssaGfxCtlStr, ssaGfxCtlSetInt, ssaGfxCtlSetStr,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

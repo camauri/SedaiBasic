@@ -9,7 +9,8 @@
   - Indexed colors (0-255) for legacy modes, RGBA truecolor for modern modes
   - Interrupt-based automatic movement and collision detection
 
-  Copyright (c) 2024-2025 Artiforge
+  Copyright (C) 2025 Maurizio Cammalleri
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see LICENSE, COPYING.RUNTIME)
 }
 unit SedaiSpriteTypes;
 

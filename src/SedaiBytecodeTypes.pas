@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiBytecodeTypes;
 
@@ -929,6 +928,10 @@ const
   // (int), Src1 = the file name (string), Src2 = the image / memory pointer, 0 = the screen (int), Immediate[0..15] =
   // BSAVE's size register, [16..31] = the palette pointer's register (int, 0 = none), bit 32 = BLOAD.
   bcGfxBFile        = bcGroupGraphics + 71;
+  // DIVERGENZE 741 - SCREENCONTROL (fbgfx.bi's GET_/SET_ operations). The integer GETs ride POINTCOORD's selector space.
+  bcGfxCtlStr       = bcGroupGraphics + 72;  // Dest (string) = GET_WINDOW_TITLE / GET_DRIVER_NAME / ...: Src1 = what (int)
+  bcGfxCtlSetInt    = bcGroupGraphics + 73;  // SET_xxx with numbers: Src1 = what, Src2 = param1, Dest = param2 (int, READ)
+  bcGfxCtlSetStr    = bcGroupGraphics + 74;  // SET_xxx with a string: Src1 = what (int), Src2 = the string
 
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
@@ -2594,6 +2597,9 @@ begin
         58: Result := 'GfxPointCoord';
         70: Result := 'GfxScreenList';
         71: Result := 'GfxBFile';          // DIVERGENZE 663
+        72: Result := 'GfxCtlStr';         // DIVERGENZE 741
+        73: Result := 'GfxCtlSetInt';      // DIVERGENZE 741
+        74: Result := 'GfxCtlSetStr';      // DIVERGENZE 741
         59: Result := 'GfxCircleEx';
         60: Result := 'GfxPaintBorder';
         61: Result := 'GfxSetTarget';

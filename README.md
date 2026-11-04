@@ -633,13 +633,10 @@ Results are saved to `benchmarks/results/BENCHMARKS.md` (or custom file with `-O
 
 Copyright (C) 2025 Maurizio Cammalleri
 
-This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License v3** as published by the Free Software Foundation.
+This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License version 3 only** (GPL-3.0-only) as published by the Free Software Foundation.
 
 See the [LICENSE](LICENSE) file for the complete license text.
 
-### Commercial Licensing
+### Your programs are yours
 
-For commercial licensing inquiries, please contact the author:
-
-**Maurizio Cammalleri**
-Email: maurizio.cammalleri@gmail.com
+SedaiBasic's files carry the **GCC Runtime Library Exception, version 3.1** ([COPYING.RUNTIME](COPYING.RUNTIME)), the standard additional permission under section 7 of the GPLv3 that the Free Software Foundation wrote for GCC's runtime libraries (SPDX: `GPL-3.0-only WITH GCC-exception-3.1`). A program you write in SedaiBasic, compiled to `.basc` bytecode or to a fused executable with `sbc --fuse`, may be distributed under terms of your choice, including proprietary ones, even though it carries the SedaiBasic runtime. SedaiBasic itself, and any modified version of it, remains under the GPLv3.

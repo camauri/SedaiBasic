@@ -1,3 +1,23 @@
+{*
+ * SedaiBasic - A BASIC interpreter with bytecode VM
+ * Copyright (C) 2025 Maurizio Cammalleri
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
+ *
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
+ *}
 unit SedaiOpcodeTable;
 
 { ============================================================================
@@ -42,7 +62,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 594 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcFloatOverflowCheck (DIVERGENZE 738)  // +1 bcGfxBFile (DIVERGENZE 663)  // +1 bcDataSetInt (DIVERGENZE 662)  // +1 bcValueForC (DIVERGENZE 561)  // +1 bcPtrFromInt (DIVERGENZE 528)  // +1 bcUtfConv (utf_conv.bi)  // +2 bcArrayLoadSingle/StoreSingle (phase 2.6)   // +2 bcArrayLoadNarrow/StoreNarrow (phase 2.5)   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +2 bcArrayDescPtr/Ind; +1 bcArrayElemAddr
+  OPCODE_LIST_COUNT = 597 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +3 bcGfxCtlStr/SetInt/SetStr (DIVERGENZE 741)   // +1 bcFloatOverflowCheck (DIVERGENZE 738)  // +1 bcGfxBFile (DIVERGENZE 663)  // +1 bcDataSetInt (DIVERGENZE 662)  // +1 bcValueForC (DIVERGENZE 561)  // +1 bcPtrFromInt (DIVERGENZE 528)  // +1 bcUtfConv (utf_conv.bi)  // +2 bcArrayLoadSingle/StoreSingle (phase 2.6)   // +2 bcArrayLoadNarrow/StoreNarrow (phase 2.5)   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +2 bcArrayDescPtr/Ind; +1 bcArrayElemAddr
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -123,6 +143,7 @@ const
     bcGfxScreenInfo, bcGfxScreenSet, bcGfxPCopy, bcGfxWindow, bcGfxPMap, bcGfxView,
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
     bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord, bcGfxScreenList, bcGfxBFile,
+    bcGfxCtlStr, bcGfxCtlSetInt, bcGfxCtlSetStr,
     bcGfxCircleEx, bcGfxCircleExF, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr,
     bcGfxScreenLock, bcGfxScreenUnlock, bcScnClr,
   bcGfxImageConvertRow, bcGfxDrawString, bcRegexCount, bcRegexReplace,
@@ -206,7 +227,7 @@ const
   {$ELSE}
   DENSE_WEB_SIZE      = 0;    // group 8 is gated out: it takes NO dense range
   {$ENDIF}
-  DENSE_GRAPHICS_SIZE = 72;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING, SCREENLIST, bcGfxBFile = 71)
+  DENSE_GRAPHICS_SIZE = 75;   // +3 SCREENCONTROL (DIVERGENZE 741) = 72..74   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING, SCREENLIST, bcGfxBFile = 71)
   DENSE_SOUND_SIZE    = 6;    // group 11
   DENSE_BIGINT_SIZE   = 13;   // group 12
   DENSE_SUPER_SIZE    = 72;   // group 200 keeps its whole block, holes included

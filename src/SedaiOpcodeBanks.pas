@@ -13,7 +13,7 @@ unit SedaiOpcodeBanks;
   SedaiRegisterCompaction and should follow.
 
   Copyright (c) 2025 Maurizio Cammalleri
-  Released under GNU GPL v3 }
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see COPYING.RUNTIME) }
 
 {$mode objfpc}{$H+}
 {$codepage UTF8}   // CP_UTF8 literals, like every other unit. A string that crosses a codepage
@@ -244,6 +244,7 @@ begin
     bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src1 = work / src page (int)
     bcGfxWindow, bcGfxView, bcGfxPMap,  // WINDOW/VIEW: Src1 = x1 ; PMAP: Src1 = coord (int)
     bcGfxScreen,  // SCREEN: Src1 = mode (int)
+    bcGfxCtlStr, bcGfxCtlSetInt, bcGfxCtlSetStr,  // SCREENCONTROL: Src1 = what (int) (DIVERGENZE 741)
     bcMultikey,  // MULTIKEY: Src1 = scancode (int)
     bcSetmouse,  // SETMOUSE: Src1 = x (int)
     bcGetJoystick,  // GETJOYSTICK: Src1 = device id (int)
@@ -446,6 +447,8 @@ begin
     bcGraphicCircle,  // Src2 = x register (int)
     bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxDrawString,  // DRAW STRING: Src2 = x (int); Src1 is the TEXT and is classified as a string
+    bcGfxScreen,      // SCREEN n, depth: Src2 = the depth (int), read only when Immediate bit 32 says it was given
+    bcGfxCtlSetInt,   // SCREENCONTROL SET_xxx: Src2 = param1 (int) (DIVERGENZE 741)
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
     bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
@@ -802,6 +805,7 @@ begin
     // compactor treats the register as dead on entry and may hand it to something else.
     bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr, bcBigMulSmall, bcBigDiv, bcBigMod,
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
+    bcGfxCtlSetInt,   // SCREENCONTROL SET_xxx: Dest = param2 (int) - READ, not written (DIVERGENZE 741)
     bcArrayStoreNarrow,  // phase 2.5: Dest = value register (int) - READ, not written
     bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===
@@ -884,6 +888,7 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register load (M2): Dest is the string register written.
     bcXferLoadString,
+    bcGfxCtlStr,      // SCREENCONTROL GET_WINDOW_TITLE / GET_DRIVER_NAME (DIVERGENZE 741)
     // UDT/record (M3): RecordLoadString writes a string field into Dest.
     bcRecordLoadString,
     // BigInt (group 12): the decimal text of a value.
@@ -1030,6 +1035,7 @@ begin
   case OpCode of
     // UDT/record (M3): RecordStoreString's Src2 is the string value being written.
     bcRecordStoreString,
+    bcGfxCtlSetStr,   // SCREENCONTROL SET_WINDOW_TITLE / SET_DRIVER_NAME: the string (DIVERGENZE 741)
     // === GROUP 0: Core VM operations ===
     // String comparison (second operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,

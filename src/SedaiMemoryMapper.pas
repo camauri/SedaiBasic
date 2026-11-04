@@ -18,7 +18,8 @@
   - Create subclasses for different computers (C128, C64, ZX Spectrum, etc.)
   - Each subclass registers its own mappings in InitializeMappings
 
-  Copyright (c) 2024-2025 Artiforge
+  Copyright (C) 2025 Maurizio Cammalleri
+  Released under GNU GPL v3 with the GCC Runtime Library Exception 3.1 (see LICENSE, COPYING.RUNTIME)
 }
 unit SedaiMemoryMapper;
 

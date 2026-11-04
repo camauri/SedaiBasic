@@ -58,7 +58,7 @@
     optimisation settings; SEDAI_CPUOPT=none|avx|avx2 picks the instruction set.
 
     Copyright (c) 2025 Maurizio Cammalleri
-    Released under GNU GPL v3 or Commercial License
+    Released under GNU GPL v3 (GPL-3.0-only) with the GCC Runtime Library Exception 3.1 (COPYING.RUNTIME)
 #>
 
 param(

@@ -2,22 +2,21 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    You may redistribute and/or modify it under the terms of the GNU GPL v3
- *    as published by the Free Software Foundation.
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
- *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 unit SedaiTerminalIO;
 
@@ -81,6 +80,11 @@ type
     // Only a mirror: stdout still receives exactly what it always did, so this cannot change the output
     // of a single existing program. It ADDS the pixels.
     FGfx: IGraphicsBackend;
+    // DIVERGENZE 729: a WINDOW shows that surface. fbc, once ScreenRes has opened a screen, sends PRINT to
+    // the screen and NOTHING to stdout; when ScreenRes fails (no display) it stays in text mode and PRINT
+    // goes to stdout. sb opens its framebuffer either way, so the mirror to stdout is kept exactly when no
+    // window shows it - the headless run every net reads - and dropped while a window does.
+    FWindowShown: Boolean;
     // A model of the visible screen, so a program can read back what it printed: SCREEN(row, col) and
     // the C128 screen RAM at $0400 both go through GetCharAt/GetColorAt. Text still goes straight to
     // stdout -- this mirrors it, cell by cell, wrapping at the right margin and scrolling at the bottom.
@@ -116,6 +120,8 @@ type
     // that one returns immediately when the screen model is not observable (it is maintained for
     // whoever can read it back, and usually nobody can), and the framebuffer is always observable.
     procedure MirrorTextToSurface(const Text: string);
+    function TextGoesToStdout: Boolean; inline;   // DIVERGENZE 729, see FWindowShown
+    procedure GraphicsLeft;                        // GLeaveGraphicsHook: SCREEN 0 gives the terminal back
   public
     constructor Create;
     // sb --window: attach the shared graphics surface so C128 graphics draw into the window.
@@ -123,6 +129,9 @@ type
     // The backend PRINT mirrors into while a graphics mode is open. Handed over by the VM, which is the
     // only thing that holds both; nil is the ordinary text case and costs one test per Print.
     procedure AttachGraphicsBackend(Backend: IGraphicsBackend);
+    // A window now presents the graphics surface (sb --window, or the window opened at the first
+    // ScreenRes): while a graphics mode is open, PRINT stops reaching stdout (DIVERGENZE 729).
+    procedure SetWindowShown(Value: Boolean);
 
     // IOutputDevice implementation
     function Initialize(const Title: string = ''; Width: Integer = 80; Height: Integer = 25): Boolean;
@@ -274,6 +283,9 @@ type
 procedure TerminalOutFlush;
 // Write S through the stream PRINT uses and flush it: the terminal console's escape sequences (DIVERGENZE 415).
 procedure TerminalWriteRaw(const S: string);
+// DIVERGENZE 729: True while a window shows a graphics screen - then the screen is the console, as in
+// libfb, and nothing of the text console (text, CLS, COLOR/LOCATE escapes) reaches the terminal.
+function GfxScreenOwnsText: Boolean;
 
 // The terminal controller behind an output device, or nil when the device is another one (the SDL2 console,
 // the web output) - and always nil off UNIX, where the WSTRING print keeps writing UTF-8 (DIVERGENZE 414: fbc
@@ -331,6 +343,9 @@ var
   // explicit that Draw String's advantage over Print is a TRANSPARENT background, which only means
   // anything if Print has an opaque one - i.e. if Print draws. Default ON is the faithful behaviour.
   GGfxTextMirror: Boolean = True;
+  // SB_GFX_STDOUT=1: PRINT keeps reaching stdout while a window shows a graphics screen - the behaviour
+  // before DIVERGENZE 729, as an A/B on one binary.
+  GGfxStdoutMirror: Boolean = False;
 
 function StdoutIsTerminal: Boolean; forward;
 function StdinIsTerminal: Boolean; forward;
@@ -361,6 +376,14 @@ begin
 end;
 
 procedure OutWrite(const Text: string); forward;
+
+var
+  GWindowTextCtrl: TTerminalController = nil;   // the controller whose window shows the screen (729)
+
+function GfxScreenOwnsText: Boolean;
+begin
+  Result := Assigned(GWindowTextCtrl) and not GWindowTextCtrl.TextGoesToStdout;
+end;
 
 procedure TerminalWriteRaw(const S: string);
 begin
@@ -621,6 +644,7 @@ begin
   GStdinIsTerminal := StdinIsTerminal;
   if GOutBuffered then CStdioInit(GOutIsTerminal);   // DIVERGENZE 434 (SB_OUT_C=0: the own buffer, as before)
   GGfxTextMirror := SysUtils.GetEnvironmentVariable('GFXTEXT') <> '0';
+  GGfxStdoutMirror := SysUtils.GetEnvironmentVariable('SB_GFX_STDOUT') = '1';
   if not GOutExitRegistered then
   begin
     // Whatever is still buffered must reach the stream even if the process ends abnormally.
@@ -798,6 +822,42 @@ end;
 procedure TTerminalController.AttachGraphicsBackend(Backend: IGraphicsBackend);
 begin
   FGfx := Backend;
+  // the escape sequences of the terminal console ask the same question (GfxScreenOwnsText), and the screen-0 reset
+  // runs whatever the driver (DIVERGENZE 740)
+  GWindowTextCtrl := Self;
+  GLeaveGraphicsHook := @GraphicsLeft;
+end;
+
+procedure TTerminalController.SetWindowShown(Value: Boolean);
+begin
+  FWindowShown := Value;
+  if Value then
+  begin
+    GWindowTextCtrl := Self;
+    GLeaveGraphicsHook := @GraphicsLeft;
+  end
+  else if GWindowTextCtrl = Self then
+  begin
+    GWindowTextCtrl := nil;
+    GLeaveGraphicsHook := nil;
+  end;
+end;
+
+procedure TTerminalController.GraphicsLeft;
+// libfb, closing a screen a window showed: the console comes back cleared, the whole screen its print area
+begin
+  if TcActive then TcScreenZero;
+  ClearView;
+  FCursorX := 0;
+  FCursorY := 0;
+end;
+
+function TTerminalController.TextGoesToStdout: Boolean;
+// False while a FreeBASIC screen is open, whatever the driver - a window or fbc's off-screen Null: then the screen is
+// the console, as in libfb (DIVERGENZE 729, 740). A C128 GRAPHIC mode keeps its text on stdout. SB_GFX_STDOUT=1 keeps
+// the mirror for A/B (GGfxStdoutMirror).
+begin
+  Result := (FGfx = nil) or GGfxStdoutMirror or not FGfx.InFbScreen;
 end;
 
 procedure TTerminalController.MirrorTextToSurface(const Text: string);
@@ -821,7 +881,8 @@ end;
 
 procedure TTerminalController.Print(const Text: string; ClearBackground: Boolean);
 begin
-  if TcActive then
+  if not TextGoesToStdout then
+  else if TcActive then
   begin
     // libfb on a terminal: control characters print as glyphs, and every PRINT reaches the screen at once
     OutWrite(TcPrintText(Text));
@@ -836,7 +897,8 @@ end;
 
 procedure TTerminalController.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
-  if TcActive then
+  if not TextGoesToStdout then
+  else if TcActive then
     OutWrite(TcPrintText(Text) + TcPrintText(LineEnding))
   else
   begin
@@ -853,7 +915,8 @@ end;
 
 procedure TTerminalController.NewLine;
 begin
-  if TcActive then OutWrite(TcPrintText(LineEnding)) else OutWrite(LineEnding);
+  if not TextGoesToStdout then
+  else if TcActive then OutWrite(TcPrintText(LineEnding)) else OutWrite(LineEnding);
   if GOutIsTerminal then TerminalOutFlush;
   CellNextRow;
   FCursorX := 0;
@@ -866,7 +929,8 @@ var
 begin
   Cells := Utf8ToUtf32Cells(Text, Result);
   if Result = 0 then Exit;
-  if FbConsoleInited then
+  if not TextGoesToStdout then
+  else if FbConsoleInited then
     OutWrite(#27'%G' + Text + #27'%@')
   else
     OutWrite(Cells);
@@ -877,7 +941,8 @@ end;
 
 procedure TTerminalController.NewLineWide;
 begin
-  if FbConsoleInited then
+  if not TextGoesToStdout then
+  else if FbConsoleInited then
     OutWrite(#27'%G'#10#27'%@')
   else
     OutWrite(#10#0#0#0);
@@ -936,7 +1001,8 @@ begin
   // initialised: with stdin redirected fbc writes nothing for CLS, and neither does sb. sbv, which never
   // asks for fbc's console, and SB_TERMCONSOLE=0 keep the ANSI clear this always wrote.
   {$IFDEF UNIX}
-  if TcActive then
+  if not TextGoesToStdout then   // DIVERGENZE 729: CLS of a graphics screen in a window clears the screen only
+  else if TcActive then
     TcClear(Mode, FViewTop + 1, FViewBottom + 1)
   else if StdoutIsTerminal and not TcFbConsole then
   begin
@@ -944,7 +1010,7 @@ begin
     TerminalOutFlush;
   end;
   {$ELSE}
-  if StdoutIsTerminal then
+  if TextGoesToStdout and StdoutIsTerminal then
   begin
     // Through the same buffer as everything else, or the clear would overtake the text before it.
     OutWrite(LineEnding);

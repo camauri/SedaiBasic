@@ -2,15 +2,16 @@
  * SedaiBasic - A BASIC interpreter with bytecode VM
  * Copyright (C) 2025 Maurizio Cammalleri
  *
- * This program is dual-licensed:
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3
+ * as published by the Free Software Foundation (GPL-3.0-only).
+ * See <https://www.gnu.org/licenses/gpl-3.0.html>
  *
- * 1) For open source use: GNU General Public License version 3 (GPL-3.0-only)
- *    See <https://www.gnu.org/licenses/gpl-3.0.html>
+ * Under Section 7 of GPL version 3, you are granted additional permissions
+ * described in the GCC Runtime Library Exception, version 3.1, as published
+ * by the Free Software Foundation. See the files LICENSE and COPYING.RUNTIME.
  *
- * 2) For commercial/proprietary use: A separate commercial license is required.
- *    Contact: maurizio.cammalleri@gmail.com for licensing inquiries.
- *
- * SPDX-License-Identifier: GPL-3.0-only OR Commercial
+ * SPDX-License-Identifier: GPL-3.0-only WITH GCC-exception-3.1
  *}
 
 { FreeBASIC graphics — Phase 1: backend abstraction.
@@ -56,6 +57,12 @@ type
     function  ResizeScreen(W, H, Depth: Integer): Boolean;     // base for SCREENRES (truecolor surface)
     function  GetMode: TGraphicMode;
     function  InGraphics: Boolean;
+    // SCREEN 0 after a graphics screen: back to text. The surface stays (POINT and friends answer from the VM's
+    // own state, DIVERGENZE 735); what changes is that PRINT is the console's again (DIVERGENZE 729).
+    procedure LeaveGraphics;
+    // A FreeBASIC screen (SCREENRES / SCREEN n) is open - not a C128 GRAPHIC mode. While it is, PRINT is the screen's
+    // and nothing of it reaches stdout, as in fbc with any driver (DIVERGENZE 740).
+    function  InFbScreen: Boolean;
     procedure ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
     procedure Present;                                          // accelerable; no-op on the software backend
     // --- surfaces / images (image creation deferred to phase 2/G3) ---
@@ -140,6 +147,7 @@ type
   private
     FScreen: TGraphicsMemory;
     FInGraphics: Boolean;
+    FInFbScreen: Boolean;
     FTextFG, FTextBG: TGfxColor;   // COLOR fg,bg - what PRINT draws with in a graphics mode
     FImages: array of TGraphicsMemory;   // image surfaces; id = index+1, 0 = screen
     function ValidScreen: Boolean; inline;
@@ -152,6 +160,8 @@ type
     function  PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer; out Mask: Int64): Boolean;
     function  GetMode: TGraphicMode;
     function  InGraphics: Boolean;
+    procedure LeaveGraphics;
+    function  InFbScreen: Boolean;
     procedure ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
     procedure Present;
     function  ScreenSurface: TGfxSurface;
@@ -203,6 +213,11 @@ type
     // Window presenter access (sb --window): the screen surface's CPU framebuffer is the source of truth.
     function  ScreenMemory: TGraphicsMemory;
   end;
+
+var
+  // Called when a graphics screen is left (SCREEN 0): the text console takes the terminal back
+  // (DIVERGENZE 729). Set by the terminal output device; nil everywhere else.
+  GLeaveGraphicsHook: procedure of object = nil;
 
 implementation
 
@@ -285,6 +300,7 @@ begin
   if SplitLine >= 0 then FScreen.SetSplitLine(SplitLine);
   if ClearBuffer then FScreen.ClearCurrentMode;
   FInGraphics := not (Mode in [gm40ColText, gm80ColText, gm80x50Text]);
+  FInFbScreen := False;   // a C128 mode is not a FreeBASIC screen
   Result := True;
 end;
 
@@ -305,6 +321,7 @@ begin
   FTextFG := $FFFFFFFF;                  // SCREENRES resets the text pair, as FreeBASIC does
   FTextBG := $FF000000;
   FInGraphics := True;
+  FInFbScreen := True;
   Result := True;
 end;
 
@@ -316,6 +333,21 @@ end;
 function TSoftwareGraphicsBackend.InGraphics: Boolean;
 begin
   Result := FInGraphics;
+end;
+
+function TSoftwareGraphicsBackend.InFbScreen: Boolean;
+begin
+  Result := FInFbScreen;
+end;
+
+procedure TSoftwareGraphicsBackend.LeaveGraphics;
+var
+  Was: Boolean;
+begin
+  Was := FInGraphics;
+  FInGraphics := False;
+  FInFbScreen := False;
+  if Was and Assigned(GLeaveGraphicsHook) then GLeaveGraphicsHook();
 end;
 
 procedure TSoftwareGraphicsBackend.ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
